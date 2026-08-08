@@ -232,7 +232,7 @@ JSON 字段：opening(str), question(str), rubric(list[str])
             "micro_feedback": "这题你没有跑偏，经历也讲出来了。下一轮我们把追问压力稍微加一点。",
             "next_question": "如果面试官质疑这个项目结果不是你主导的，你会怎么回应？",
             "hint": "可以按事实边界、个人贡献、协作价值三个层次回答。",
-            "should_finish": count_candidate_answers(session.transcript or []) >= 6,
+            "should_finish": count_candidate_answers(session.transcript or []) >= 10,
         }
         prompt = f"""
 继续一场模拟面试。根据用户刚才回答，给一句短反馈，再追问下一题。
@@ -246,7 +246,8 @@ JSON 字段：opening(str), question(str), rubric(list[str])
 1. 你已经在面试中，不能说“是否要开始”或“准备好了再开始”。
 2. 把用户最新内容当作候选人回答，必须继续反馈和追问。
 3. 压力型也要专业，不要羞辱、嘲讽或人身攻击。
-4. should_finish 只有在候选人至少回答 6 轮，且已经覆盖自我介绍、经历深挖、岗位理解和压力追问后才可以为 true。
+4. should_finish 只有在候选人至少回答 10 轮，且已经覆盖自我介绍、经历深挖、岗位理解、证据质量、压力追问和收尾准备后才可以为 true。
+5. 如果还没覆盖完整 checklist，继续追问最薄弱的一项，不要急着结束。
 
 JSON 字段：micro_feedback(str), next_question(str), hint(str), should_finish(bool)
 """
@@ -579,9 +580,9 @@ def hydrate_uploaded_file_actions(actions: list[Any], uploaded_file: Any) -> lis
 
 def sanitize_agent_text(value: str) -> str:
     replacements = {
-        "——": "，",
-        "—": "，",
-        "–": "-",
+        "\u2014\u2014": "，",
+        "\u2014": "，",
+        "\u2013": "-",
         "猪猪猪": "同学",
         "你是来面试产品经理，不是来给我猜谜语的": "这份简历信息还不够完整，我会用追问帮你补齐证据",
         "没反应就算你弃权": "我们直接进入第一题",

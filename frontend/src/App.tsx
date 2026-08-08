@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
@@ -104,6 +103,7 @@ type InterviewProgress = {
   max_answers: number
   completion: number
   can_llm_finish: boolean
+  checklist?: Array<{ key: string; label: string; description: string; done: boolean }>
 }
 
 type ResumeFolder = {
@@ -139,6 +139,10 @@ type KnowledgeDraft = {
   content: string
   url: string
 }
+
+type KnowledgeTab = 'personal' | 'saved' | 'discover'
+type KnowledgeFolder = { id: string; name: string; scope: Exclude<KnowledgeTab, 'discover'>; collapsed?: boolean }
+type SortMode = 'updated' | 'name'
 
 const profileSectionMeta: Record<ProfileSectionId, { title: string; summary: string; helper: string }> = {
   reviews: {
@@ -215,11 +219,19 @@ const composerActions = ['模拟面试', '题库练习', '简历优化', '简历
 const defaultInterviewProgress: InterviewProgress = {
   answer_count: 0,
   question_count: 0,
-  min_answers_for_llm_finish: 4,
-  target_answers: 6,
-  max_answers: 8,
+  min_answers_for_llm_finish: 8,
+  target_answers: 10,
+  max_answers: 12,
   completion: 0,
   can_llm_finish: false,
+  checklist: [
+    { key: 'self_intro', label: '自我介绍', description: '开场介绍已经建立候选人背景和目标', done: false },
+    { key: 'experience_deep_dive', label: '经历深挖', description: '至少追问过一段实习或项目', done: false },
+    { key: 'role_understanding', label: '岗位理解', description: '覆盖岗位、公司或业务理解', done: false },
+    { key: 'evidence_quality', label: '证据质量', description: '回答中有贡献、指标或事实边界', done: false },
+    { key: 'pressure_followup', label: '压力追问', description: '完成过质疑或挑战追问', done: false },
+    { key: 'closing_readiness', label: '收尾准备', description: '足够生成复盘和下一步计划', done: false },
+  ],
 }
 
 const initialConversations: Conversation[] = [
@@ -259,7 +271,9 @@ function App() {
   const [activeProfileSection, setActiveProfileSection] = useState<ProfileSectionId>('full')
   const [profileSections, setProfileSections] = useState<Record<ProfileSectionId, string>>(initialProfileSections)
   const [profileActionResult, setProfileActionResult] = useState('')
-  const [knowledgeInput, setKnowledgeInput] = useState('')
+  const [resumeFiles, setResumeFiles] = useState<ParsedUpload[]>([])
+  const [knowledgeQuestion, setKnowledgeQuestion] = useState('')
+  const [knowledgeMessages, setKnowledgeMessages] = useState<ChatMessage[]>([])
   const [personalKnowledge, setPersonalKnowledge] = useState<KnowledgeItem[]>([])
   const [activeKnowledgeId, setActiveKnowledgeId] = useState('')
   const [knowledgeQuery, setKnowledgeQuery] = useState('')
@@ -290,7 +304,15 @@ function App() {
   const [timerCollapsed, setTimerCollapsed] = useState(false)
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null)
   const [mediaReady, setMediaReady] = useState(false)
-  const [knowledgeTab, setKnowledgeTab] = useState<'personal' | 'saved' | 'discover'>('personal')
+  const [subNavCollapsed, setSubNavCollapsed] = useState(false)
+  const [knowledgeTab, setKnowledgeTab] = useState<KnowledgeTab>('personal')
+  const [knowledgeFolderSort, setKnowledgeFolderSort] = useState<SortMode>('updated')
+  const [knowledgeFileSort, setKnowledgeFileSort] = useState<SortMode>('updated')
+  const [knowledgeFolders, setKnowledgeFolders] = useState<Record<Exclude<KnowledgeTab, 'discover'>, KnowledgeFolder[]>>({
+    personal: [{ id: 'personal-default', name: '默认文件夹', scope: 'personal' }],
+    saved: [{ id: 'saved-default', name: '默认收藏', scope: 'saved' }],
+  })
+  const [activeKnowledgeFolderId, setActiveKnowledgeFolderId] = useState('personal-default')
   const [savedKnowledge, setSavedKnowledge] = useState<string[]>(['pm-method'])
 
   const chatScrollRef = useRef<HTMLElement | null>(null)
@@ -305,7 +327,7 @@ function App() {
   const fallbackRecommendations = useMemo(() => buildRecommendations(profile, dashboard), [profile, dashboard])
   const visibleRecommendations = recommendations.length ? recommendations : fallbackRecommendations
   const resumeFolders = useMemo(() => buildResumeFolders(profile, dashboard, profileSections), [profile, dashboard, profileSections])
-  const knowledgeItems = useMemo(() => [...personalKnowledge, ...buildKnowledgeItems(profile)], [personalKnowledge, profile])
+  const knowledgeItems = useMemo(() => [...personalKnowledge, ...buildKnowledgeItems(profile), ...discoverKnowledgeFeed()], [personalKnowledge, profile])
 
   const api = useCallback(async <T,>(path: string, options?: RequestInit): Promise<T> => {
     setError('')
@@ -478,6 +500,11 @@ function App() {
   function openModule(nextModule: PrimaryModule) {
     setModule(nextModule)
     if (nextModule === 'peach') setPeachPanel('new-chat')
+    if (nextModule === 'knowledge') {
+      setKnowledgeTab('personal')
+      setActiveKnowledgeFolderId('personal-default')
+    }
+    setSubNavCollapsed(false)
     setNotice(moduleNotice(nextModule))
   }
 
@@ -972,6 +999,87 @@ function App() {
     }
   }
 
+  function createKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>) {
+    const name = window.prompt('文件夹名称', scope === 'personal' ? '求职资料' : '收藏资料')
+    if (!name?.trim()) return
+    const folder: KnowledgeFolder = { id: `${scope}-${Date.now()}`, name: name.trim(), scope }
+    setKnowledgeFolders((current) => ({ ...current, [scope]: [...current[scope], folder] }))
+    setActiveKnowledgeFolderId(folder.id)
+    setKnowledgeTab(scope)
+  }
+
+  function renameKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
+    const folder = knowledgeFolders[scope].find((item) => item.id === folderId)
+    const name = window.prompt('重命名文件夹', folder?.name ?? '')
+    if (!name?.trim()) return
+    setKnowledgeFolders((current) => ({
+      ...current,
+      [scope]: current[scope].map((item) => (item.id === folderId ? { ...item, name: name.trim() } : item)),
+    }))
+  }
+
+  function deleteKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
+    setKnowledgeFolders((current) => {
+      if (current[scope].length <= 1) return current
+      const nextFolders = current[scope].filter((item) => item.id !== folderId)
+      if (activeKnowledgeFolderId === folderId) setActiveKnowledgeFolderId(nextFolders[0]?.id ?? `${scope}-default`)
+      return { ...current, [scope]: nextFolders }
+    })
+  }
+
+  async function renameKnowledgeItem(item: KnowledgeItem) {
+    const title = window.prompt('重命名文件', item.title)
+    if (!title?.trim()) return
+    if (item.source !== 'personal') {
+      setPersonalKnowledge((current) => current.map((value) => (value.id === item.id ? { ...value, title: title.trim() } : value)))
+      setKnowledgeDraft((current) => (item.id === activeKnowledgeId ? { ...current, title: title.trim() } : current))
+      return
+    }
+    begin('knowledge', '正在重命名资料')
+    try {
+      const data = await api<{ item: KnowledgeItem }>(`/api/knowledge/${item.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...toKnowledgeDraft(item), title: title.trim(), source: 'personal' }),
+      })
+      setPersonalKnowledge((current) => current.map((value) => (value.id === data.item.id ? data.item : value)))
+      if (item.id === activeKnowledgeId) setKnowledgeDraft(toKnowledgeDraft(data.item))
+      setNotice('资料已重命名。')
+    } catch (err) {
+      setError('重命名失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
+  async function parseKnowledgeLink() {
+    const url = window.prompt('粘贴要加入知识库的链接')
+    if (!url?.trim()) return
+    begin('knowledge', '正在解析链接')
+    try {
+      const data = await api<{ item: KnowledgeItem }>('/api/knowledge', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: titleFromUrl(url.trim()),
+          summary: `链接资料：${url.trim()}`,
+          content: `链接：${url.trim()}\n\n可以在这里继续补充网页重点，桃子会在知识库问答里参考它。`,
+          source: 'personal',
+          url: url.trim(),
+        }),
+      })
+      setPersonalKnowledge((current) => [data.item, ...current])
+      setActiveKnowledgeId(data.item.id)
+      setKnowledgeDraft(toKnowledgeDraft(data.item))
+      setKnowledgeTab('personal')
+      setNotice('链接已加入个人知识库。')
+    } catch (err) {
+      setError('链接解析失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
   async function uploadKnowledgeFile(file: File) {
     begin('upload', '正在解析并添加知识库')
     try {
@@ -1047,6 +1155,9 @@ function App() {
         activeProfileSection,
         [profileSections[activeProfileSection], content].filter(Boolean).join('\n\n'),
       )
+      if (activeProfileSection === 'full') {
+        setResumeFiles((current) => [data.file, ...current.filter((item) => item.filename !== data.file.filename)])
+      }
       setNotice(data.file.warning || `已补充到${profileSectionMeta[activeProfileSection].title}。`)
     } catch (err) {
       setError(fileUploadErrorMessage(err))
@@ -1087,8 +1198,7 @@ function App() {
     setNotice(`已沉淀到${profileSectionMeta[activeProfileSection].title}。`)
   }
 
-  function submitProfileNote(event: FormEvent) {
-    event.preventDefault()
+  function submitProfileNote() {
     if (!profileInput.trim()) return
     const nextSections = {
       ...profileSections,
@@ -1099,66 +1209,65 @@ function App() {
     setProfileInput('')
   }
 
-  async function submitKnowledge(event: FormEvent) {
-    event.preventDefault()
-    if (!knowledgeInput.trim()) return
-    begin('knowledge', '正在添加个人知识库')
+  async function askKnowledgeQuestion() {
+    const question = knowledgeQuestion.trim()
+    if (!question || busy.chat) return
+    const sourceItems = knowledgeItems
+      .filter((item) => {
+        if (knowledgeTab === 'personal') return item.source === 'personal'
+        if (knowledgeTab === 'saved') return savedKnowledge.includes(item.id)
+        return item.source === 'discover'
+      })
+      .slice(0, 8)
+    setKnowledgeQuestion('')
+    setKnowledgeMessages((current) => [...current, { role: 'user', content: question }, { role: 'system', content: '桃子正在基于知识库回答。' }])
+    begin('chat', '桃子正在基于知识库回答')
     try {
-      const data = await api<{ item: KnowledgeItem }>('/api/knowledge', {
+      const data = await api<{ reply: string }>('/api/chat', {
         method: 'POST',
         body: JSON.stringify({
-          title: buildKnowledgeTitle(knowledgeInput.trim()),
-          summary: summarizeClientText(knowledgeInput.trim(), 160),
-          content: knowledgeInput.trim(),
-          source: 'personal',
-          url: looksLikeUrl(knowledgeInput.trim()) ? knowledgeInput.trim() : '',
+          message: [
+            `请基于以下求职知识库资料回答用户问题。回答要具体，无法从资料判断时要说明需要补充什么。`,
+            `资料：${JSON.stringify(sourceItems.map((item) => ({ title: item.title, summary: item.summary, content: item.content?.slice(0, 2500) })), null, 2)}`,
+            `用户问题：${question}`,
+          ].join('\n\n'),
         }),
       })
-      setPersonalKnowledge((current) => [data.item, ...current])
-      setActiveKnowledgeId(data.item.id)
-      setKnowledgeDraft(toKnowledgeDraft(data.item))
-      setKnowledgeTab('personal')
-      setKnowledgeInput('')
-      setNotice('已添加到个人知识库。')
+      setKnowledgeMessages((current) => [
+        ...current.filter((message) => message.content !== '桃子正在基于知识库回答。'),
+        { role: 'peach', content: cleanAssistantText(data.reply) },
+      ])
+      setNotice('知识库回答已生成。')
     } catch (err) {
-      setError('知识库添加失败，稍后再试一次。')
+      setKnowledgeMessages((current) => current.filter((message) => message.content !== '桃子正在基于知识库回答。'))
+      setKnowledgeQuestion(question)
+      setError('知识库问答失败，问题已经放回输入框。')
       console.error(err)
     } finally {
-      end('knowledge')
+      end('chat')
     }
   }
 
-  const appClass = `app-shell module-${module}`
+  const hasSubNav = module === 'peach' || module === 'knowledge'
+  const appClass = `app-shell module-${module} ${hasSubNav ? 'has-sub-nav' : 'no-sub-nav'} ${subNavCollapsed ? 'subnav-collapsed' : ''}`
 
   return (
     <main className={appClass}>
       <aside className="main-nav" aria-label="主导航栏">
-        <div className="brand-block">
-          <div className="brand-mark">桃</div>
-          <div>
-            <strong>桃子</strong>
-            <span>求职陪练 Agent</span>
-          </div>
-        </div>
         <nav className="main-nav-list">
           <button className={module === 'peach' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('peach')}>
+            <span className="nav-icon">桃</span>
             <strong>桃子</strong>
-            <span>对话和面试</span>
           </button>
           <button className={module === 'profile' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('profile')}>
+            <span className="nav-icon">档</span>
             <strong>个人档案</strong>
-            <span>简历和复盘</span>
           </button>
           <button className={module === 'knowledge' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('knowledge')}>
+            <span className="nav-icon">库</span>
             <strong>求职知识库</strong>
-            <span>资料和收藏</span>
           </button>
         </nav>
-        <div className="nav-profile">
-          <span>{profile.stage}</span>
-          <strong>{profile.target_role}</strong>
-          <p>{profile.target_company || '还没有目标公司'}</p>
-        </div>
       </aside>
 
       {module === 'peach' ? (
@@ -1166,20 +1275,57 @@ function App() {
           activePanel={peachPanel}
           conversations={conversations}
           activeConversationId={activeConversationId}
+          collapsed={subNavCollapsed}
           onNew={createConversation}
-          onInterview={() => setPeachPanel('interview-setup')}
           onOpenHistory={openConversation}
+          onToggle={() => setSubNavCollapsed((value) => !value)}
+        />
+      ) : null}
+
+      {module === 'knowledge' ? (
+        <KnowledgeSubNav
+          collapsed={subNavCollapsed}
+          tab={knowledgeTab}
+          query={knowledgeQuery}
+          items={knowledgeItems}
+          savedIds={savedKnowledge}
+          activeId={activeKnowledgeId}
+          folders={knowledgeFolders}
+          activeFolderId={activeKnowledgeFolderId}
+          folderSort={knowledgeFolderSort}
+          fileSort={knowledgeFileSort}
+          onToggle={() => setSubNavCollapsed((value) => !value)}
+          onTab={(tab) => {
+            setKnowledgeTab(tab)
+            if (tab === 'personal') setActiveKnowledgeFolderId(knowledgeFolders.personal[0]?.id ?? 'personal-default')
+            if (tab === 'saved') setActiveKnowledgeFolderId(knowledgeFolders.saved[0]?.id ?? 'saved-default')
+          }}
+          onQuery={setKnowledgeQuery}
+          onSelectFolder={setActiveKnowledgeFolderId}
+          onFolderSort={setKnowledgeFolderSort}
+          onFileSort={setKnowledgeFileSort}
+          onCreateFolder={createKnowledgeFolder}
+          onRenameFolder={renameKnowledgeFolder}
+          onDeleteFolder={deleteKnowledgeFolder}
+          onSelectItem={selectKnowledgeItem}
+          onNewItem={createKnowledgeDraft}
+          onRenameItem={(item) => void renameKnowledgeItem(item)}
+          onDeleteItem={(id) => void deleteKnowledgeItem(id)}
+          onParseLink={() => void parseKnowledgeLink()}
+          onUpload={(file) => void uploadKnowledgeFile(file)}
         />
       ) : null}
 
       <section className="workspace" aria-label="工作区">
-        <header className="workspace-topbar">
-          <div>
-            <p>{workspaceKicker(module, peachPanel)}</p>
-            <h1>{workspaceTitle(module, peachPanel)}</h1>
-          </div>
-          <div className={busyText ? 'status-pill busy' : 'status-pill'}>{busyText || notice}</div>
-        </header>
+        {module === 'profile' || (module === 'peach' && peachPanel !== 'new-chat') ? (
+          <header className="workspace-topbar">
+            <div>
+              <p>{workspaceKicker(module, peachPanel)}</p>
+              <h1>{workspaceTitle(module, peachPanel)}</h1>
+            </div>
+            <div className={busyText ? 'status-pill busy' : 'status-pill'}>{busyText || notice}</div>
+          </header>
+        ) : null}
 
         {error ? <div className="inline-error">{error}</div> : null}
         {!dashboard && !error ? <LoadingScreen /> : null}
@@ -1230,6 +1376,7 @@ function App() {
             sectionContent={profileSections[activeProfileSection]}
             sections={profileSections}
             actionResult={profileActionResult}
+            resumeFiles={resumeFiles}
             isSaving={Boolean(busy.profile)}
             value={profileInput}
             onSelectSection={selectProfileSection}
@@ -1246,22 +1393,18 @@ function App() {
         {module === 'knowledge' ? (
           <KnowledgeWorkspace
             tab={knowledgeTab}
-            query={knowledgeQuery}
-            value={knowledgeInput}
+            question={knowledgeQuestion}
+            messages={knowledgeMessages}
             items={knowledgeItems}
             savedIds={savedKnowledge}
             activeId={activeKnowledgeId}
             draft={knowledgeDraft}
             busy={Boolean(busy.knowledge || busy.upload)}
-            onTab={setKnowledgeTab}
-            onQuery={setKnowledgeQuery}
-            onValue={setKnowledgeInput}
-            onSubmit={submitKnowledge}
+            onQuestion={setKnowledgeQuestion}
+            onAskQuestion={() => void askKnowledgeQuestion()}
             onSave={saveKnowledge}
-            onSelect={selectKnowledgeItem}
             onDraft={setKnowledgeDraft}
             onSaveDraft={() => void saveKnowledgeDraft()}
-            onNew={createKnowledgeDraft}
             onDelete={(id) => void deleteKnowledgeItem(id)}
             onUpload={(file) => void uploadKnowledgeFile(file)}
             onAsk={sendKnowledgeToPeach}
@@ -1277,25 +1420,29 @@ function PeachSubNav({
   activePanel,
   conversations,
   activeConversationId,
+  collapsed,
   onNew,
-  onInterview,
   onOpenHistory,
+  onToggle,
 }: {
   activePanel: PeachPanel
   conversations: Conversation[]
   activeConversationId: string
+  collapsed: boolean
   onNew: () => void
-  onInterview: () => void
   onOpenHistory: (id: string) => void
+  onToggle: () => void
 }) {
   return (
-    <aside className="sub-nav" aria-label="桃子副导航栏">
+    <aside className={collapsed ? 'sub-nav collapsed' : 'sub-nav'} aria-label="桃子副导航栏">
+      <button className="sub-nav-toggle" type="button" onClick={onToggle} aria-label={collapsed ? '展开副导航' : '收起副导航'}>
+        <span>{collapsed ? '›' : '‹'}</span>
+      </button>
+      {collapsed ? null : (
+        <>
       <div className="sub-nav-actions">
         <button className={activePanel === 'new-chat' ? 'sub-action active' : 'sub-action'} type="button" onClick={onNew}>
           新建对话
-        </button>
-        <button className={activePanel.includes('interview') ? 'sub-action active' : 'sub-action'} type="button" onClick={onInterview}>
-          模拟面试
         </button>
       </div>
       <div className="history-section">
@@ -1314,6 +1461,153 @@ function PeachSubNav({
           ))}
         </div>
       </div>
+        </>
+      )}
+    </aside>
+  )
+}
+
+function KnowledgeSubNav({
+  collapsed,
+  tab,
+  query,
+  items,
+  savedIds,
+  activeId,
+  folders,
+  activeFolderId,
+  folderSort,
+  fileSort,
+  onToggle,
+  onTab,
+  onQuery,
+  onSelectFolder,
+  onFolderSort,
+  onFileSort,
+  onCreateFolder,
+  onRenameFolder,
+  onDeleteFolder,
+  onSelectItem,
+  onNewItem,
+  onRenameItem,
+  onDeleteItem,
+  onParseLink,
+  onUpload,
+}: {
+  collapsed: boolean
+  tab: KnowledgeTab
+  query: string
+  items: KnowledgeItem[]
+  savedIds: string[]
+  activeId: string
+  folders: Record<Exclude<KnowledgeTab, 'discover'>, KnowledgeFolder[]>
+  activeFolderId: string
+  folderSort: SortMode
+  fileSort: SortMode
+  onToggle: () => void
+  onTab: (tab: KnowledgeTab) => void
+  onQuery: (value: string) => void
+  onSelectFolder: (id: string) => void
+  onFolderSort: (mode: SortMode) => void
+  onFileSort: (mode: SortMode) => void
+  onCreateFolder: (scope: Exclude<KnowledgeTab, 'discover'>) => void
+  onRenameFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onDeleteFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onSelectItem: (item: KnowledgeItem) => void
+  onNewItem: () => void
+  onRenameItem: (item: KnowledgeItem) => void
+  onDeleteItem: (id: string) => void
+  onParseLink: () => void
+  onUpload: (file: File) => void
+}) {
+  const scope = tab === 'saved' ? 'saved' : 'personal'
+  const scopedFolders = sortFolders(folders[scope], folderSort)
+  const scopedItems = sortKnowledgeItems(items.filter((item) => {
+    if (tab === 'personal') return item.source === 'personal'
+    if (tab === 'saved') return savedIds.includes(item.id)
+    return false
+  }).filter((item) => {
+    const keyword = query.trim().toLowerCase()
+    if (!keyword) return true
+    return [item.title, item.summary, item.content, item.url].some((part) => part?.toLowerCase().includes(keyword))
+  }), fileSort)
+
+  return (
+    <aside className={collapsed ? 'sub-nav knowledge-sub-nav collapsed' : 'sub-nav knowledge-sub-nav'} aria-label="知识库副导航栏">
+      <button className="sub-nav-toggle" type="button" onClick={onToggle} aria-label={collapsed ? '展开副导航' : '收起副导航'}>
+        <span>{collapsed ? '›' : '‹'}</span>
+      </button>
+      {collapsed ? null : (
+        <>
+          <div className="knowledge-nav-tabs">
+            {(['personal', 'saved', 'discover'] as KnowledgeTab[]).map((item) => (
+              <button className={tab === item ? 'active' : ''} key={item} type="button" onClick={() => onTab(item)}>
+                {knowledgeTabLabel(item)}
+              </button>
+            ))}
+          </div>
+
+          {tab === 'discover' ? (
+            <div className="knowledge-side-note">
+              <strong>发现知识库</strong>
+              <p>浏览精选和推荐内容，收藏后会进入收藏知识库。</p>
+            </div>
+          ) : (
+            <div className="knowledge-tree">
+              <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索知识库" />
+              <div className="tree-toolbar">
+                <button type="button" onClick={() => onCreateFolder(scope)}>新建文件夹</button>
+                <select value={folderSort} onChange={(event) => onFolderSort(event.target.value as SortMode)}>
+                  <option value="updated">最近更新</option>
+                  <option value="name">名称排序</option>
+                </select>
+              </div>
+
+              <div className="folder-list">
+                {scopedFolders.map((folder) => (
+                  <section className={folder.id === activeFolderId ? 'folder-block active' : 'folder-block'} key={folder.id}>
+                    <button className="folder-title" type="button" onClick={() => onSelectFolder(folder.id)}>
+                      <span>{folder.id === activeFolderId ? '⌄' : '›'}</span>
+                      <strong>{folder.name}</strong>
+                    </button>
+                    <div className="folder-actions">
+                      <button type="button" onClick={() => onRenameFolder(scope, folder.id)}>重命名</button>
+                      <button type="button" onClick={() => onDeleteFolder(scope, folder.id)}>删除</button>
+                    </div>
+                    {folder.id === activeFolderId ? (
+                      <div className="file-list">
+                        <div className="tree-toolbar file-toolbar">
+                          <button type="button" onClick={onNewItem}>新建</button>
+                          <button type="button" onClick={onParseLink}>链接</button>
+                          <label>
+                            <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUpload(event.target.files[0])} />
+                            <span>上传</span>
+                          </label>
+                          <select value={fileSort} onChange={(event) => onFileSort(event.target.value as SortMode)}>
+                            <option value="updated">最近</option>
+                            <option value="name">名称</option>
+                          </select>
+                        </div>
+                        {scopedItems.length ? scopedItems.map((item) => (
+                          <div className={item.id === activeId ? 'file-row active' : 'file-row'} key={item.id}>
+                            <button type="button" onClick={() => onSelectItem(item)}>
+                              <span>{item.title}</span>
+                            </button>
+                            <div>
+                              <button type="button" onClick={() => onRenameItem(item)}>改名</button>
+                              {item.source === 'personal' ? <button type="button" onClick={() => onDeleteItem(item.id)}>删除</button> : null}
+                            </div>
+                          </div>
+                        )) : <p className="tree-empty">这个文件夹还没有文件。</p>}
+                      </div>
+                    ) : null}
+                  </section>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </aside>
   )
 }
@@ -1370,28 +1664,19 @@ function PeachWorkspace(props: {
 
   return (
     <div className={hasStartedChat ? 'chat-home chatting' : 'chat-home'}>
-      <section className={hasStartedChat ? 'greeting-panel compact' : 'greeting-panel'}>
+      {!hasStartedChat ? <section className="greeting-panel">
         <div className="greeting-copy">
           <h2>{personalGreeting(props.profile)}</h2>
-          {!hasStartedChat ? <p>我可以陪你模拟面试、打磨简历、整理投递节奏，也能把每次练习沉淀进个人档案。</p> : null}
+          <p>我是专属于你的求职搭子</p>
         </div>
         <div className="bubble-group">
-          {!hasStartedChat ? <div className="bubble-title">核心功能</div> : null}
           <div className="bubble-grid fixed-bubbles">
-            {(hasStartedChat ? fixedBubbles.slice(0, 4) : fixedBubbles).map((item) => (
+            {[...fixedBubbles, ...props.recommendations].map((item) => (
               <button key={item} type="button" onClick={() => props.onQuickSend(item)}>{item}</button>
             ))}
           </div>
         </div>
-        <div className={hasStartedChat ? 'bubble-group recommendation-group compact-only-hidden' : 'bubble-group recommendation-group'}>
-          <div className="bubble-title">为你推荐</div>
-          <div className="bubble-grid recommendation-bubbles">
-            {props.recommendations.map((item) => (
-              <button key={item} type="button" onClick={() => props.onQuickSend(item)}>{item}</button>
-            ))}
-          </div>
-        </div>
-      </section>
+      </section> : null}
 
       <section className="chat-thread" ref={props.chatScrollRef}>
         {props.conversation.messages.map((message, index) => (
@@ -1412,7 +1697,8 @@ function PeachWorkspace(props: {
         placeholder="和桃子聊聊你的求职问题"
         actions={composerActions}
         disabled={Boolean(props.busy.chat)}
-        button={props.busy.chat ? '回复中' : '发送'}
+        button={props.busy.chat ? '回复中' : '语音输入'}
+        buttonKind="voice"
         onChange={props.onInput}
         onSubmit={props.onSend}
         onAction={props.onAction}
@@ -1618,7 +1904,8 @@ function LiveInterview({
           placeholder={paused ? '面试暂停中，点击继续后再回答' : '输入你的回答，也可以后续接入语音转写'}
           actions={[paused ? '继续面试' : '暂停面试', '结束面试']}
           disabled={paused || Boolean(busy.chat)}
-          button={busy.chat ? '发送中' : '发送'}
+          button={busy.chat ? '发送中' : '语音输入'}
+          buttonKind="voice"
           onChange={onInput}
           onSubmit={onSend}
           onAction={(action) => {
@@ -1639,8 +1926,13 @@ function LiveInterview({
           <p>{settings.jd.trim() ? summarizeClientText(settings.jd, 120) : '未填写 JD。桃子会先按目标岗位和简历追问。'}</p>
           <p className="interview-progress-note">
             已回答 {interviewProgress.answer_count} 轮，完成度 {interviewProgress.completion}%。
-            桃子至少完成 {interviewProgress.min_answers_for_llm_finish} 轮后才会建议结束，最多 {interviewProgress.max_answers} 轮会自动收尾。
+            桃子至少完成 {interviewProgress.min_answers_for_llm_finish} 轮，并覆盖主要考察项后才会建议结束。
           </p>
+          <div className="interview-checklist">
+            {(interviewProgress.checklist ?? []).map((item) => (
+              <span className={item.done ? 'done' : ''} key={item.key}>{item.done ? '✓' : '○'} {item.label}</span>
+            ))}
+          </div>
         </section>
 
         {settings.mode === 'video' ? (
@@ -1695,6 +1987,7 @@ function ProfileWorkspace({
   sectionContent,
   sections,
   actionResult,
+  resumeFiles,
   isSaving,
   value,
   onSelectSection,
@@ -1711,12 +2004,13 @@ function ProfileWorkspace({
   sectionContent: string
   sections: Record<ProfileSectionId, string>
   actionResult: string
+  resumeFiles: ParsedUpload[]
   isSaving: boolean
   value: string
   onSelectSection: (id: ProfileSectionId) => void
   onSectionContent: (value: string) => void
   onValue: (value: string) => void
-  onSubmit: (event: FormEvent) => void
+  onSubmit: () => void
   onSave: () => void
   onAction: (action: string) => void
   onAcceptResult: () => void
@@ -1725,7 +2019,6 @@ function ProfileWorkspace({
   const current = profileSectionMeta[activeSection]
   const sectionItems = flattenResumeFolders(folders)
   const filledCount = sectionItems.filter((item) => sections[item.id]?.trim()).length
-  const activeSummary = sectionItems.find((item) => item.id === activeSection)?.summary ?? current.summary
 
   return (
     <section className="profile-workspace">
@@ -1762,14 +2055,29 @@ function ProfileWorkspace({
             <div>
               <span>正在编辑</span>
               <h2>{current.title}</h2>
-              <p>{activeSummary}</p>
             </div>
             <button type="button" onClick={onSave} disabled={isSaving}>
               {isSaving ? '保存中' : '保存档案'}
             </button>
           </div>
 
-          <div className="profile-helper-note">{current.helper}</div>
+          {activeSection === 'full' ? (
+            <div className="resume-file-strip">
+              <label className="resume-upload-card">
+                <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUploadFile(event.target.files[0])} />
+                <span>+</span>
+                <strong>上传简历附件</strong>
+              </label>
+              <div className="resume-file-list">
+                {resumeFiles.length ? resumeFiles.map((file) => (
+                  <button type="button" key={file.filename} onClick={() => onSectionContent([sectionContent, `【${file.title}】\n${file.content}`].filter(Boolean).join('\n\n'))}>
+                    <strong>{file.filename}</strong>
+                    <span>{file.summary || '已解析'}</span>
+                  </button>
+                )) : <p>还没有上传简历文件。</p>}
+              </div>
+            </div>
+          ) : null}
 
           <textarea
             className="profile-editor"
@@ -1778,19 +2086,6 @@ function ProfileWorkspace({
             placeholder={`在这里整理${current.title}。桃子会基于这些内容帮你生成简历、优化表达和准备追问题。`}
             rows={10}
           />
-
-          <div className="profile-assist-strip">
-            <span>桃子可以帮你</span>
-            {['简历生成', '经历生成', '简历优化', '面试深挖'].map((item) => (
-              <button key={item} type="button" onClick={() => onAction(item)} disabled={isSaving}>
-                {item}
-              </button>
-            ))}
-            <label className="inline-upload-button">
-              <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUploadFile(event.target.files[0])} />
-              <span>上传材料</span>
-            </label>
-          </div>
 
           {actionResult ? (
             <section className="profile-action-result">
@@ -1801,186 +2096,222 @@ function ProfileWorkspace({
               <p>{actionResult}</p>
             </section>
           ) : (
-            <section className="profile-empty-hint">
-              <strong>{current.summary}</strong>
-              <p>{sectionContent.trim() ? '可以继续补证据，或让桃子帮你改成更适合面试的表达。' : '先写几句也可以，不需要一次填完整。底部输入会直接追加到当前分区。'}</p>
+            <section className="profile-empty-hint" aria-label="当前分区状态">
+              <strong>{sectionContent.trim() ? '当前文件已可用于对话和面试。' : '当前文件暂无内容。'}</strong>
             </section>
           )}
         </section>
       </div>
-      <form className="bottom-composer profile-composer" onSubmit={onSubmit}>
-        <textarea value={value} onChange={(event) => onValue(event.target.value)} placeholder="补充个人档案" rows={2} />
-        <div className="composer-footer">
-          <div className="composer-action-row">
-            {['简历生成', '经历生成', '简历优化', '面试深挖'].map((item) => (
-              <button key={item} type="button" onClick={() => onAction(item)} disabled={isSaving}>{item}</button>
-            ))}
-          </div>
-          <button type="submit" disabled={!value.trim()}>保存补充</button>
-        </div>
-      </form>
+      <ChatComposer
+        value={value}
+        placeholder="补充个人档案"
+        actions={['简历生成', '经历生成', '简历优化', '面试深挖']}
+        disabled={isSaving}
+        button={isSaving ? '保存中' : '语音输入'}
+        buttonKind="voice"
+        onChange={onValue}
+        onSubmit={onSubmit}
+        onAction={onAction}
+        onUpload={onUploadFile}
+        uploadDisabled={isSaving}
+      />
     </section>
   )
 }
 
 function KnowledgeWorkspace({
   tab,
-  query,
-  value,
+  question,
+  messages,
   items,
   savedIds,
   activeId,
   draft,
   busy,
-  onTab,
-  onQuery,
-  onValue,
-  onSubmit,
+  onQuestion,
+  onAskQuestion,
   onSave,
-  onSelect,
   onDraft,
   onSaveDraft,
-  onNew,
   onDelete,
   onUpload,
   onAsk,
   onUseInProfile,
 }: {
-  tab: 'personal' | 'saved' | 'discover'
-  query: string
-  value: string
+  tab: KnowledgeTab
+  question: string
+  messages: ChatMessage[]
   items: KnowledgeItem[]
   savedIds: string[]
   activeId: string
   draft: KnowledgeDraft
   busy: boolean
-  onTab: (tab: 'personal' | 'saved' | 'discover') => void
-  onQuery: (value: string) => void
-  onValue: (value: string) => void
-  onSubmit: (event: FormEvent) => void
+  onQuestion: (value: string) => void
+  onAskQuestion: () => void
   onSave: (id: string) => void
-  onSelect: (item: KnowledgeItem) => void
   onDraft: (draft: KnowledgeDraft) => void
   onSaveDraft: () => void
-  onNew: () => void
   onDelete: (id: string) => void
   onUpload: (file: File) => void
   onAsk: (item: KnowledgeItem) => void
   onUseInProfile: (item: KnowledgeItem) => void
 }) {
-  const visibleItems = items.filter((item) => {
-    if (tab === 'personal') return item.source === 'personal'
-    if (tab === 'saved') return savedIds.includes(item.id)
-    return item.source === 'discover'
-  }).filter((item) => {
-    const keyword = query.trim().toLowerCase()
-    if (!keyword) return true
-    return [item.title, item.summary, item.content, item.url].some((part) => part?.toLowerCase().includes(keyword))
-  })
   const activeItem = items.find((item) => item.id === activeId)
   const canEdit = !activeItem || activeItem.source === 'personal'
   const isCreating = canEdit && !activeItem
+  const discoverItems = items.filter((item) => item.source === 'discover')
 
   return (
     <section className="knowledge-workspace">
-      <form className="knowledge-ingest" onSubmit={onSubmit}>
-        <div>
-          <h2>求职知识库</h2>
-          <p>存简历、题库、JD、复盘和资料。桃子会在对话、简历生成和经历深挖里引用它们。</p>
-        </div>
-        <div className="ingest-row">
-          <input value={value} onChange={(event) => onValue(event.target.value)} placeholder="粘贴链接、资料摘录或待整理笔记" />
-          <label className="knowledge-upload">
-            <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUpload(event.target.files[0])} />
-            <span>上传文件</span>
-          </label>
-          <button type="submit" disabled={!value.trim() || busy}>添加</button>
-        </div>
-      </form>
-
-      <div className="knowledge-toolbar">
-        <div className="knowledge-tabs">
-          <button className={tab === 'personal' ? 'active' : ''} type="button" onClick={() => onTab('personal')}>个人知识库</button>
-          <button className={tab === 'saved' ? 'active' : ''} type="button" onClick={() => onTab('saved')}>收藏知识库</button>
-          <button className={tab === 'discover' ? 'active' : ''} type="button" onClick={() => onTab('discover')}>发现知识库</button>
-        </div>
-        <div className="knowledge-search-row">
-          <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索标题、摘要、正文" />
-          <button type="button" onClick={onNew}>新建资料</button>
-        </div>
-      </div>
-
-      <div className="knowledge-layout">
-        <div className="knowledge-list">
-          {visibleItems.length ? visibleItems.map((item) => (
-            <button
-              className={item.id === activeId ? 'knowledge-list-item active' : 'knowledge-list-item'}
-              key={item.id}
-              type="button"
-              onClick={() => onSelect(item)}
-            >
-              <span>{knowledgeSourceLabel(item.source)}</span>
-              <strong>{item.title}</strong>
-              <p>{item.summary}</p>
-            </button>
-          )) : (
-            <section className="knowledge-empty">
-              <strong>这里还没有资料</strong>
-              <p>上传文件、粘贴链接，或从发现知识库收藏一份资料。</p>
-            </section>
-          )}
-        </div>
-
-        <section className="knowledge-detail">
-          <div className="knowledge-detail-head">
+      {tab === 'discover' ? (
+        <section className="knowledge-discover">
+          <div className="discover-head">
             <div>
-              <span>{canEdit ? '可编辑资料' : '发现资料'}</span>
-              <h2>{activeItem ? activeItem.title : '新建资料'}</h2>
+              <h2>知识库</h2>
+              <p>精选</p>
             </div>
-            <div className="knowledge-detail-actions">
-              {activeItem?.source === 'discover' ? (
-                <button type="button" onClick={() => onSave(activeItem.id)} disabled={savedIds.includes(activeItem.id)}>
-                  {savedIds.includes(activeItem.id) ? '已收藏' : '收藏'}
-                </button>
-              ) : null}
-              {activeItem ? <button type="button" onClick={() => onAsk(activeItem)}>问桃子</button> : null}
-              {activeItem ? <button type="button" onClick={() => onUseInProfile(activeItem)}>沉淀到档案</button> : null}
-            </div>
+            <input aria-label="搜索知识库" placeholder="搜索知识库" />
+          </div>
+          <div className="featured-grid">
+            {discoverItems.slice(0, 4).map((item, index) => (
+              <KnowledgeFeedCard
+                featured
+                item={item}
+                index={index}
+                key={item.id}
+                saved={savedIds.includes(item.id)}
+                onSave={onSave}
+                onAsk={onAsk}
+              />
+            ))}
+          </div>
+          <div className="recommend-tabs">
+            {['推荐', '科技', '教育', '职场', '财经', '产业', 'AI'].map((item) => <button key={item} type="button">{item}</button>)}
+          </div>
+          <div className="recommend-grid">
+            {discoverKnowledgeFeed().map((item, index) => (
+              <KnowledgeFeedCard
+                item={item}
+                index={index}
+                key={item.id}
+                saved={savedIds.includes(item.id)}
+                onSave={onSave}
+                onAsk={() => onAsk(item)}
+              />
+            ))}
+          </div>
+        </section>
+      ) : (
+        <section className="knowledge-qa">
+          <div className="knowledge-qa-empty">
+            <h2>基于知识库问答</h2>
+            {!messages.length ? (
+              <p>{tab === 'personal' ? '可以围绕个人知识库梳理经历、准备面试题和整理投递策略。' : '可以围绕收藏知识库解释概念、拆解方法论和迁移到你的求职场景。'}</p>
+            ) : null}
+          </div>
+          <div className="knowledge-chat-thread">
+            {messages.map((message, index) => (
+              <Message
+                key={`${message.role}-${index}`}
+                role={message.role}
+                actions={message.actions}
+                onApproveAction={() => undefined}
+                onDismissAction={() => undefined}
+              >
+                {message.content}
+              </Message>
+            ))}
           </div>
 
-          {canEdit ? (
-            <div className="knowledge-editor">
-              <label>
-                <span>标题</span>
-                <input value={draft.title} onChange={(event) => onDraft({ ...draft, title: event.target.value })} />
-              </label>
-              <label>
-                <span>摘要</span>
-                <textarea rows={3} value={draft.summary} onChange={(event) => onDraft({ ...draft, summary: event.target.value })} placeholder="可选。留空时会自动从正文生成摘要。" />
-              </label>
-              <label>
-                <span>正文</span>
-                <textarea rows={8} value={draft.content} onChange={(event) => onDraft({ ...draft, content: event.target.value })} placeholder="粘贴资料正文、JD、题库、复盘、课程笔记或链接说明。" />
-              </label>
-              <label>
-                <span>来源链接</span>
-                <input value={draft.url} onChange={(event) => onDraft({ ...draft, url: event.target.value })} placeholder="可选" />
-              </label>
-              <div className="knowledge-editor-actions">
-                {activeItem?.source === 'personal' ? <button type="button" className="secondary-danger" onClick={() => onDelete(activeItem.id)}>删除</button> : null}
-                <button type="button" onClick={onSaveDraft} disabled={busy || !draft.title.trim() || !draft.content.trim()}>
-                  {busy ? '保存中' : isCreating ? '新建资料' : '保存修改'}
-                </button>
+          {activeItem ? (
+            <section className="knowledge-inline-editor">
+              <div className="knowledge-detail-head">
+                <div>
+                  <span>{canEdit ? '当前资料' : '已选资料'}</span>
+                  <h2>{activeItem.title}</h2>
+                </div>
+                <div className="knowledge-detail-actions">
+                  {activeItem.source === 'discover' ? (
+                    <button type="button" onClick={() => onSave(activeItem.id)} disabled={savedIds.includes(activeItem.id)}>
+                      {savedIds.includes(activeItem.id) ? '已收藏' : '收藏'}
+                    </button>
+                  ) : null}
+                  <button type="button" onClick={() => onAsk(activeItem)}>问桃子</button>
+                  <button type="button" onClick={() => onUseInProfile(activeItem)}>沉淀到档案</button>
+                </div>
               </div>
-            </div>
-          ) : (
-            <div className="knowledge-preview">
-              <p>{activeItem?.content || activeItem?.summary || '选择一条资料查看详情。'}</p>
-            </div>
-          )}
+              {canEdit ? (
+                <div className="knowledge-editor compact">
+                  <label>
+                    <span>标题</span>
+                    <input value={draft.title} onChange={(event) => onDraft({ ...draft, title: event.target.value })} />
+                  </label>
+                  <label>
+                    <span>摘要</span>
+                    <textarea rows={2} value={draft.summary} onChange={(event) => onDraft({ ...draft, summary: event.target.value })} />
+                  </label>
+                  <label>
+                    <span>正文</span>
+                    <textarea rows={5} value={draft.content} onChange={(event) => onDraft({ ...draft, content: event.target.value })} />
+                  </label>
+                  <div className="knowledge-editor-actions">
+                    {activeItem.source === 'personal' ? <button type="button" className="secondary-danger" onClick={() => onDelete(activeItem.id)}>删除</button> : null}
+                    <button type="button" onClick={onSaveDraft} disabled={busy || !draft.title.trim() || !draft.content.trim()}>
+                      {busy ? '保存中' : isCreating ? '新建资料' : '保存修改'}
+                    </button>
+                  </div>
+                </div>
+              ) : <p className="knowledge-preview-text">{activeItem.content || activeItem.summary}</p>}
+            </section>
+          ) : null}
+
+          <ChatComposer
+            value={question}
+            placeholder={tab === 'personal' ? '基于知识库向桃子提问，如基于个人知识库，梳理一下我在快手 AI 产品经理岗位的求职经历' : '基于知识库向桃子提问，如基于所收藏知识库，解释一下 auto-rubric 是什么意思'}
+            actions={[]}
+            disabled={Boolean(busy)}
+            button={busy ? '回答中' : '语音输入'}
+            buttonKind="voice"
+            onChange={onQuestion}
+            onSubmit={onAskQuestion}
+            onAction={() => undefined}
+            onUpload={onUpload}
+            uploadDisabled={Boolean(busy)}
+          />
         </section>
-      </div>
+      )}
     </section>
+  )
+}
+
+function KnowledgeFeedCard({
+  item,
+  featured,
+  index,
+  saved,
+  onSave,
+  onAsk,
+}: {
+  item: KnowledgeItem
+  featured?: boolean
+  index: number
+  saved: boolean
+  onSave: (id: string) => void
+  onAsk: (item: KnowledgeItem) => void
+}) {
+  return (
+    <article className={featured ? 'knowledge-feed-card featured' : 'knowledge-feed-card'}>
+      <div className="feed-cover" style={{ backgroundImage: `url(https://picsum.photos/seed/peach-knowledge-${index}/160/160)` }} />
+      <div>
+        <h3>{item.title}</h3>
+        <p>{item.summary}</p>
+        <span>{knowledgeMetaLine(item, index)}</span>
+      </div>
+      <div className="feed-actions">
+        <button type="button" onClick={() => onAsk(item)}>提问</button>
+        <button type="button" onClick={() => onSave(item.id)} disabled={saved}>{saved ? '已收藏' : '收藏'}</button>
+      </div>
+    </article>
   )
 }
 
@@ -1990,6 +2321,7 @@ function ChatComposer({
   actions,
   disabled,
   button,
+  buttonKind = 'send',
   uploadDisabled,
   onChange,
   onSubmit,
@@ -2001,6 +2333,7 @@ function ChatComposer({
   actions: string[]
   disabled: boolean
   button: string
+  buttonKind?: 'send' | 'voice'
   uploadDisabled?: boolean
   onChange: (value: string) => void
   onSubmit: () => void
@@ -2009,13 +2342,6 @@ function ChatComposer({
 }) {
   return (
     <section className="bottom-composer">
-      {actions.length ? (
-        <div className="composer-action-row">
-          {actions.map((action) => (
-            <button key={action} type="button" onClick={() => onAction(action)}>{action}</button>
-          ))}
-        </div>
-      ) : null}
       <div className="composer-input-row">
         <textarea
           rows={1}
@@ -2029,9 +2355,11 @@ function ChatComposer({
           }}
           placeholder={placeholder}
         />
-        <div className="composer-send-group">
+      </div>
+      <div className="composer-tool-row">
+        <div className="composer-left-tools">
           {onUpload ? (
-            <label className={uploadDisabled ? 'composer-upload-button disabled' : 'composer-upload-button'} title="上传文件">
+            <label className={uploadDisabled ? 'composer-upload-button disabled' : 'composer-upload-button'} title="上传文件" aria-label="上传文件">
               <input
                 type="file"
                 accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm"
@@ -2042,10 +2370,21 @@ function ChatComposer({
                   if (file) onUpload(file)
                 }}
               />
-              <span>上传</span>
+              <span aria-hidden="true">+</span>
             </label>
           ) : null}
-          <button type="button" onClick={onSubmit} disabled={disabled || !value.trim()}>{button}</button>
+          {actions.length ? (
+            <div className="composer-action-row">
+              {actions.map((action) => (
+                <button key={action} type="button" onClick={() => onAction(action)}>{action}</button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+        <div className="composer-send-group">
+          <button className={buttonKind === 'voice' ? 'voice-send-button' : ''} type="button" onClick={onSubmit} disabled={disabled || !value.trim()} aria-label={button}>
+            {buttonKind === 'voice' ? <span className="mic-icon" aria-hidden="true" /> : button}
+          </button>
         </div>
       </div>
     </section>
@@ -2242,6 +2581,49 @@ function toKnowledgeDraft(item: KnowledgeItem): KnowledgeDraft {
   }
 }
 
+function sortFolders(folders: KnowledgeFolder[], mode: SortMode) {
+  return [...folders].sort((a, b) => (mode === 'name' ? a.name.localeCompare(b.name, 'zh-CN') : b.id.localeCompare(a.id)))
+}
+
+function sortKnowledgeItems(items: KnowledgeItem[], mode: SortMode) {
+  return [...items].sort((a, b) => (mode === 'name' ? a.title.localeCompare(b.title, 'zh-CN') : b.id.localeCompare(a.id)))
+}
+
+function knowledgeTabLabel(tab: KnowledgeTab) {
+  const labels: Record<KnowledgeTab, string> = {
+    personal: '个人知识库',
+    saved: '收藏知识库',
+    discover: '发现知识库',
+  }
+  return labels[tab]
+}
+
+function knowledgeMetaLine(item: KnowledgeItem, index: number) {
+  const subscribers = ['2.1万人已订阅', '538人已订阅', '1.2万人已订阅', '7989人已订阅', '6907人已订阅']
+  const contents = ['100万+个内容', '729个内容', '164个内容', '4868个内容', '1077个内容']
+  return `${subscribers[index % subscribers.length]} | ${contents[index % contents.length]} | @${item.source === 'discover' ? '桃子精选' : '个人资料'}`
+}
+
+function titleFromUrl(value: string) {
+  try {
+    const url = new URL(value)
+    return url.hostname.replace(/^www\./, '') || '链接资料'
+  } catch {
+    return value.slice(0, 48) || '链接资料'
+  }
+}
+
+function discoverKnowledgeFeed(): KnowledgeItem[] {
+  return [
+    { id: 'feed-ai-pm', title: 'AI 产品经理求职资料库', summary: '覆盖 AI 产品方法论、岗位 JD 拆解、案例题和面试追问。', source: 'discover' },
+    { id: 'feed-autumn', title: '互联网秋招节奏库', summary: '按时间线整理提前批、正式批、补录和实习转正准备重点。', source: 'discover' },
+    { id: 'feed-resume', title: '产品简历表达库', summary: '收集项目经历、实习经历、量化表达和 STAR 改写样例。', source: 'discover' },
+    { id: 'feed-case', title: '商业分析与策略题库', summary: '沉淀市场规模、增长策略、竞品分析和业务拆解题。', source: 'discover' },
+    { id: 'feed-boss', title: '大厂面试官追问库', summary: '整理常见深挖方式，帮助候选人准备证据和反问。', source: 'discover' },
+    { id: 'feed-tools', title: '求职工具与术语库', summary: '解释 auto-rubric、JD fit、行为面、case interview 等概念。', source: 'discover' },
+  ]
+}
+
 function summarizeClientText(value: string, limit = 160) {
   const clean = value.replace(/\s+/g, ' ').trim()
   if (!clean) return ''
@@ -2252,28 +2634,6 @@ function isInterviewFinishIntent(value: string) {
   const clean = value.replace(/\s+/g, '')
   if (clean.length > 24) return false
   return ['结束面试', '停止面试', '结束并生成报告', '生成报告', '面试报告'].some((word) => clean.includes(word))
-}
-
-function looksLikeUrl(value: string) {
-  try {
-    const url = new URL(value)
-    return ['http:', 'https:'].includes(url.protocol)
-  } catch {
-    return false
-  }
-}
-
-function buildKnowledgeTitle(value: string) {
-  if (looksLikeUrl(value)) {
-    try {
-      const url = new URL(value)
-      return url.hostname.replace(/^www\./, '') || '链接资料'
-    } catch {
-      return '链接资料'
-    }
-  }
-  const firstLine = value.split(/\n/).find((line) => line.trim())
-  return summarizeClientText(firstLine || value, 48) || '个人资料'
 }
 
 function formatInterviewReportMessage(report?: {
@@ -2452,11 +2812,6 @@ function workspaceTitle(module: PrimaryModule, panel: PeachPanel) {
   return '你好，我是桃子'
 }
 
-function knowledgeSourceLabel(source: string) {
-  if (source === 'personal') return '个人知识库'
-  if (source === 'discover') return '发现知识库'
-  return '收藏知识库'
-}
 
 function formatTime(value: number) {
   const minutes = Math.floor(value / 60).toString().padStart(2, '0')
@@ -2466,7 +2821,7 @@ function formatTime(value: number) {
 
 function cleanAssistantText(value: string) {
   return value
-    .replace(/[—–]/g, '，')
+    .replace(/[\u2014\u2013]/g, '，')
     .replace(/```[\s\S]*?```/g, (block) => block.replace(/```/g, ''))
     .replace(/\*\*(.*?)\*\*/g, '$1')
     .replace(/__(.*?)__/g, '$1')

@@ -20,9 +20,17 @@ from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_upload
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
-MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH = 4
-TARGET_INTERVIEW_ANSWERS = 6
-MAX_INTERVIEW_ANSWERS = 8
+MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH = 8
+TARGET_INTERVIEW_ANSWERS = 10
+MAX_INTERVIEW_ANSWERS = 12
+INTERVIEW_CHECKLIST = [
+    ("self_intro", "自我介绍", "开场介绍已经建立候选人背景和目标"),
+    ("experience_deep_dive", "经历深挖", "至少追问过一段实习或项目的背景、行动和结果"),
+    ("role_understanding", "岗位理解", "覆盖了对岗位、公司、用户或业务的理解"),
+    ("evidence_quality", "证据质量", "回答中出现可验证的贡献、指标、结果或事实边界"),
+    ("pressure_followup", "压力追问", "完成过质疑、挑战或反事实追问"),
+    ("closing_readiness", "收尾准备", "已经足够生成可执行复盘和下一步计划"),
+]
 
 
 async def get_or_create_profile(session: AsyncSession) -> UserProfile:
@@ -517,7 +525,10 @@ def build_interview_progress(interview: InterviewSession) -> dict:
     transcript = interview.transcript or []
     answer_count = sum(1 for item in transcript if item.get("role") == "candidate")
     question_count = sum(1 for item in transcript if item.get("role") == "interviewer")
-    completion = min(100, round(answer_count / TARGET_INTERVIEW_ANSWERS * 100))
+    transcript_text = "\n".join(str(item.get("content") or "") for item in transcript)
+    checklist = build_interview_checklist(transcript_text, answer_count)
+    covered_count = sum(1 for item in checklist if item["done"])
+    completion = min(100, round(covered_count / len(INTERVIEW_CHECKLIST) * 100))
     return {
         "answer_count": answer_count,
         "question_count": question_count,
@@ -525,8 +536,36 @@ def build_interview_progress(interview: InterviewSession) -> dict:
         "target_answers": TARGET_INTERVIEW_ANSWERS,
         "max_answers": MAX_INTERVIEW_ANSWERS,
         "completion": completion,
-        "can_llm_finish": answer_count >= MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH and completion >= 67,
+        "checklist": checklist,
+        "can_llm_finish": answer_count >= MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH and covered_count >= 5,
     }
+
+
+def build_interview_checklist(transcript_text: str, answer_count: int) -> list[dict]:
+    text = transcript_text.lower()
+    keyword_groups = {
+        "self_intro": ["自我介绍", "我是", "来自", "背景", "经历"],
+        "experience_deep_dive": ["实习", "项目", "负责", "主导", "推动", "star", "结果"],
+        "role_understanding": ["岗位", "公司", "用户", "业务", "产品", "策略", "jd", "行业"],
+        "evidence_quality": ["数据", "%", "提升", "增长", "降低", "指标", "上线", "转化", "留存"],
+        "pressure_followup": ["质疑", "挑战", "如果", "为什么", "不是你", "压力", "反驳"],
+        "closing_readiness": ["复盘", "总结", "下一步", "改进", "收尾"],
+    }
+    checklist = []
+    for key, label, description in INTERVIEW_CHECKLIST:
+        matched = any(word in text for word in keyword_groups.get(key, []))
+        if key == "self_intro":
+            matched = matched or answer_count >= 1
+        if key == "experience_deep_dive":
+            matched = matched or answer_count >= 3
+        if key == "role_understanding":
+            matched = matched or answer_count >= 4
+        if key == "pressure_followup":
+            matched = matched or answer_count >= 6
+        if key == "closing_readiness":
+            matched = matched or answer_count >= 8
+        checklist.append({"key": key, "label": label, "description": description, "done": matched})
+    return checklist
 
 
 async def owned_knowledge(session: AsyncSession, user_id: str, item_id: str) -> KnowledgeResource:
