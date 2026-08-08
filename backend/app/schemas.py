@@ -22,6 +22,24 @@ class ChatIn(BaseModel):
     message: str
 
 
+class AgentActionIn(BaseModel):
+    message: str
+    context: dict = Field(default_factory=dict)
+
+
+class AgentToolExecuteIn(BaseModel):
+    tool: str
+    payload: dict = Field(default_factory=dict)
+
+
+class KnowledgeIn(BaseModel):
+    title: str
+    summary: str = ""
+    content: str = ""
+    source: str = "personal"
+    url: str = ""
+
+
 class PracticeIn(BaseModel):
     question: str
     answer: str
@@ -33,6 +51,8 @@ class InterviewStartIn(BaseModel):
     interviewer_style: str = "温和型"
     company: str = ""
     role: str = ""
+    jd: str = ""
+    question_bank: str = ""
 
 
 class InterviewAnswerIn(BaseModel):

@@ -1,18 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db import get_session
-from backend.app.models import InterviewSession, PracticeRecord, UserProfile
+from backend.app.models import InterviewSession, KnowledgeResource, PracticeRecord, UserProfile
 from backend.app.schemas import (
+    AgentActionIn,
+    AgentToolExecuteIn,
     ChatIn,
     InterviewAnswerIn,
     InterviewStartIn,
+    KnowledgeIn,
     PracticeIn,
     ProfileIn,
     ReviewIn,
 )
 from backend.app.services.agent import PeachAgent
+from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_upload
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
@@ -126,8 +130,22 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
         company=payload.company or profile.target_company,
         role=payload.role or profile.target_role,
     )
-    opening = await agent.start_interview(profile, interview)
+    opening = await agent.start_interview(
+        profile,
+        interview,
+        {"jd": payload.jd, "question_bank": payload.question_bank},
+    )
     interview.transcript = [
+        *(
+            [{"role": "system", "content": f"岗位 JD：{payload.jd[:3000]}"}]
+            if payload.jd.strip()
+            else []
+        ),
+        *(
+            [{"role": "system", "content": f"题库材料：{payload.question_bank[:3000]}"}]
+            if payload.question_bank.strip()
+            else []
+        ),
         {"role": "interviewer", "content": opening["opening"]},
         {"role": "interviewer", "content": opening["question"]},
     ]
@@ -206,6 +224,193 @@ async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) ->
     return {"reply": reply}
 
 
+@router.post("/agent/actions")
+async def agent_actions(payload: AgentActionIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    planned = await agent.plan_actions(profile, payload.message, payload.context)
+    return {
+        "reply": planned.get("reply", ""),
+        "actions": [normalize_tool_action(action, index) for index, action in enumerate(planned.get("actions", []))],
+    }
+
+
+@router.post("/agent/actions/execute")
+async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    data = payload.payload or {}
+
+    if payload.tool == "start_interview":
+        interview_payload = InterviewStartIn(
+            interview_type=str(data.get("interview_type") or "模拟面试"),
+            interviewer_style=str(data.get("interviewer_style") or "温和型"),
+            company=str(data.get("company") or profile.target_company or ""),
+            role=str(data.get("role") or profile.target_role),
+            jd=str(data.get("jd") or ""),
+            question_bank=str(data.get("question_bank") or ""),
+        )
+        result = await start_interview(interview_payload, session)
+        return {"message": "已创建模拟面试。", **result}
+
+    if payload.tool == "finish_latest_interview":
+        interview = await latest_interview(session, profile.id, active_only=True)
+        if not interview:
+            interview = await latest_interview(session, profile.id, active_only=False)
+        if not interview:
+            raise HTTPException(status_code=404, detail="没有可结束的面试")
+        result = await finish_interview(interview.id, session)
+        return {"message": "面试已结束，报告已生成。", **result}
+
+    if payload.tool == "update_profile_fields":
+        fields = data.get("fields", data)
+        if not isinstance(fields, dict):
+            raise HTTPException(status_code=400, detail="fields must be an object")
+        allowed = {"name", "target_role", "target_company", "target_city", "stage", "communication_style"}
+        for key, value in fields.items():
+            if key in allowed:
+                setattr(profile, key, str(value))
+        init = await agent.initialize_profile(profile)
+        profile.strengths = init.get("strengths", profile.strengths or [])
+        profile.weak_points = init.get("weak_points", profile.weak_points or [])
+        profile.plan = init.get("plan", profile.plan or [])
+        await session.commit()
+        await session.refresh(profile)
+        return {"message": "个人信息已更新。", "profile": serialize_profile(profile)}
+
+    if payload.tool == "update_resume":
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+        mode = str(data.get("mode") or "append")
+        profile.resume_text = content if mode == "replace" else "\n\n".join([item for item in [profile.resume_text, content] if item])
+        init = await agent.initialize_profile(profile)
+        profile.strengths = init.get("strengths", profile.strengths or [])
+        profile.weak_points = init.get("weak_points", profile.weak_points or [])
+        profile.plan = init.get("plan", profile.plan or [])
+        await session.commit()
+        await session.refresh(profile)
+        return {"message": "简历已更新。", "profile": serialize_profile(profile)}
+
+    if payload.tool == "append_profile_note":
+        content = str(data.get("content") or "").strip()
+        title = str(data.get("title") or "个人档案")
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+        profile.resume_text = "\n\n".join([item for item in [profile.resume_text, f"【{title}】\n{content}"] if item])
+        await session.commit()
+        await session.refresh(profile)
+        return {"message": f"已补充到{title}。", "profile": serialize_profile(profile)}
+
+    if payload.tool == "add_knowledge_item":
+        title = str(data.get("title") or "求职资料").strip()
+        resource = KnowledgeResource(
+            user_id=profile.id,
+            title=title[:160],
+            summary=str(data.get("summary") or data.get("content") or "")[:600],
+            content=str(data.get("content") or ""),
+            source="personal",
+            url=str(data.get("url") or ""),
+        )
+        session.add(resource)
+        await session.commit()
+        await session.refresh(resource)
+        return {"message": "已添加到个人知识库。", "knowledge": serialize_knowledge(resource)}
+
+    if payload.tool == "update_knowledge_item":
+        resource = await owned_knowledge(session, profile.id, str(data.get("id") or ""))
+        for key in ["title", "summary", "content", "url"]:
+            if key in data:
+                setattr(resource, key, str(data.get(key) or ""))
+        await session.commit()
+        await session.refresh(resource)
+        return {"message": "知识库资料已更新。", "knowledge": serialize_knowledge(resource)}
+
+    if payload.tool == "delete_knowledge_item":
+        resource = await owned_knowledge(session, profile.id, str(data.get("id") or ""))
+        item_id = resource.id
+        await session.delete(resource)
+        await session.commit()
+        return {"message": "知识库资料已删除。", "deleted_knowledge_id": item_id}
+
+    raise HTTPException(status_code=400, detail=f"unsupported tool: {payload.tool}")
+
+
+@router.get("/knowledge")
+async def list_knowledge(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    resources = (
+        await session.execute(
+            select(KnowledgeResource)
+            .where(KnowledgeResource.user_id == profile.id)
+            .order_by(desc(KnowledgeResource.created_at))
+        )
+    ).scalars().all()
+    return {"items": [serialize_knowledge(item) for item in resources]}
+
+
+@router.post("/knowledge")
+async def create_knowledge(payload: KnowledgeIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    resource = KnowledgeResource(
+        user_id=profile.id,
+        title=payload.title,
+        summary=payload.summary,
+        content=payload.content,
+        source=payload.source,
+        url=payload.url,
+    )
+    session.add(resource)
+    await session.commit()
+    await session.refresh(resource)
+    return {"item": serialize_knowledge(resource)}
+
+
+@router.put("/knowledge/{item_id}")
+async def update_knowledge(item_id: str, payload: KnowledgeIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    resource = await owned_knowledge(session, profile.id, item_id)
+    resource.title = payload.title
+    resource.summary = payload.summary
+    resource.content = payload.content
+    resource.source = payload.source
+    resource.url = payload.url
+    await session.commit()
+    await session.refresh(resource)
+    return {"item": serialize_knowledge(resource)}
+
+
+@router.delete("/knowledge/{item_id}")
+async def delete_knowledge(item_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    resource = await owned_knowledge(session, profile.id, item_id)
+    await session.delete(resource)
+    await session.commit()
+    return {"deleted": True, "id": item_id}
+
+
+@router.post("/files/parse")
+async def parse_file(file: UploadFile = File(...)) -> dict:
+    parsed = await parse_uploaded_file(file)
+    return {"file": parsed}
+
+
+@router.post("/knowledge/upload")
+async def upload_knowledge(file: UploadFile = File(...), session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    parsed = await parse_uploaded_file(file)
+    resource = KnowledgeResource(
+        user_id=profile.id,
+        title=parsed["title"],
+        summary=parsed["summary"],
+        content=parsed["content"],
+        source="personal",
+        url="",
+    )
+    session.add(resource)
+    await session.commit()
+    await session.refresh(resource)
+    return {"item": serialize_knowledge(resource), "file": parsed}
+
+
 def serialize_profile(profile: UserProfile) -> dict:
     return {
         "id": profile.id,
@@ -245,6 +450,92 @@ def serialize_interview(interview: InterviewSession) -> dict:
         "transcript": interview.transcript or [],
         "report": interview.report or {},
         "created_at": interview.created_at.isoformat() if interview.created_at else None,
+    }
+
+
+def serialize_knowledge(item: KnowledgeResource) -> dict:
+    return {
+        "id": item.id,
+        "title": item.title,
+        "summary": item.summary,
+        "content": item.content,
+        "source": item.source,
+        "url": item.url,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+def normalize_tool_action(action: dict, index: int) -> dict:
+    allowed_tools = {
+        "start_interview",
+        "finish_latest_interview",
+        "update_profile_fields",
+        "update_resume",
+        "append_profile_note",
+        "add_knowledge_item",
+        "update_knowledge_item",
+        "delete_knowledge_item",
+    }
+    tool = str(action.get("tool", ""))
+    if tool not in allowed_tools:
+        return {
+            "id": f"unsupported-{index}",
+            "tool": "unsupported",
+            "title": "无法执行的动作",
+            "summary": "桃子提出了一个当前版本还不支持的动作。",
+            "payload": {},
+            "approval_required": True,
+        }
+    return {
+        "id": str(action.get("id") or f"{tool}-{index}"),
+        "tool": tool,
+        "title": str(action.get("title") or "待确认动作"),
+        "summary": str(action.get("summary") or "确认后桃子会执行这个动作。"),
+        "payload": action.get("payload") if isinstance(action.get("payload"), dict) else {},
+        "approval_required": bool(action.get("approval_required", True)),
+    }
+
+
+async def latest_interview(session: AsyncSession, user_id: str, active_only: bool) -> InterviewSession | None:
+    query = select(InterviewSession).where(InterviewSession.user_id == user_id)
+    if active_only:
+        query = query.where(InterviewSession.status == "active")
+    result = await session.execute(query.order_by(desc(InterviewSession.created_at)).limit(1))
+    return result.scalar_one_or_none()
+
+
+async def owned_knowledge(session: AsyncSession, user_id: str, item_id: str) -> KnowledgeResource:
+    resource = await session.get(KnowledgeResource, item_id)
+    if not resource or resource.user_id != user_id:
+        raise HTTPException(status_code=404, detail="knowledge item not found")
+    return resource
+
+
+async def parse_uploaded_file(file: UploadFile) -> dict:
+    filename = file.filename or "upload"
+    extension = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in SUPPORTED_EXTENSIONS:
+        allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise HTTPException(status_code=400, detail=f"unsupported file type. allowed: {allowed}")
+
+    content = await file.read()
+    if len(content) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="file is too large")
+
+    try:
+        parsed = parse_upload(filename, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"file parse failed: {exc}") from exc
+
+    return {
+        "filename": parsed.filename,
+        "extension": parsed.extension,
+        "title": parsed.title,
+        "summary": parsed.summary,
+        "content": parsed.content,
+        "warning": parsed.warning,
     }
 
 

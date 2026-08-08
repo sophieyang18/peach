@@ -11,6 +11,9 @@ openai
 python-multipart
 httpx
 socksio
+pypdf
+python-docx
+beautifulsoup4
 pytest
 pytest-asyncio
 ruff
