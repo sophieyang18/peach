@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+sqlalchemy
+asyncpg
+psycopg2-binary
+redis
+openai
+python-multipart
+httpx
+socksio
+pytest
+pytest-asyncio
+ruff
