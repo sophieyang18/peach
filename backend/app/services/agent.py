@@ -14,6 +14,8 @@ PEACH_PERSONA = """
 输出要具体，避免空泛鸡汤。面试反馈必须包含亮点、可改进点、下一步练习。
 聊天回复必须像即时对话，不要写成公众号文章或长篇报告。
 不要使用 Markdown 格式，不要用加粗标记、标题符号、代码块或表格。
+不许羞辱、嘲讽、贬低或给用户起外号。即使是压力型面试，也只能通过连续追问、要求证据、指出逻辑漏洞来体现压力。
+不要使用破折号。需要停顿时用逗号、句号或分号。
 除非用户明确要求详细方案，否则每次回复控制在 3-6 个短段，每段 1-3 句话。
 可以给清单，但清单最多 3 项，且用自然语言，不要堆格式。
 """
@@ -99,9 +101,9 @@ class PeachAgent:
                 messages=[{"role": "system", "content": PEACH_PERSONA}, *messages],
                 temperature=0.7,
             )
-            return response.choices[0].message.content or fallback
+            return sanitize_agent_text(response.choices[0].message.content or fallback)
         except Exception:
-            return fallback
+            return sanitize_agent_text(fallback)
 
     async def json_complete(
         self,
@@ -216,6 +218,11 @@ JSON 字段：score(int 0-100), summary(str), highlights(list[str]), improvement
 题库材料：{str(context.get("question_bank") or "")[:2200]}
 薄弱点：{profile.weak_points or []}
 
+要求：
+1. 开场必须专业、简短，不要羞辱候选人。
+2. 压力型只体现为问题更具体、追问更严格。
+3. 如果简历信息不足，只说“简历信息有限”，不要攻击用户。
+
 JSON 字段：opening(str), question(str), rubric(list[str])
 """
         return await self.json_complete([{"role": "user", "content": prompt}], fallback)
@@ -225,7 +232,7 @@ JSON 字段：opening(str), question(str), rubric(list[str])
             "micro_feedback": "这题你没有跑偏，经历也讲出来了。下一轮我们把追问压力稍微加一点。",
             "next_question": "如果面试官质疑这个项目结果不是你主导的，你会怎么回应？",
             "hint": "可以按事实边界、个人贡献、协作价值三个层次回答。",
-            "should_finish": len(session.transcript) >= 5,
+            "should_finish": count_candidate_answers(session.transcript or []) >= 6,
         }
         prompt = f"""
 继续一场模拟面试。根据用户刚才回答，给一句短反馈，再追问下一题。
@@ -233,6 +240,13 @@ JSON 字段：opening(str), question(str), rubric(list[str])
 面试风格：{session.interviewer_style}
 历史对话：{(session.transcript or [])[-6:]}
 用户最新回答：{answer}
+候选人已回答轮数：{count_candidate_answers(session.transcript or [])}
+
+要求：
+1. 你已经在面试中，不能说“是否要开始”或“准备好了再开始”。
+2. 把用户最新内容当作候选人回答，必须继续反馈和追问。
+3. 压力型也要专业，不要羞辱、嘲讽或人身攻击。
+4. should_finish 只有在候选人至少回答 6 轮，且已经覆盖自我介绍、经历深挖、岗位理解和压力追问后才可以为 true。
 
 JSON 字段：micro_feedback(str), next_question(str), hint(str), should_finish(bool)
 """
@@ -296,6 +310,9 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 所有工具动作必须先让用户确认，不能直接执行。
 不要为了显得智能而乱提动作。只有当用户明确表达要开始面试、结束面试、改档案、改简历、添加知识资料，或上传文件且意图明显时才提出动作。
 如果用户上传了文件，你要先判断文件更适合作为知识库资料、简历、项目/实习经历、面试题库还是 JD。可以同时提出 1-3 个动作，但必须解释每个动作会改哪里。
+如果前端上下文显示 current_panel 是 live-interview 或 interview_active 是 true，说明面试已经开始。此时不要再提出 start_interview，除非用户明确说重新开一场新的面试。
+面试进行中时，用户普通回答应被理解为候选人回答，不要回复“你想开练吗”。
+面试进行中时，只有用户明确说“结束面试、停止面试、生成报告、面试报告”时，才可以提出 finish_latest_interview。不要因为你觉得够了就主动结束，主动建议结束由面试进度接口控制。
 当用户说“优化简历”“帮我改简历”，payload.content 要给出整理后的可保存简历内容，而不是只把原话塞进去。
 当用户说“针对某家公司/某类公司/某岗位模拟面试”，尽量从用户话里提取 company、role、interviewer_style、interview_type、jd，并提出 start_interview。
 当用户说“把这个存起来”“以后参考”“加入知识库”，优先提出 add_knowledge_item。
@@ -332,6 +349,19 @@ actions: list, 每个动作包含 tool, title, summary, payload, approval_requir
         data = await self.json_complete([{"role": "user", "content": prompt}], fallback)
         if not isinstance(data.get("actions"), list):
             data["actions"] = []
+        if context.get("current_panel") == "live-interview" or context.get("interview_active"):
+            allow_restart = any(word in message for word in ["重新开", "重开", "重新开始", "再开一场", "换一场"])
+            user_requested_finish = any(word in message for word in ["结束面试", "停止面试", "生成报告", "面试报告", "结束并生成"])
+            if not allow_restart:
+                data["actions"] = [
+                    action for action in data["actions"]
+                    if not (isinstance(action, dict) and action.get("tool") == "start_interview")
+                ]
+            if not user_requested_finish:
+                data["actions"] = [
+                    action for action in data["actions"]
+                    if not (isinstance(action, dict) and action.get("tool") == "finish_latest_interview")
+                ]
         data["actions"] = hydrate_uploaded_file_actions(data["actions"], uploaded_file)
         return data
 
@@ -351,6 +381,7 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
 
     material = file_content or text
     lower = text.lower()
+    interview_active = bool(context.get("interview_active")) or context.get("current_panel") == "live-interview"
 
     if any(word in text for word in ["结束面试", "生成报告", "面试报告"]):
         actions.append(
@@ -358,11 +389,11 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
                 "tool": "finish_latest_interview",
                 "title": "结束最近一场面试",
                 "summary": "结束进行中的模拟面试，并生成一份复盘报告。",
-                "payload": {},
+                "payload": {"interview_id": context.get("active_interview_id") or ""},
                 "approval_required": True,
             }
         )
-    elif "面试" in text and any(word in text for word in ["开始", "来一场", "模拟", "练", "针对"]):
+    elif not interview_active and "面试" in text and any(word in text for word in ["开始", "来一场", "模拟", "练", "针对"]):
         company = infer_company(text, profile.target_company or "")
         role = infer_role(text, profile.target_role)
         actions.append(
@@ -443,8 +474,14 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
             }
         )
 
+    reply = "我先帮你判断了一下，这件事可以直接变成一个可执行动作。你确认后我再动手。"
+    if interview_active and not actions:
+        reply = "收到，这句话我会当作面试中的回答来处理。我们继续沿着当前面试追问，不会重新开一场。"
+    elif actions:
+        reply = "我读完了，先给你整理成可确认的动作。你点确认后我再真正修改档案、简历或知识库。"
+
     return {
-        "reply": "我读完了，先给你整理成可确认的动作。你点确认后我再真正修改档案、简历或知识库。",
+        "reply": reply,
         "actions": actions,
     }
 
@@ -538,3 +575,22 @@ def hydrate_uploaded_file_actions(actions: list[Any], uploaded_file: Any) -> lis
         action["payload"] = payload
         hydrated.append(action)
     return hydrated
+
+
+def sanitize_agent_text(value: str) -> str:
+    replacements = {
+        "——": "，",
+        "—": "，",
+        "–": "-",
+        "猪猪猪": "同学",
+        "你是来面试产品经理，不是来给我猜谜语的": "这份简历信息还不够完整，我会用追问帮你补齐证据",
+        "没反应就算你弃权": "我们直接进入第一题",
+    }
+    text = value
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return text.strip()
+
+
+def count_candidate_answers(transcript: list[dict[str, Any]]) -> int:
+    return sum(1 for item in transcript if item.get("role") == "candidate")

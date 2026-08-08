@@ -96,6 +96,16 @@ type InterviewSettings = {
   questionBank: string
 }
 
+type InterviewProgress = {
+  answer_count: number
+  question_count: number
+  min_answers_for_llm_finish: number
+  target_answers: number
+  max_answers: number
+  completion: number
+  can_llm_finish: boolean
+}
+
 type ResumeFolder = {
   id: string
   title: string
@@ -202,6 +212,15 @@ const defaultMessages: ChatMessage[] = [
 
 const fixedBubbles = ['帮我模拟面试', '帮我写简历', '帮我改简历', '我能投哪些岗位']
 const composerActions = ['模拟面试', '题库练习', '简历优化', '简历撰写', '投递动态']
+const defaultInterviewProgress: InterviewProgress = {
+  answer_count: 0,
+  question_count: 0,
+  min_answers_for_llm_finish: 4,
+  target_answers: 6,
+  max_answers: 8,
+  completion: 0,
+  can_llm_finish: false,
+}
 
 const initialConversations: Conversation[] = [
   {
@@ -262,6 +281,9 @@ function App() {
     questionBank: '产品经理通用题库',
   })
   const [liveKind, setLiveKind] = useState<'interview' | 'question-bank'>('interview')
+  const [activeInterviewId, setActiveInterviewId] = useState('')
+  const [interviewProgress, setInterviewProgress] = useState<InterviewProgress>(defaultInterviewProgress)
+  const [finishSuggestionShown, setFinishSuggestionShown] = useState(false)
   const [seconds, setSeconds] = useState(0)
   const [paused, setPaused] = useState(false)
   const [subtitleCollapsed, setSubtitleCollapsed] = useState(false)
@@ -491,6 +513,9 @@ function App() {
           message: snapshot,
           context: {
             current_panel: peachPanel,
+            active_interview_id: activeInterviewId,
+            interview_active: peachPanel === 'live-interview' && Boolean(activeInterviewId),
+            interview_progress: interviewProgress,
             active_profile_section: activeProfileSection,
             profile_sections: profileSections,
             recent_messages: activeConversation.messages.slice(-8),
@@ -520,12 +545,30 @@ function App() {
     }
 
     markActionStatus(action.id, 'executing')
+    if (action.tool === 'start_interview') {
+      setSettings((current) => ({
+        ...current,
+        style: String(action.payload.interviewer_style ?? current.style),
+        jd: String(action.payload.jd ?? current.jd),
+        questionBank: String(action.payload.question_bank ?? current.questionBank),
+      }))
+      setActiveInterviewId('')
+      setInterviewProgress(defaultInterviewProgress)
+      setFinishSuggestionShown(false)
+      setLiveKind(String(action.payload.interview_type ?? '').includes('题库') ? 'question-bank' : 'interview')
+      setSeconds(0)
+      setPaused(false)
+      setPeachPanel('live-interview')
+      appendMessage({ role: 'system', content: '正在生成第一题。' })
+    }
     begin('chat', `正在执行${action.title}`)
     try {
       const data = await api<{
         message?: string
         profile?: Profile
         interview?: { id: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: { summary?: string } }
+        opening?: { opening?: string; question?: string }
+        progress?: InterviewProgress
         report?: { summary?: string; overall_score?: number }
         knowledge?: KnowledgeItem
         deleted_knowledge_id?: string
@@ -535,11 +578,14 @@ function App() {
       })
 
       markActionStatus(action.id, 'approved')
+      removeSystemMessage('正在生成第一题。')
       applyToolResult(action, data)
       appendMessage({ role: 'system', content: data.message || '动作已完成。' })
       void refreshDashboard()
     } catch (err) {
+      removeSystemMessage('正在生成第一题。')
       markActionStatus(action.id, 'pending')
+      if (action.tool === 'start_interview') setPeachPanel('interview-setup')
       setError('动作执行失败，先没有改动任何内容。')
       console.error(err)
     } finally {
@@ -556,7 +602,9 @@ function App() {
     action: AgentToolProposal,
     data: {
       profile?: Profile
-      interview?: { interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: { summary?: string } }
+      interview?: { id?: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: { summary?: string } }
+      opening?: { opening?: string; question?: string }
+      progress?: InterviewProgress
       report?: { summary?: string; overall_score?: number }
       knowledge?: KnowledgeItem
       deleted_knowledge_id?: string
@@ -584,9 +632,21 @@ function App() {
         jd: String(action.payload.jd ?? current.jd),
         questionBank: String(action.payload.question_bank ?? current.questionBank),
       }))
-      setPeachPanel('interview-setup')
+      setActiveInterviewId(data.interview.id || '')
+      setInterviewProgress(data.progress ?? defaultInterviewProgress)
+      setFinishSuggestionShown(false)
+      setLiveKind(String(data.interview.interview_type).includes('题库') ? 'question-bank' : 'interview')
+      setSeconds(0)
+      setPaused(false)
+      setPeachPanel('live-interview')
+      if (data.opening?.opening || data.opening?.question) {
+        appendMessage({ role: 'peach', content: cleanAssistantText([data.opening.opening, data.opening.question].filter(Boolean).join('\n\n')) })
+      }
     }
     if (action.tool === 'finish_latest_interview') {
+      setActiveInterviewId('')
+      setInterviewProgress(defaultInterviewProgress)
+      setFinishSuggestionShown(false)
       setPeachPanel('new-chat')
       if (data.report?.summary) appendMessage({ role: 'peach', content: `这场面试我已经收尾了。${data.report.summary}` })
     }
@@ -624,19 +684,31 @@ function App() {
       setMediaReady(true)
       setSeconds(0)
       setPaused(false)
+      setInterviewProgress(defaultInterviewProgress)
+      setFinishSuggestionShown(false)
       setLiveKind(kind)
-      setPeachPanel('live-interview')
-      appendMessage({ role: 'peach', content: kind === 'question-bank' ? '题库练习开始。我们按题库顺序来，我会根据你的回答追问。' : '模拟面试开始。先稳住节奏，按真实面试来。' })
 
-      void api('/api/interviews', {
+      begin('interviewStart', '正在生成面试开场')
+      const data = await api<{
+        interview: { id: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string }
+        opening: { opening: string; question: string; rubric?: string[] }
+        progress?: InterviewProgress
+      }>('/api/interviews', {
         method: 'POST',
         body: JSON.stringify({
           interview_type: kind === 'question-bank' ? '题库练习' : '模拟面试',
           interviewer_style: settings.style,
           company: profile.target_company,
           role: profile.target_role,
+          jd: settings.jd,
+          question_bank: kind === 'question-bank' ? settings.questionBank : '',
         }),
-      }).catch(() => undefined)
+      })
+
+      setActiveInterviewId(data.interview.id)
+      setInterviewProgress(data.progress ?? defaultInterviewProgress)
+      setPeachPanel('live-interview')
+      appendMessage({ role: 'peach', content: cleanAssistantText(`${data.opening.opening}\n\n${data.opening.question}`) })
 
       setNotice('实时面试已开始。')
     } catch (err) {
@@ -645,6 +717,110 @@ function App() {
       console.error(err)
     } finally {
       end('interviewStart')
+    }
+  }
+
+  async function sendInterviewAnswer() {
+    const answer = input.trim()
+    if (!answer || paused || busy.chat) return
+    if (!activeInterviewId) {
+      setError('当前没有连接到进行中的面试，请回到设置页重新开始。')
+      return
+    }
+    if (isInterviewFinishIntent(answer)) {
+      setInput('')
+      appendMessage({ role: 'user', content: answer })
+      await finishActiveInterview()
+      return
+    }
+    const interviewId = activeInterviewId
+    setInput('')
+    appendMessage({ role: 'user', content: answer })
+    appendMessage({ role: 'system', content: '面试官正在追问。' })
+    begin('chat', '面试官正在追问')
+    try {
+      const data = await api<{
+        interview: { id: string; status: string; report?: { summary?: string; overall_score?: number } }
+        next: { micro_feedback?: string; next_question?: string; hint?: string; should_finish?: boolean }
+        report?: { summary?: string; overall_score?: number; key_improvements?: string[]; next_plan?: string[] }
+        progress?: InterviewProgress
+      }>(`/api/interviews/${interviewId}/answer`, {
+        method: 'POST',
+        body: JSON.stringify({ answer }),
+      })
+      removeSystemMessage('面试官正在追问。')
+      const reply = [
+        data.next.micro_feedback,
+        data.next.next_question,
+        data.next.hint ? `提示：${data.next.hint}` : '',
+      ].filter(Boolean).join('\n\n')
+      appendMessage({ role: 'peach', content: cleanAssistantText(reply || '收到，我们继续下一题。') })
+      const nextProgress = data.progress ?? interviewProgress
+      setInterviewProgress(nextProgress)
+      if (data.interview.status === 'completed') {
+        setActiveInterviewId('')
+        setInterviewProgress(defaultInterviewProgress)
+        setFinishSuggestionShown(false)
+        setPeachPanel('new-chat')
+        appendMessage({ role: 'peach', content: formatInterviewReportMessage(data.report || data.interview.report) })
+      } else if (data.next.should_finish && nextProgress.can_llm_finish && !finishSuggestionShown) {
+        appendMessage({
+          role: 'peach',
+          content: '这场已经达到可复盘的最低轮数。你可以继续练，也可以现在结束生成报告。',
+          actions: [{
+            id: `finish-${interviewId}-${Date.now()}`,
+            tool: 'finish_latest_interview',
+            title: '结束并生成报告',
+            summary: `已回答 ${nextProgress.answer_count}/${nextProgress.target_answers} 轮，完成度 ${nextProgress.completion}%。确认后生成面试复盘报告。`,
+            payload: { interview_id: interviewId, reason: '达到最低面试完成度' },
+            approval_required: true,
+            status: 'pending',
+          }],
+        })
+        setFinishSuggestionShown(true)
+      }
+      setNotice(data.interview.status === 'completed' ? '面试已完成。' : '追问已生成。')
+    } catch (err) {
+      removeSystemMessage('面试官正在追问。')
+      setInput(answer)
+      setError('面试追问生成失败，回答已经放回输入框。')
+      console.error(err)
+    } finally {
+      end('chat')
+    }
+  }
+
+  async function finishActiveInterview() {
+    if (busy.chat) return
+    if (!activeInterviewId) {
+      setPeachPanel('new-chat')
+      setInterviewProgress(defaultInterviewProgress)
+      setFinishSuggestionShown(false)
+      setNotice('已退出面试。')
+      return
+    }
+    begin('chat', '正在结束面试并生成报告')
+    appendMessage({ role: 'system', content: '正在生成面试报告。' })
+    try {
+      const data = await api<{
+        interview: { id: string; status: string; report?: { summary?: string; overall_score?: number } }
+        report?: { summary?: string; overall_score?: number; key_improvements?: string[]; next_plan?: string[] }
+      }>(`/api/interviews/${activeInterviewId}/finish`, { method: 'POST' })
+      removeSystemMessage('正在生成面试报告。')
+      setActiveInterviewId('')
+      setPaused(false)
+      setInterviewProgress(defaultInterviewProgress)
+      setFinishSuggestionShown(false)
+      setPeachPanel('new-chat')
+      appendMessage({ role: 'peach', content: formatInterviewReportMessage(data.report || data.interview.report) })
+      setNotice('面试已结束，报告已生成。')
+      void refreshDashboard()
+    } catch (err) {
+      removeSystemMessage('正在生成面试报告。')
+      setError('面试报告生成失败，可以稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('chat')
     }
   }
 
@@ -1017,6 +1193,8 @@ function App() {
             input={input}
             settings={settings}
             liveKind={liveKind}
+            activeInterviewId={activeInterviewId}
+            interviewProgress={interviewProgress}
             seconds={seconds}
             paused={paused}
             mediaReady={mediaReady}
@@ -1027,7 +1205,7 @@ function App() {
             chatScrollRef={chatScrollRef}
             busy={busy}
             onInput={setInput}
-            onSend={() => void sendPrompt(input)}
+            onSend={() => (peachPanel === 'live-interview' ? void sendInterviewAnswer() : void sendPrompt(input))}
             onQuickSend={(value) => void sendPrompt(value)}
             onAction={runComposerAction}
             onSettingsChange={setSettings}
@@ -1036,6 +1214,7 @@ function App() {
             onUploadInterviewFile={(file, target) => void uploadInterviewFile(file, target)}
             onUploadChatFile={(file) => void uploadChatFile(file)}
             onPauseToggle={() => setPaused((value) => !value)}
+            onFinishInterview={() => void finishActiveInterview()}
             onSubtitleToggle={() => setSubtitleCollapsed((value) => !value)}
             onTimerToggle={() => setTimerCollapsed((value) => !value)}
             onBackToSetup={() => setPeachPanel(liveKind === 'question-bank' ? 'question-bank-setup' : 'interview-setup')}
@@ -1147,6 +1326,8 @@ function PeachWorkspace(props: {
   input: string
   settings: InterviewSettings
   liveKind: 'interview' | 'question-bank'
+  activeInterviewId: string
+  interviewProgress: InterviewProgress
   seconds: number
   paused: boolean
   mediaReady: boolean
@@ -1166,6 +1347,7 @@ function PeachWorkspace(props: {
   onUploadInterviewFile: (file: File, target: 'resume' | 'questionBank') => void
   onUploadChatFile: (file: File) => void
   onPauseToggle: () => void
+  onFinishInterview: () => void
   onSubtitleToggle: () => void
   onTimerToggle: () => void
   onBackToSetup: () => void
@@ -1343,6 +1525,8 @@ function InterviewSetup({
 function LiveInterview({
   settings,
   liveKind,
+  activeInterviewId,
+  interviewProgress,
   conversation,
   input,
   seconds,
@@ -1358,22 +1542,56 @@ function LiveInterview({
   onSend,
   onUploadChatFile,
   onPauseToggle,
+  onFinishInterview,
   onSubtitleToggle,
   onTimerToggle,
   onBackToSetup,
+  onApproveAction,
+  onDismissAction,
 }: Parameters<typeof PeachWorkspace>[0]) {
   const liveTitle = liveKind === 'question-bank' ? '题库练习进行中' : '模拟面试进行中'
+  const contextItems = [
+    { label: '岗位', value: settings.resume },
+    { label: '风格', value: settings.style },
+    { label: '形式', value: settings.mode === 'video' ? '视频' : '语音' },
+  ]
+  const transcriptPreview = conversation.messages
+    .filter((message) => message.role !== 'system')
+    .slice(-4)
 
   return (
     <section className="live-stage">
       <div className="live-main">
+        <div className="interview-status-strip">
+          <div>
+            <span>{activeInterviewId ? '面试已连接' : '等待连接'}</span>
+            <strong>{liveTitle}</strong>
+          </div>
+          <div className="interview-status-meta">
+            <span>{formatTime(seconds)}</span>
+            <span>{paused ? '暂停中' : '进行中'}</span>
+            <span>{interviewProgress.answer_count}/{interviewProgress.target_answers} 轮</span>
+          </div>
+        </div>
+
         <div className="avatar-stage" aria-label="桃子的半身形象">
-          <div className="peach-avatar">
-            <div className="avatar-face">桃</div>
+          <div className={paused ? 'peach-avatar paused' : 'peach-avatar'}>
+            <div className="avatar-aura" />
+            <div className="avatar-face">
+              <span>桃</span>
+            </div>
             <div className="avatar-body">
               <strong>{liveTitle}</strong>
               <span>{settings.mode === 'video' ? '视频面试' : '语音面试'} / {settings.style}</span>
             </div>
+          </div>
+          <div className="interview-context-grid">
+            {contextItems.map((item) => (
+              <div key={item.label}>
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
+              </div>
+            ))}
           </div>
           <div className="live-controls">
             <button type="button" onClick={onPauseToggle}>{paused ? '继续面试' : '暂停面试'}</button>
@@ -1387,8 +1605,8 @@ function LiveInterview({
               actions={message.actions}
               key={`${message.role}-${index}`}
               role={message.role}
-              onApproveAction={() => undefined}
-              onDismissAction={() => undefined}
+              onApproveAction={onApproveAction}
+              onDismissAction={onDismissAction}
             >
               {message.content}
             </Message>
@@ -1398,18 +1616,33 @@ function LiveInterview({
         <ChatComposer
           value={input}
           placeholder={paused ? '面试暂停中，点击继续后再回答' : '输入你的回答，也可以后续接入语音转写'}
-          actions={[]}
+          actions={[paused ? '继续面试' : '暂停面试', '结束面试']}
           disabled={paused || Boolean(busy.chat)}
           button={busy.chat ? '发送中' : '发送'}
           onChange={onInput}
           onSubmit={onSend}
-          onAction={() => undefined}
+          onAction={(action) => {
+            if (action === '结束面试') onFinishInterview()
+            else onPauseToggle()
+          }}
           onUpload={onUploadChatFile}
           uploadDisabled={paused || Boolean(busy.upload || busy.chat)}
         />
       </div>
 
       <aside className="live-side">
+        <section className="side-widget interview-focus-card">
+          <div className="widget-head">
+            <span>当前面试</span>
+            <strong>{activeInterviewId ? '已同步' : '本地模式'}</strong>
+          </div>
+          <p>{settings.jd.trim() ? summarizeClientText(settings.jd, 120) : '未填写 JD。桃子会先按目标岗位和简历追问。'}</p>
+          <p className="interview-progress-note">
+            已回答 {interviewProgress.answer_count} 轮，完成度 {interviewProgress.completion}%。
+            桃子至少完成 {interviewProgress.min_answers_for_llm_finish} 轮后才会建议结束，最多 {interviewProgress.max_answers} 轮会自动收尾。
+          </p>
+        </section>
+
         {settings.mode === 'video' ? (
           <section className="side-widget video-widget">
             <div className="widget-head">
@@ -1427,8 +1660,14 @@ function LiveInterview({
           </div>
           {!subtitleCollapsed ? (
             <div className="subtitle-lines">
-              <p>{mediaReady ? '桃子：请先做一个 1 分钟自我介绍。' : '等待媒体权限开启。'}</p>
-              <p>{paused ? '面试已暂停。' : '字幕模块会在接入语音识别后实时更新。'}</p>
+              {transcriptPreview.length ? transcriptPreview.map((message, index) => (
+                <p className={message.role === 'user' ? 'candidate-line' : ''} key={`${message.role}-${index}`}>
+                  <strong>{message.role === 'user' ? '我' : '桃子'}</strong>
+                  {cleanAssistantText(message.content)}
+                </p>
+              )) : (
+                <p>{mediaReady ? '等待第一轮回答。' : '等待媒体权限开启。'}</p>
+              )}
             </div>
           ) : null}
         </section>
@@ -2009,6 +2248,12 @@ function summarizeClientText(value: string, limit = 160) {
   return clean.slice(0, limit) + (clean.length > limit ? '...' : '')
 }
 
+function isInterviewFinishIntent(value: string) {
+  const clean = value.replace(/\s+/g, '')
+  if (clean.length > 24) return false
+  return ['结束面试', '停止面试', '结束并生成报告', '生成报告', '面试报告'].some((word) => clean.includes(word))
+}
+
 function looksLikeUrl(value: string) {
   try {
     const url = new URL(value)
@@ -2029,6 +2274,23 @@ function buildKnowledgeTitle(value: string) {
   }
   const firstLine = value.split(/\n/).find((line) => line.trim())
   return summarizeClientText(firstLine || value, 48) || '个人资料'
+}
+
+function formatInterviewReportMessage(report?: {
+  summary?: string
+  overall_score?: number
+  key_improvements?: string[]
+  next_plan?: string[]
+}) {
+  if (!report) return '这场面试已结束。报告生成完成，可以在个人档案和成长记录里继续复盘。'
+  const parts = [
+    '这场面试已结束，我先给你一版简短复盘。',
+    report.overall_score ? `综合表现：${report.overall_score} 分。` : '',
+    report.summary || '',
+    report.key_improvements?.length ? `优先改进：${report.key_improvements.slice(0, 3).join('；')}` : '',
+    report.next_plan?.length ? `下一步：${report.next_plan.slice(0, 3).join('；')}` : '',
+  ].filter(Boolean)
+  return parts.join('\n\n')
 }
 
 async function responseErrorMessage(response: Response) {
@@ -2204,6 +2466,7 @@ function formatTime(value: number) {
 
 function cleanAssistantText(value: string) {
   return value
+    .replace(/[—–]/g, '，')
     .replace(/```[\s\S]*?```/g, (block) => block.replace(/```/g, ''))
     .replace(/\*\*(.*?)\*\*/g, '$1')
     .replace(/__(.*?)__/g, '$1')

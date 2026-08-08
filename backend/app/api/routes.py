@@ -20,6 +20,9 @@ from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_upload
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
+MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH = 4
+TARGET_INTERVIEW_ANSWERS = 6
+MAX_INTERVIEW_ANSWERS = 8
 
 
 async def get_or_create_profile(session: AsyncSession) -> UserProfile:
@@ -152,7 +155,7 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
     session.add(interview)
     await session.commit()
     await session.refresh(interview)
-    return {"interview": serialize_interview(interview), "opening": opening}
+    return {"interview": serialize_interview(interview), "opening": opening, "progress": build_interview_progress(interview)}
 
 
 @router.post("/interviews/{interview_id}/answer")
@@ -175,13 +178,20 @@ async def answer_interview(
         {"role": "interviewer", "content": next_turn["next_question"]},
     ]
 
-    if next_turn.get("should_finish"):
+    progress = build_interview_progress(interview)
+    llm_can_finish = progress["can_llm_finish"]
+    should_offer_finish = bool(next_turn.get("should_finish")) and llm_can_finish
+    force_finish = progress["answer_count"] >= MAX_INTERVIEW_ANSWERS
+    next_turn["should_finish"] = should_offer_finish
+
+    if force_finish:
         interview.status = "completed"
         interview.report = await agent.interview_report(profile, interview)
+        progress = build_interview_progress(interview)
 
     await session.commit()
     await session.refresh(interview)
-    return {"interview": serialize_interview(interview), "next": next_turn, "report": interview.report}
+    return {"interview": serialize_interview(interview), "next": next_turn, "report": interview.report, "progress": progress}
 
 
 @router.post("/interviews/{interview_id}/finish")
@@ -195,7 +205,7 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
     interview.report = await agent.interview_report(profile, interview)
     await session.commit()
     await session.refresh(interview)
-    return {"interview": serialize_interview(interview), "report": interview.report}
+    return {"interview": serialize_interview(interview), "report": interview.report, "progress": build_interview_progress(interview)}
 
 
 @router.post("/review")
@@ -252,7 +262,10 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         return {"message": "已创建模拟面试。", **result}
 
     if payload.tool == "finish_latest_interview":
-        interview = await latest_interview(session, profile.id, active_only=True)
+        interview_id = str(data.get("interview_id") or "").strip()
+        interview = await session.get(InterviewSession, interview_id) if interview_id else None
+        if not interview:
+            interview = await latest_interview(session, profile.id, active_only=True)
         if not interview:
             interview = await latest_interview(session, profile.id, active_only=False)
         if not interview:
@@ -282,10 +295,6 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             raise HTTPException(status_code=400, detail="content is required")
         mode = str(data.get("mode") or "append")
         profile.resume_text = content if mode == "replace" else "\n\n".join([item for item in [profile.resume_text, content] if item])
-        init = await agent.initialize_profile(profile)
-        profile.strengths = init.get("strengths", profile.strengths or [])
-        profile.weak_points = init.get("weak_points", profile.weak_points or [])
-        profile.plan = init.get("plan", profile.plan or [])
         await session.commit()
         await session.refresh(profile)
         return {"message": "简历已更新。", "profile": serialize_profile(profile)}
@@ -502,6 +511,22 @@ async def latest_interview(session: AsyncSession, user_id: str, active_only: boo
         query = query.where(InterviewSession.status == "active")
     result = await session.execute(query.order_by(desc(InterviewSession.created_at)).limit(1))
     return result.scalar_one_or_none()
+
+
+def build_interview_progress(interview: InterviewSession) -> dict:
+    transcript = interview.transcript or []
+    answer_count = sum(1 for item in transcript if item.get("role") == "candidate")
+    question_count = sum(1 for item in transcript if item.get("role") == "interviewer")
+    completion = min(100, round(answer_count / TARGET_INTERVIEW_ANSWERS * 100))
+    return {
+        "answer_count": answer_count,
+        "question_count": question_count,
+        "min_answers_for_llm_finish": MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH,
+        "target_answers": TARGET_INTERVIEW_ANSWERS,
+        "max_answers": MAX_INTERVIEW_ANSWERS,
+        "completion": completion,
+        "can_llm_finish": answer_count >= MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH and completion >= 67,
+    }
 
 
 async def owned_knowledge(session: AsyncSession, user_id: str, item_id: str) -> KnowledgeResource:
