@@ -148,7 +148,7 @@ async def deep_health(session: AsyncSession = Depends(get_session)) -> dict:
 
     try:
         await session.execute(text("select 1"))
-        checks["database"] = {"ok": True, "detail": "postgres reachable"}
+        checks["database"] = {"ok": True, "detail": "database reachable"}
     except Exception as exc:
         checks["database"] = {"ok": False, "detail": str(exc)[:240]}
 

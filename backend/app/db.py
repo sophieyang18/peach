@@ -1,4 +1,6 @@
 from collections.abc import AsyncGenerator
+from pathlib import Path
+from urllib.parse import urlparse
 
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -12,6 +14,13 @@ class Base(DeclarativeBase):
 
 
 settings = get_settings()
+
+if settings.database_url.startswith("sqlite"):
+    parsed = urlparse(settings.database_url)
+    db_path = parsed.path.lstrip("/")
+    if db_path and db_path != ":memory:":
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
