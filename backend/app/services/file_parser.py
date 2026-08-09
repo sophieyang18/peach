@@ -6,13 +6,16 @@ import zipfile
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
+from urllib.parse import urlparse
 
+import httpx
 from bs4 import BeautifulSoup
 from docx import Document
 from pypdf import PdfReader
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".md", ".markdown", ".html", ".htm"}
+MAX_LINK_BYTES = 2 * 1024 * 1024
 
 
 @dataclass
@@ -94,6 +97,40 @@ def parse_html(content: bytes) -> str:
     return soup.get_text("\n")
 
 
+async def parse_link(url: str) -> ParsedFile:
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise ValueError("unsupported url")
+
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+        response = await client.get(url, headers={"User-Agent": "PeachAgent/0.1"})
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        content = response.content[:MAX_LINK_BYTES]
+
+    if "pdf" in content_type or parsed_url.path.lower().endswith(".pdf"):
+        parsed = parse_upload(Path(parsed_url.path).name or "link.pdf", content)
+        return ParsedFile(
+            filename=Path(parsed_url.path).name or parsed.filename,
+            extension=parsed.extension,
+            title=parsed.title,
+            content=parsed.content,
+            summary=parsed.summary,
+            warning=parsed.warning,
+        )
+
+    text = parse_html(content)
+    clean = normalize_text(text)
+    title = title_from_html(content) or parsed_url.netloc.replace("www.", "")
+    return ParsedFile(
+        filename=parsed_url.netloc,
+        extension="html",
+        title=title,
+        content=f"来源链接：{url}\n\n{clean}",
+        summary=summarize(clean),
+    )
+
+
 def parse_markdown(content: bytes) -> str:
     raw = content.decode("utf-8", errors="ignore")
     if not raw.strip():
@@ -130,3 +167,14 @@ def file_title(filename: str, content: str) -> str:
     if first_line and len(first_line) <= 40:
         return first_line
     return stem or "上传文件"
+
+
+def title_from_html(content: bytes) -> str:
+    raw = content.decode("utf-8", errors="ignore") or content.decode("gb18030", errors="ignore")
+    soup = BeautifulSoup(raw, "html.parser")
+    if soup.title and soup.title.string:
+        return normalize_text(soup.title.string)[:120]
+    heading = soup.find(["h1", "h2"])
+    if heading:
+        return normalize_text(heading.get_text(" "))[:120]
+    return ""

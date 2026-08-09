@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -20,6 +21,19 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(ensure_demo_columns)
+
+
+def ensure_demo_columns(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    if "user_profiles" not in tables:
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("user_profiles")}
+    if "username" not in columns:
+        sync_conn.execute(text("ALTER TABLE user_profiles ADD COLUMN username VARCHAR(80)"))
+    sync_conn.execute(text("UPDATE user_profiles SET username = 'demo' WHERE username IS NULL OR username = ''"))
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

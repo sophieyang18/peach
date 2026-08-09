@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode, RefObject } from 'react'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
+const PEACH_PORTRAIT = '/peach-assets/peach-portrait.png'
+const PEACH_ICON = '/peach-assets/peach-icon.png'
+const NAV_ICONS: Record<PrimaryModule, string> = {
+  peach: '/peach-assets/nav-peach.jpg',
+  profile: '/peach-assets/nav-profile.jpg',
+  knowledge: '/peach-assets/nav-knowledge.jpg',
+}
 
 type PrimaryModule = 'peach' | 'profile' | 'knowledge'
 type PeachPanel = 'new-chat' | 'interview-setup' | 'question-bank-setup' | 'live-interview'
 type InterviewMode = 'voice' | 'video'
+type TtsRateMode = 'slow' | 'medium' | 'fast'
 type ProfileSectionId = 'reviews' | 'full' | 'internship' | 'project' | 'education' | 'skills' | 'competition'
 type AgentToolName =
   | 'start_interview'
@@ -18,6 +27,12 @@ type AgentToolName =
   | 'delete_knowledge_item'
   | 'unsupported'
 type AgentActionStatus = 'pending' | 'executing' | 'approved' | 'dismissed'
+type ToolActionDetail = {
+  title: string
+  summary: string
+  items: string[]
+  content?: string
+}
 type AgentToolProposal = {
   id: string
   tool: AgentToolName
@@ -26,13 +41,16 @@ type AgentToolProposal = {
   payload: Record<string, unknown>
   approval_required: boolean
   status?: AgentActionStatus
+  result?: ToolActionDetail
 }
 type ChatMessage = { role: 'peach' | 'user' | 'system'; content: string; actions?: AgentToolProposal[] }
 type Conversation = { id: string; title: string; updatedAt: string; messages: ChatMessage[] }
-type BusyKey = 'refresh' | 'recommend' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload'
+type BusyKey = 'account' | 'refresh' | 'recommend' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload'
+type Account = { username: string; display_name?: string }
 
 type Profile = {
   id: string
+  username?: string
   name: string
   target_role: string
   target_company: string
@@ -73,7 +91,8 @@ type Dashboard = {
     role: string
     status: string
     transcript: Array<{ role: string; content: string }>
-    report: { summary?: string; overall_score?: number }
+    report: InterviewReport
+    created_at?: string
   }>
   growth: {
     avg_score: number
@@ -84,6 +103,23 @@ type Dashboard = {
     weak_points: string[]
     progress_points: Array<{ label: string; score: number }>
   }
+}
+
+type InterviewReport = {
+  position?: string
+  overall_score?: number
+  level?: string
+  percentile?: number
+  dimensions?: Array<{ name: string; score: number }>
+  summary?: string
+  key_improvements?: string[]
+  next_plan?: string[]
+  question_review?: Array<{
+    question?: string
+    assessment_focus?: string
+    candidate_transcript?: string
+    sample_answer?: string
+  }>
 }
 
 type InterviewSettings = {
@@ -141,8 +177,34 @@ type KnowledgeDraft = {
 }
 
 type KnowledgeTab = 'personal' | 'saved' | 'discover'
-type KnowledgeFolder = { id: string; name: string; scope: Exclude<KnowledgeTab, 'discover'>; collapsed?: boolean }
+type KnowledgeFolder = {
+  id: string
+  name: string
+  scope: Exclude<KnowledgeTab, 'discover'>
+  item_ids: string[]
+  sort_order?: number
+  created_at?: string
+  updated_at?: string
+  collapsed?: boolean
+}
 type SortMode = 'updated' | 'name'
+type SpeechRecognitionEventLike = {
+  results: ArrayLike<{ isFinal?: boolean; 0?: { transcript?: string } }>
+}
+type BrowserSpeechRecognition = {
+  lang: string
+  interimResults: boolean
+  continuous: boolean
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null
+  onerror: (() => void) | null
+  onend: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: new () => BrowserSpeechRecognition
+  webkitSpeechRecognition?: new () => BrowserSpeechRecognition
+}
 
 const profileSectionMeta: Record<ProfileSectionId, { title: string; summary: string; helper: string }> = {
   reviews: {
@@ -210,10 +272,6 @@ const defaultProfile: Profile = {
   ],
 }
 
-const defaultMessages: ChatMessage[] = [
-  { role: 'peach', content: '你好，我是桃子' },
-]
-
 const fixedBubbles = ['帮我模拟面试', '帮我写简历', '帮我改简历', '我能投哪些岗位']
 const composerActions = ['模拟面试', '题库练习', '简历优化', '简历撰写', '投递动态']
 const defaultInterviewProgress: InterviewProgress = {
@@ -239,42 +297,31 @@ const initialConversations: Conversation[] = [
     id: 'chat-default',
     title: '新建对话',
     updatedAt: '刚刚',
-    messages: defaultMessages,
-  },
-  {
-    id: 'chat-resume',
-    title: '简历深挖准备',
-    updatedAt: '昨天',
-    messages: [
-      { role: 'peach', content: '我们上次聊到项目经历还缺少量化结果，可以继续把那段经历打磨成面试答案。' },
-    ],
-  },
-  {
-    id: 'chat-autumn',
-    title: '秋招节奏规划',
-    updatedAt: '3 天前',
-    messages: [
-      { role: 'peach', content: '你适合先投产品实习和 AIGC 策略方向，节奏上要提前准备简历深挖题。' },
-    ],
+    messages: [],
   },
 ]
 
 function App() {
+  const [account, setAccount] = useState<Account | null>(null)
+  const [accountInput, setAccountInput] = useState(() => window.localStorage.getItem('peach:last-username') ?? '')
+  const [accountMessage, setAccountMessage] = useState('输入用户名登录，或直接创建一个 demo 账号。')
   const [module, setModule] = useState<PrimaryModule>('peach')
   const [peachPanel, setPeachPanel] = useState<PeachPanel>('new-chat')
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
-  const [busy, setBusy] = useState<Partial<Record<BusyKey, string>>>({ refresh: '正在同步个人档案' })
+  const [busy, setBusy] = useState<Partial<Record<BusyKey, string>>>({})
   const [notice, setNotice] = useState('准备好了就开始。')
   const [error, setError] = useState('')
   const [input, setInput] = useState('')
   const [profileInput, setProfileInput] = useState('')
   const [activeProfileSection, setActiveProfileSection] = useState<ProfileSectionId>('full')
-  const [profileSections, setProfileSections] = useState<Record<ProfileSectionId, string>>(initialProfileSections)
+  const [profileSections, setProfileSections] = useState<Record<ProfileSectionId, string>>({ ...initialProfileSections })
   const [profileActionResult, setProfileActionResult] = useState('')
+  const [profileMessages, setProfileMessages] = useState<ChatMessage[]>([])
   const [resumeFiles, setResumeFiles] = useState<ParsedUpload[]>([])
   const [knowledgeQuestion, setKnowledgeQuestion] = useState('')
   const [knowledgeMessages, setKnowledgeMessages] = useState<ChatMessage[]>([])
   const [personalKnowledge, setPersonalKnowledge] = useState<KnowledgeItem[]>([])
+  const [discoverKnowledge, setDiscoverKnowledge] = useState<KnowledgeItem[]>(discoverKnowledgeFeed())
   const [activeKnowledgeId, setActiveKnowledgeId] = useState('')
   const [knowledgeQuery, setKnowledgeQuery] = useState('')
   const [knowledgeDraft, setKnowledgeDraft] = useState<KnowledgeDraft>({
@@ -283,6 +330,9 @@ function App() {
     content: '',
     url: '',
   })
+  const [knowledgeActionResult, setKnowledgeActionResult] = useState('')
+  const [knowledgeActionMode, setKnowledgeActionMode] = useState('')
+  const [isCreatingKnowledge, setIsCreatingKnowledge] = useState(false)
   const [conversations, setConversations] = useState<Conversation[]>(initialConversations)
   const [activeConversationId, setActiveConversationId] = useState(initialConversations[0].id)
   const [recommendations, setRecommendations] = useState<string[]>([])
@@ -304,19 +354,25 @@ function App() {
   const [timerCollapsed, setTimerCollapsed] = useState(false)
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null)
   const [mediaReady, setMediaReady] = useState(false)
+  const [ttsMuted, setTtsMuted] = useState(false)
+  const [ttsSpeaking, setTtsSpeaking] = useState(false)
+  const [lastTtsText, setLastTtsText] = useState('')
+  const [ttsRateMode, setTtsRateMode] = useState<TtsRateMode>('medium')
+  const [immersiveInterview, setImmersiveInterview] = useState(false)
   const [subNavCollapsed, setSubNavCollapsed] = useState(false)
   const [knowledgeTab, setKnowledgeTab] = useState<KnowledgeTab>('personal')
   const [knowledgeFolderSort, setKnowledgeFolderSort] = useState<SortMode>('updated')
   const [knowledgeFileSort, setKnowledgeFileSort] = useState<SortMode>('updated')
   const [knowledgeFolders, setKnowledgeFolders] = useState<Record<Exclude<KnowledgeTab, 'discover'>, KnowledgeFolder[]>>({
-    personal: [{ id: 'personal-default', name: '默认文件夹', scope: 'personal' }],
-    saved: [{ id: 'saved-default', name: '默认收藏', scope: 'saved' }],
+    personal: [{ id: 'personal-default', name: '默认文件夹', scope: 'personal', item_ids: [] }],
+    saved: [{ id: 'saved-default', name: '默认收藏', scope: 'saved', item_ids: [] }],
   })
   const [activeKnowledgeFolderId, setActiveKnowledgeFolderId] = useState('personal-default')
   const [savedKnowledge, setSavedKnowledge] = useState<string[]>(['pm-method'])
 
   const chatScrollRef = useRef<HTMLElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const recommendationsHydratedRef = useRef(false)
   const profileHydratedRef = useRef(false)
   const knowledgeHydratedRef = useRef(false)
@@ -325,28 +381,43 @@ function App() {
   const activeConversation = conversations.find((item) => item.id === activeConversationId) ?? conversations[0]
   const busyText = Object.values(busy)[0]
   const fallbackRecommendations = useMemo(() => buildRecommendations(profile, dashboard), [profile, dashboard])
-  const visibleRecommendations = recommendations.length ? recommendations : fallbackRecommendations
+  const visibleRecommendations = useMemo(
+    () => safeRecommendations(recommendations, fallbackRecommendations),
+    [fallbackRecommendations, recommendations],
+  )
   const resumeFolders = useMemo(() => buildResumeFolders(profile, dashboard, profileSections), [profile, dashboard, profileSections])
-  const knowledgeItems = useMemo(() => [...personalKnowledge, ...buildKnowledgeItems(profile), ...discoverKnowledgeFeed()], [personalKnowledge, profile])
+  const knowledgeItems = useMemo(
+    () => uniqueKnowledgeItems([...personalKnowledge, ...buildKnowledgeItems(profile), ...discoverKnowledge]),
+    [discoverKnowledge, personalKnowledge, profile],
+  )
 
   const api = useCallback(async <T,>(path: string, options?: RequestInit): Promise<T> => {
     setError('')
     const response = await fetch(`${API_BASE}${path}`, {
-      headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) },
       ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(account?.username ? { 'X-Peach-User': account.username } : {}),
+        ...(options?.headers ?? {}),
+      },
     })
     if (!response.ok) throw new Error(await responseErrorMessage(response))
     return response.json()
-  }, [])
+  }, [account?.username])
 
-  const uploadApi = useCallback(async <T,>(path: string, file: File): Promise<T> => {
+  const uploadApi = useCallback(async <T,>(path: string, file: File, fields: Record<string, string> = {}): Promise<T> => {
     setError('')
     const body = new FormData()
     body.append('file', file)
-    const response = await fetch(`${API_BASE}${path}`, { method: 'POST', body })
+    Object.entries(fields).forEach(([key, value]) => body.append(key, value))
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      body,
+      headers: account?.username ? { 'X-Peach-User': account.username } : undefined,
+    })
     if (!response.ok) throw new Error(await responseErrorMessage(response))
     return response.json()
-  }, [])
+  }, [account?.username])
 
   const begin = useCallback((key: BusyKey, message: string) => {
     setBusy((current) => ({ ...current, [key]: message }))
@@ -360,6 +431,213 @@ function App() {
       return next
     })
   }, [])
+
+  const stopTts = useCallback(() => {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+    ttsUtteranceRef.current = null
+    setTtsSpeaking(false)
+  }, [])
+
+  const speakInterviewText = useCallback((raw: string, force = false) => {
+    const text = cleanAssistantText(raw)
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!text) return
+    setLastTtsText(text)
+    if (ttsMuted && !force) return
+    if (!('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
+      setNotice('当前浏览器不支持语音朗读。')
+      return
+    }
+
+    window.speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.lang = 'zh-CN'
+    utterance.rate = ttsRateValue(ttsRateMode)
+    utterance.pitch = 1
+    utterance.volume = 1
+    const voices = window.speechSynthesis.getVoices()
+    const zhVoice = voices.find((voice) => voice.lang.toLowerCase().startsWith('zh')) ?? voices[0]
+    if (zhVoice) utterance.voice = zhVoice
+    utterance.onstart = () => setTtsSpeaking(true)
+    utterance.onend = () => {
+      if (ttsUtteranceRef.current === utterance) ttsUtteranceRef.current = null
+      setTtsSpeaking(false)
+    }
+    utterance.onerror = () => {
+      if (ttsUtteranceRef.current === utterance) ttsUtteranceRef.current = null
+      setTtsSpeaking(false)
+    }
+    ttsUtteranceRef.current = utterance
+    setTtsSpeaking(true)
+    window.speechSynthesis.speak(utterance)
+  }, [ttsMuted, ttsRateMode])
+
+  const toggleTtsMuted = useCallback(() => {
+    setTtsMuted((current) => {
+      const next = !current
+      if (next) {
+        if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+        ttsUtteranceRef.current = null
+        setTtsSpeaking(false)
+      }
+      return next
+    })
+  }, [])
+
+  const replayTts = useCallback(() => {
+    if (lastTtsText) speakInterviewText(lastTtsText, true)
+  }, [lastTtsText, speakInterviewText])
+
+  const resetClientWorkspace = useCallback(() => {
+    const freshConversations = initialConversations.map((conversation) => ({ ...conversation, messages: [...conversation.messages] }))
+    setModule('peach')
+    setPeachPanel('new-chat')
+    setDashboard(null)
+    setNotice('准备好了就开始。')
+    setError('')
+    setInput('')
+    setProfileInput('')
+    setActiveProfileSection('full')
+    setProfileSections({ ...initialProfileSections })
+    setProfileActionResult('')
+    setProfileMessages([])
+    setResumeFiles([])
+    setKnowledgeQuestion('')
+    setKnowledgeMessages([])
+    setPersonalKnowledge([])
+    setDiscoverKnowledge(discoverKnowledgeFeed())
+    setActiveKnowledgeId('')
+    setKnowledgeQuery('')
+    setKnowledgeDraft({ title: '', summary: '', content: '', url: '' })
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode('')
+    setIsCreatingKnowledge(false)
+    setConversations(freshConversations)
+    setActiveConversationId(freshConversations[0].id)
+    setRecommendations([])
+    setSettings({
+      resume: '完整简历',
+      jd: '',
+      gender: '女性',
+      style: '温和型',
+      mode: 'voice',
+      questionBank: '产品经理通用题库',
+    })
+    setLiveKind('interview')
+    setActiveInterviewId('')
+    setInterviewProgress(defaultInterviewProgress)
+    setFinishSuggestionShown(false)
+    setSeconds(0)
+    setPaused(false)
+    setSubtitleCollapsed(false)
+    setTimerCollapsed(false)
+    mediaStream?.getTracks().forEach((track) => track.stop())
+    setMediaStream(null)
+    setMediaReady(false)
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+    ttsUtteranceRef.current = null
+    setTtsSpeaking(false)
+    setLastTtsText('')
+    setTtsRateMode('medium')
+    setImmersiveInterview(false)
+    setSubNavCollapsed(false)
+    setKnowledgeTab('personal')
+    setKnowledgeFolderSort('updated')
+    setKnowledgeFileSort('updated')
+    setKnowledgeFolders({
+      personal: [{ id: 'personal-default', name: '默认文件夹', scope: 'personal', item_ids: [] }],
+      saved: [{ id: 'saved-default', name: '默认收藏', scope: 'saved', item_ids: [] }],
+    })
+    setActiveKnowledgeFolderId('personal-default')
+    setSavedKnowledge(['pm-method'])
+    recommendationsHydratedRef.current = false
+    profileHydratedRef.current = false
+    knowledgeHydratedRef.current = false
+  }, [mediaStream])
+
+  const accountRequest = useCallback(async (path: string, username?: string) => {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(username ? { 'X-Peach-User': username } : {}),
+      },
+      body: username ? JSON.stringify({ username }) : undefined,
+    })
+    if (!response.ok) throw new Error(await responseErrorMessage(response))
+    return response.json() as Promise<{ account: Account; profile?: Profile }>
+  }, [])
+
+  const enterAccount = useCallback((nextAccount: Account) => {
+    const username = nextAccount.username.trim()
+    window.localStorage.setItem('peach:last-username', username)
+    resetClientWorkspace()
+    setAccount({ ...nextAccount, username })
+    setAccountInput(username)
+    setAccountMessage(`已进入 ${username}。`)
+  }, [resetClientWorkspace])
+
+  async function loginAccount() {
+    const username = accountInput.trim()
+    if (!username) {
+      setAccountMessage('先输入一个用户名。')
+      return
+    }
+    begin('account', '正在登录账号')
+    setError('')
+    try {
+      const data = await accountRequest('/api/accounts/login', username)
+      enterAccount(data.account)
+    } catch (err) {
+      setAccountMessage(err instanceof Error ? err.message : '登录失败，可以试试创建账号。')
+    } finally {
+      end('account')
+    }
+  }
+
+  async function createAccount() {
+    const username = accountInput.trim()
+    if (!username) {
+      setAccountMessage('先输入一个用户名。')
+      return
+    }
+    begin('account', '正在创建账号')
+    setError('')
+    try {
+      const data = await accountRequest('/api/accounts', username)
+      enterAccount(data.account)
+    } catch (err) {
+      setAccountMessage(err instanceof Error ? err.message : '创建失败，请换一个用户名。')
+    } finally {
+      end('account')
+    }
+  }
+
+  function switchAccount() {
+    resetClientWorkspace()
+    setAccount(null)
+    setAccountMessage('已回到账号入口。')
+  }
+
+  async function resetAccount() {
+    if (!account) return
+    const confirmed = window.confirm(`确定重置账号「${account.username}」吗？这个账号下的档案、面试、练习和知识库会恢复为空白 demo 状态。`)
+    if (!confirmed) return
+    begin('account', '正在重置账号')
+    try {
+      const data = await api<{ account: Account; profile: Profile }>('/api/accounts/reset', { method: 'POST' })
+      resetClientWorkspace()
+      setAccount(data.account)
+      setAccountInput(data.account.username)
+      setNotice('账号已重置。')
+    } catch (err) {
+      setError('账号重置失败，请稍后再试。')
+      console.error(err)
+    } finally {
+      end('account')
+    }
+  }
 
   const refreshDashboard = useCallback(async () => {
     try {
@@ -375,9 +653,21 @@ function App() {
     }
   }, [api, begin, end])
 
+  const refreshKnowledgeFolders = useCallback(async () => {
+    const data = await api<{ folders: KnowledgeFolder[] }>('/api/knowledge/folders')
+    const grouped = groupKnowledgeFolders(data.folders)
+    setKnowledgeFolders(grouped)
+    setSavedKnowledge(Array.from(new Set(grouped.saved.flatMap((folder) => folder.item_ids || []))))
+    setActiveKnowledgeFolderId((current) => {
+      if (data.folders.some((folder) => folder.id === current)) return current
+      return grouped.personal[0]?.id ?? 'personal-default'
+    })
+  }, [api])
+
   useEffect(() => {
+    if (!account) return
     void refreshDashboard()
-  }, [refreshDashboard])
+  }, [account, refreshDashboard])
 
   useEffect(() => {
     if (!dashboard || profileHydratedRef.current) return
@@ -391,22 +681,20 @@ function App() {
 
     async function hydrateKnowledge() {
       try {
-        const data = await api<{ items: KnowledgeItem[] }>('/api/knowledge')
-        setPersonalKnowledge(data.items)
+        const [knowledgeData, discoverData] = await Promise.all([
+          api<{ items: KnowledgeItem[] }>('/api/knowledge'),
+          api<{ items: KnowledgeItem[] }>('/api/knowledge/discover'),
+        ])
+        setPersonalKnowledge(knowledgeData.items)
+        setDiscoverKnowledge(discoverData.items)
+        await refreshKnowledgeFolders()
       } catch (err) {
         console.error(err)
       }
     }
 
     void hydrateKnowledge()
-  }, [api, dashboard])
-
-  useEffect(() => {
-    if (activeKnowledgeId || !knowledgeItems.length) return
-    const first = knowledgeItems[0]
-    setActiveKnowledgeId(first.id)
-    setKnowledgeDraft(toKnowledgeDraft(first))
-  }, [activeKnowledgeId, knowledgeItems])
+  }, [api, dashboard, refreshKnowledgeFolders])
 
   useEffect(() => {
     if (!dashboard || recommendationsHydratedRef.current) return
@@ -464,6 +752,10 @@ function App() {
     mediaStream?.getTracks().forEach((track) => track.stop())
   }, [mediaStream])
 
+  useEffect(() => () => {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+  }, [])
+
   function updateConversation(id: string, updater: (conversation: Conversation) => Conversation) {
     setConversations((current) => current.map((item) => (item.id === id ? updater(item) : item)))
   }
@@ -487,14 +779,17 @@ function App() {
     }))
   }
 
-  function markActionStatus(actionId: string, status: AgentActionStatus) {
+  function markActionStatus(actionId: string, status: AgentActionStatus, result?: ToolActionDetail) {
+    const updateMessages = (messages: ChatMessage[]) => messages.map((message) => ({
+      ...message,
+      actions: message.actions?.map((action) => (action.id === actionId ? { ...action, status, ...(result ? { result } : {}) } : action)),
+    }))
     updateConversation(activeConversationId, (conversation) => ({
       ...conversation,
-      messages: conversation.messages.map((message) => ({
-        ...message,
-        actions: message.actions?.map((action) => (action.id === actionId ? { ...action, status } : action)),
-      })),
+      messages: updateMessages(conversation.messages),
     }))
+    setProfileMessages(updateMessages)
+    setKnowledgeMessages(updateMessages)
   }
 
   function openModule(nextModule: PrimaryModule) {
@@ -503,15 +798,24 @@ function App() {
     if (nextModule === 'knowledge') {
       setKnowledgeTab('personal')
       setActiveKnowledgeFolderId('personal-default')
+      setActiveKnowledgeId('')
+      setKnowledgeActionResult('')
+      setIsCreatingKnowledge(false)
     }
     setSubNavCollapsed(false)
     setNotice(moduleNotice(nextModule))
   }
 
   function createConversation() {
+    const active = conversations.find((conversation) => conversation.id === activeConversationId)
+    if (active && active.messages.length === 0) {
+      setPeachPanel('new-chat')
+      setNotice('当前已经是空白对话。')
+      return
+    }
     const id = `chat-${Date.now()}`
     setConversations((current) => [
-      { id, title: '新建对话', updatedAt: '刚刚', messages: defaultMessages },
+      { id, title: '新建对话', updatedAt: '刚刚', messages: [] },
       ...current,
     ])
     setActiveConversationId(id)
@@ -523,6 +827,34 @@ function App() {
     setActiveConversationId(id)
     setPeachPanel('new-chat')
     setNotice('已切回历史对话。')
+  }
+
+  function renameConversation(id: string) {
+    const conversation = conversations.find((item) => item.id === id)
+    if (!conversation) return
+    const nextTitle = window.prompt('重命名对话', conversation.title)?.trim()
+    if (!nextTitle) return
+    setConversations((current) => current.map((item) => (
+      item.id === id ? { ...item, title: nextTitle.slice(0, 28), updatedAt: '刚刚' } : item
+    )))
+    setNotice('对话已重命名。')
+  }
+
+  function deleteConversation(id: string) {
+    const conversation = conversations.find((item) => item.id === id)
+    if (!conversation) return
+    const confirmed = window.confirm(`确定删除「${conversation.title}」吗？这会移除当前浏览器里的这条对话记录。`)
+    if (!confirmed) return
+
+    const rest = conversations.filter((item) => item.id !== id)
+    const fallback: Conversation = { id: `chat-${Date.now()}`, title: '新建对话', updatedAt: '刚刚', messages: [] }
+    const nextConversations = rest.length ? rest : [fallback]
+    setConversations(nextConversations)
+    if (activeConversationId === id) {
+      setActiveConversationId(nextConversations[0].id)
+      setPeachPanel('new-chat')
+    }
+    setNotice('对话已删除。')
   }
 
   async function sendPrompt(prompt: string, extraContext: Record<string, unknown> = {}, visibleContent = prompt) {
@@ -585,6 +917,7 @@ function App() {
       setLiveKind(String(action.payload.interview_type ?? '').includes('题库') ? 'question-bank' : 'interview')
       setSeconds(0)
       setPaused(false)
+      setImmersiveInterview(true)
       setPeachPanel('live-interview')
       appendMessage({ role: 'system', content: '正在生成第一题。' })
     }
@@ -593,10 +926,10 @@ function App() {
       const data = await api<{
         message?: string
         profile?: Profile
-        interview?: { id: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: { summary?: string } }
+        interview?: { id: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: InterviewReport }
         opening?: { opening?: string; question?: string }
         progress?: InterviewProgress
-        report?: { summary?: string; overall_score?: number }
+        report?: InterviewReport
         knowledge?: KnowledgeItem
         deleted_knowledge_id?: string
       }>('/api/agent/actions/execute', {
@@ -604,7 +937,8 @@ function App() {
         body: JSON.stringify({ tool: action.tool, payload: action.payload }),
       })
 
-      markActionStatus(action.id, 'approved')
+      const resultDetail = buildToolActionDetail(action, data, profile, knowledgeItems)
+      markActionStatus(action.id, 'approved', resultDetail)
       removeSystemMessage('正在生成第一题。')
       applyToolResult(action, data)
       appendMessage({ role: 'system', content: data.message || '动作已完成。' })
@@ -629,10 +963,10 @@ function App() {
     action: AgentToolProposal,
     data: {
       profile?: Profile
-      interview?: { id?: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: { summary?: string } }
+      interview?: { id?: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: InterviewReport }
       opening?: { opening?: string; question?: string }
       progress?: InterviewProgress
-      report?: { summary?: string; overall_score?: number }
+      report?: InterviewReport
       knowledge?: KnowledgeItem
       deleted_knowledge_id?: string
     },
@@ -646,6 +980,7 @@ function App() {
       setKnowledgeTab('personal')
       setActiveKnowledgeId(data.knowledge.id)
       setKnowledgeDraft(toKnowledgeDraft(data.knowledge))
+      setIsCreatingKnowledge(false)
     }
     if (data.deleted_knowledge_id) {
       setPersonalKnowledge((current) => current.filter((item) => item.id !== data.deleted_knowledge_id))
@@ -665,9 +1000,12 @@ function App() {
       setLiveKind(String(data.interview.interview_type).includes('题库') ? 'question-bank' : 'interview')
       setSeconds(0)
       setPaused(false)
+      setImmersiveInterview(true)
       setPeachPanel('live-interview')
       if (data.opening?.opening || data.opening?.question) {
-        appendMessage({ role: 'peach', content: cleanAssistantText([data.opening.opening, data.opening.question].filter(Boolean).join('\n\n')) })
+        const openingText = cleanAssistantText([data.opening.opening, data.opening.question].filter(Boolean).join('\n\n'))
+        appendMessage({ role: 'peach', content: openingText })
+        speakInterviewText(openingText)
       }
     }
     if (action.tool === 'finish_latest_interview') {
@@ -675,7 +1013,11 @@ function App() {
       setInterviewProgress(defaultInterviewProgress)
       setFinishSuggestionShown(false)
       setPeachPanel('new-chat')
-      if (data.report?.summary) appendMessage({ role: 'peach', content: `这场面试我已经收尾了。${data.report.summary}` })
+      if (data.report?.summary) {
+        const summaryText = `这场面试我已经收尾了。${data.report.summary}`
+        appendMessage({ role: 'peach', content: summaryText })
+        speakInterviewText(summaryText)
+      }
     }
   }
 
@@ -691,7 +1033,13 @@ function App() {
     const promptMap: Record<string, string> = {
       简历优化: '帮我优化简历，重点提升项目经历和岗位匹配度。',
       简历撰写: '帮我从零写一版适合目标岗位的简历。',
-      投递动态: '帮我整理接下来一周的投递节奏和优先级。',
+      投递动态: [
+        '请基于桃子的岗位池为我推荐近期可投岗位和投递节奏。',
+        '岗位池来自飞书表导入数据；如果当前无法读取在线表格，就使用内置样例岗位池做降级推荐。',
+        '严禁建议我去牛客、实习僧、公司官网或其他竞品网站搜索。',
+        `内置岗位池：${JSON.stringify(deliveryJobPool())}`,
+        `我的目标岗位：${profile.target_role}，目标公司：${profile.target_company || '未填写'}，城市：${profile.target_city || '未填写'}。`,
+      ].join('\n'),
     }
     void sendPrompt(promptMap[action] ?? action)
   }
@@ -711,6 +1059,7 @@ function App() {
       setMediaReady(true)
       setSeconds(0)
       setPaused(false)
+      setImmersiveInterview(true)
       setInterviewProgress(defaultInterviewProgress)
       setFinishSuggestionShown(false)
       setLiveKind(kind)
@@ -724,7 +1073,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           interview_type: kind === 'question-bank' ? '题库练习' : '模拟面试',
-          interviewer_style: settings.style,
+          interviewer_style: `${settings.gender} / ${settings.style}`,
           company: profile.target_company,
           role: profile.target_role,
           jd: settings.jd,
@@ -735,7 +1084,9 @@ function App() {
       setActiveInterviewId(data.interview.id)
       setInterviewProgress(data.progress ?? defaultInterviewProgress)
       setPeachPanel('live-interview')
-      appendMessage({ role: 'peach', content: cleanAssistantText(`${data.opening.opening}\n\n${data.opening.question}`) })
+      const openingText = cleanAssistantText(`${data.opening.opening}\n\n${data.opening.question}`)
+      appendMessage({ role: 'peach', content: openingText })
+      speakInterviewText(openingText)
 
       setNotice('实时面试已开始。')
     } catch (err) {
@@ -748,7 +1099,10 @@ function App() {
   }
 
   async function sendInterviewAnswer() {
-    const answer = input.trim()
+    await sendInterviewAnswerText(input.trim())
+  }
+
+  async function sendInterviewAnswerText(answer: string) {
     if (!answer || paused || busy.chat) return
     if (!activeInterviewId) {
       setError('当前没有连接到进行中的面试，请回到设置页重新开始。')
@@ -767,9 +1121,9 @@ function App() {
     begin('chat', '面试官正在追问')
     try {
       const data = await api<{
-        interview: { id: string; status: string; report?: { summary?: string; overall_score?: number } }
+        interview: { id: string; status: string; report?: InterviewReport }
         next: { micro_feedback?: string; next_question?: string; hint?: string; should_finish?: boolean }
-        report?: { summary?: string; overall_score?: number; key_improvements?: string[]; next_plan?: string[] }
+        report?: InterviewReport
         progress?: InterviewProgress
       }>(`/api/interviews/${interviewId}/answer`, {
         method: 'POST',
@@ -781,15 +1135,20 @@ function App() {
         data.next.next_question,
         data.next.hint ? `提示：${data.next.hint}` : '',
       ].filter(Boolean).join('\n\n')
-      appendMessage({ role: 'peach', content: cleanAssistantText(reply || '收到，我们继续下一题。') })
+      const replyText = cleanAssistantText(reply || '收到，我们继续下一题。')
+      appendMessage({ role: 'peach', content: replyText })
+      speakInterviewText(replyText)
       const nextProgress = data.progress ?? interviewProgress
       setInterviewProgress(nextProgress)
       if (data.interview.status === 'completed') {
         setActiveInterviewId('')
         setInterviewProgress(defaultInterviewProgress)
         setFinishSuggestionShown(false)
+        setImmersiveInterview(false)
         setPeachPanel('new-chat')
-        appendMessage({ role: 'peach', content: formatInterviewReportMessage(data.report || data.interview.report) })
+        const reportText = formatInterviewReportMessage(data.report || data.interview.report)
+        appendMessage({ role: 'peach', content: reportText })
+        speakInterviewText(reportText)
       } else if (data.next.should_finish && nextProgress.can_llm_finish && !finishSuggestionShown) {
         appendMessage({
           role: 'peach',
@@ -823,6 +1182,7 @@ function App() {
       setPeachPanel('new-chat')
       setInterviewProgress(defaultInterviewProgress)
       setFinishSuggestionShown(false)
+      setImmersiveInterview(false)
       setNotice('已退出面试。')
       return
     }
@@ -830,16 +1190,19 @@ function App() {
     appendMessage({ role: 'system', content: '正在生成面试报告。' })
     try {
       const data = await api<{
-        interview: { id: string; status: string; report?: { summary?: string; overall_score?: number } }
-        report?: { summary?: string; overall_score?: number; key_improvements?: string[]; next_plan?: string[] }
+        interview: { id: string; status: string; report?: InterviewReport }
+        report?: InterviewReport
       }>(`/api/interviews/${activeInterviewId}/finish`, { method: 'POST' })
       removeSystemMessage('正在生成面试报告。')
       setActiveInterviewId('')
       setPaused(false)
       setInterviewProgress(defaultInterviewProgress)
       setFinishSuggestionShown(false)
+      setImmersiveInterview(false)
       setPeachPanel('new-chat')
-      appendMessage({ role: 'peach', content: formatInterviewReportMessage(data.report || data.interview.report) })
+      const reportText = formatInterviewReportMessage(data.report || data.interview.report)
+      appendMessage({ role: 'peach', content: reportText })
+      speakInterviewText(reportText)
       setNotice('面试已结束，报告已生成。')
       void refreshDashboard()
     } catch (err) {
@@ -859,6 +1222,53 @@ function App() {
 
   function updateProfileSection(id: ProfileSectionId, content: string) {
     setProfileSections((current) => ({ ...current, [id]: content }))
+  }
+
+  function appendProfileMessage(message: ChatMessage) {
+    setProfileMessages((current) => [...current, message])
+  }
+
+  function removeProfileSystemMessage(content: string) {
+    setProfileMessages((current) => current.filter((message) => message.content !== content))
+  }
+
+  async function sendProfileChat() {
+    const message = profileInput.trim()
+    if (!message || busy.profile) return
+    const section = profileSectionMeta[activeProfileSection]
+    setProfileInput('')
+    appendProfileMessage({ role: 'user', content: message })
+    appendProfileMessage({ role: 'system', content: '桃子正在处理档案请求。' })
+    begin('profile', '桃子正在处理档案请求')
+    try {
+      const data = await api<{ reply: string; actions?: AgentToolProposal[] }>('/api/agent/actions', {
+        method: 'POST',
+        body: JSON.stringify({
+          message: [
+            `用户正在个人档案的「${section.title}」分区内对话。`,
+            '如果用户是在补充经历、要求整理简历、优化档案、沉淀材料，请优先提出 append_profile_note 或 update_resume 动作，让用户确认后再改资料。',
+            `用户输入：${message}`,
+          ].join('\n'),
+          context: {
+            current_panel: 'profile',
+            active_profile_section: activeProfileSection,
+            profile_sections: profileSections,
+            current_section_content: profileSections[activeProfileSection],
+            profile,
+          },
+        }),
+      })
+      removeProfileSystemMessage('桃子正在处理档案请求。')
+      appendProfileMessage({ role: 'peach', content: cleanAssistantText(data.reply), actions: normalizeAgentActions(data.actions) })
+      setNotice('档案对话已生成。')
+    } catch (err) {
+      removeProfileSystemMessage('桃子正在处理档案请求。')
+      setProfileInput(message)
+      setError('档案对话失败，内容已经放回输入框。')
+      console.error(err)
+    } finally {
+      end('profile')
+    }
   }
 
   async function saveProfileSections(nextSections = profileSections) {
@@ -894,6 +1304,7 @@ function App() {
       经历生成: `请基于「${section.title}」里的素材，生成一版适合${profile.target_role}求职的经历描述。要求包含背景、任务、行动、结果和可追问细节，不要编造不存在的数据。`,
       简历优化: `请优化「${section.title}」这段档案内容，让它更适合${profile.target_role}求职。请指出可以补证据的位置，并给出改写版本。`,
       面试深挖: `请围绕「${section.title}」生成 6 个面试深挖问题，并说明每题考察点。问题要贴近${profile.target_role}。`,
+      面试复盘: `请基于当前上传或记录的面试材料，生成一份面试复盘总结，分为情绪承接、问题回顾、可执行改进和下一次练习计划。`,
     }
     begin('profile', `桃子正在处理${action}`)
     setProfileActionResult('')
@@ -925,21 +1336,61 @@ function App() {
     setNotice('已采纳到当前文件夹，记得保存档案。')
   }
 
-  function saveKnowledge(id: string) {
-    setSavedKnowledge((current) => (current.includes(id) ? current : [...current, id]))
+  async function saveKnowledge(id: string) {
+    if (savedKnowledge.includes(id)) return
+    const folder = knowledgeFolders.saved[0]
+    if (!folder) {
+      setSavedKnowledge((current) => [...current, id])
+      return
+    }
+    begin('knowledge', '正在收藏知识库')
+    try {
+      const itemIds = Array.from(new Set([id, ...(folder.item_ids || [])]))
+      const data = await api<{ folder: KnowledgeFolder }>(`/api/knowledge/folders/${folder.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...folder, item_ids: itemIds }),
+      })
+      setKnowledgeFolders((current) => ({
+        ...current,
+        saved: current.saved.map((item) => (item.id === data.folder.id ? data.folder : item)),
+      }))
+      setSavedKnowledge(itemIds)
+      setNotice('已收藏到收藏知识库。')
+    } catch (err) {
+      setError('收藏失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
   }
 
   function selectKnowledgeItem(item: KnowledgeItem) {
     setActiveKnowledgeId(item.id)
     setKnowledgeDraft(toKnowledgeDraft(item))
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode('')
+    setIsCreatingKnowledge(false)
     setNotice(`正在查看${item.title}。`)
   }
 
   function createKnowledgeDraft() {
     setActiveKnowledgeId('')
     setKnowledgeDraft({ title: '', summary: '', content: '', url: '' })
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode('')
+    setIsCreatingKnowledge(true)
     setKnowledgeTab('personal')
+    setActiveKnowledgeFolderId(knowledgeFolders.personal[0]?.id ?? 'personal-default')
     setNotice('可以新增一条个人知识。')
+  }
+
+  function closeKnowledgeDetail() {
+    setActiveKnowledgeId('')
+    setKnowledgeDraft({ title: '', summary: '', content: '', url: '' })
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode('')
+    setIsCreatingKnowledge(false)
+    setNotice('已回到知识库问答。')
   }
 
   async function saveKnowledgeDraft() {
@@ -957,19 +1408,27 @@ function App() {
       if (active?.source === 'personal') {
         const data = await api<{ item: KnowledgeItem }>(`/api/knowledge/${active.id}`, {
           method: 'PUT',
-          body: JSON.stringify(payload),
-        })
+        body: JSON.stringify(payload),
+      })
         setPersonalKnowledge((current) => current.map((item) => (item.id === data.item.id ? data.item : item)))
         setKnowledgeDraft(toKnowledgeDraft(data.item))
+        setKnowledgeActionResult('')
+        setKnowledgeActionMode('')
         setNotice('知识库已保存。')
       } else {
+        const folder = [...knowledgeFolders.personal, ...knowledgeFolders.saved].find((item) => item.id === activeKnowledgeFolderId)
+        const folderId = folder?.scope === 'personal' ? activeKnowledgeFolderId : knowledgeFolders.personal[0]?.id
         const data = await api<{ item: KnowledgeItem }>('/api/knowledge', {
           method: 'POST',
-          body: JSON.stringify(payload),
+          body: JSON.stringify({ ...payload, folder_id: folderId ?? '' }),
         })
         setPersonalKnowledge((current) => [data.item, ...current])
         setActiveKnowledgeId(data.item.id)
         setKnowledgeDraft(toKnowledgeDraft(data.item))
+        setKnowledgeActionResult('')
+        setKnowledgeActionMode('')
+        setIsCreatingKnowledge(false)
+        await refreshKnowledgeFolders()
         setNotice('已添加到个人知识库。')
       }
     } catch (err) {
@@ -990,6 +1449,10 @@ function App() {
       const next = personalKnowledge.find((value) => value.id !== id)
       setActiveKnowledgeId(next?.id ?? '')
       setKnowledgeDraft(next ? toKnowledgeDraft(next) : { title: '', summary: '', content: '', url: '' })
+      setKnowledgeActionResult('')
+      setKnowledgeActionMode('')
+      setIsCreatingKnowledge(false)
+      await refreshKnowledgeFolders()
       setNotice('知识库资料已删除。')
     } catch (err) {
       setError('知识库删除失败，稍后再试一次。')
@@ -999,32 +1462,96 @@ function App() {
     }
   }
 
-  function createKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>) {
+  async function createKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>) {
     const name = window.prompt('文件夹名称', scope === 'personal' ? '求职资料' : '收藏资料')
     if (!name?.trim()) return
-    const folder: KnowledgeFolder = { id: `${scope}-${Date.now()}`, name: name.trim(), scope }
-    setKnowledgeFolders((current) => ({ ...current, [scope]: [...current[scope], folder] }))
-    setActiveKnowledgeFolderId(folder.id)
-    setKnowledgeTab(scope)
+    begin('knowledge', '正在新建文件夹')
+    try {
+      const data = await api<{ folder: KnowledgeFolder }>('/api/knowledge/folders', {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim(), scope, item_ids: [], sort_order: knowledgeFolders[scope].length }),
+      })
+      setKnowledgeFolders((current) => ({ ...current, [scope]: [...current[scope], data.folder] }))
+      setActiveKnowledgeFolderId(data.folder.id)
+      setKnowledgeTab(scope)
+      setNotice('文件夹已新建。')
+    } catch (err) {
+      setError('文件夹新建失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
   }
 
-  function renameKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
+  async function renameKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
     const folder = knowledgeFolders[scope].find((item) => item.id === folderId)
     const name = window.prompt('重命名文件夹', folder?.name ?? '')
     if (!name?.trim()) return
-    setKnowledgeFolders((current) => ({
-      ...current,
-      [scope]: current[scope].map((item) => (item.id === folderId ? { ...item, name: name.trim() } : item)),
-    }))
+    if (!folder) return
+    begin('knowledge', '正在重命名文件夹')
+    try {
+      const data = await api<{ folder: KnowledgeFolder }>(`/api/knowledge/folders/${folderId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...folder, name: name.trim() }),
+      })
+      setKnowledgeFolders((current) => ({
+        ...current,
+        [scope]: current[scope].map((item) => (item.id === folderId ? data.folder : item)),
+      }))
+      setNotice('文件夹已重命名。')
+    } catch (err) {
+      setError('文件夹重命名失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
   }
 
-  function deleteKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
-    setKnowledgeFolders((current) => {
-      if (current[scope].length <= 1) return current
+  async function deleteKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
+    if (knowledgeFolders[scope].length <= 1) return
+    begin('knowledge', '正在删除文件夹')
+    try {
+      await api<{ deleted: boolean; id: string }>(`/api/knowledge/folders/${folderId}`, { method: 'DELETE' })
+      setKnowledgeFolders((current) => {
       const nextFolders = current[scope].filter((item) => item.id !== folderId)
       if (activeKnowledgeFolderId === folderId) setActiveKnowledgeFolderId(nextFolders[0]?.id ?? `${scope}-default`)
       return { ...current, [scope]: nextFolders }
-    })
+      })
+      setNotice('文件夹已删除。')
+    } catch (err) {
+      setError('文件夹删除失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
+  function selectKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string) {
+    setKnowledgeTab(scope)
+    setActiveKnowledgeFolderId(folderId)
+    setActiveKnowledgeId('')
+    setKnowledgeDraft({ title: '', summary: '', content: '', url: '' })
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode('')
+    setIsCreatingKnowledge(false)
+  }
+
+  function folderKnowledgeItems(folder: KnowledgeFolder, scope: Exclude<KnowledgeTab, 'discover'>) {
+    const folderIds = folder.item_ids ?? []
+    const keyword = knowledgeQuery.trim().toLowerCase()
+    return sortKnowledgeItems(
+      knowledgeItems
+        .filter((item) => {
+          if (!folderIds.includes(item.id)) return false
+          if (scope === 'personal') return item.source === 'personal'
+          return savedKnowledge.includes(item.id)
+        })
+        .filter((item) => {
+          if (!keyword) return true
+          return [item.title, item.summary, item.content, item.url].some((part) => part?.toLowerCase().includes(keyword))
+        }),
+      knowledgeFileSort,
+    )
   }
 
   async function renameKnowledgeItem(item: KnowledgeItem) {
@@ -1057,21 +1584,19 @@ function App() {
     if (!url?.trim()) return
     begin('knowledge', '正在解析链接')
     try {
-      const data = await api<{ item: KnowledgeItem }>('/api/knowledge', {
+      const data = await api<{ item: KnowledgeItem; file?: ParsedUpload }>('/api/knowledge/link', {
         method: 'POST',
-        body: JSON.stringify({
-          title: titleFromUrl(url.trim()),
-          summary: `链接资料：${url.trim()}`,
-          content: `链接：${url.trim()}\n\n可以在这里继续补充网页重点，桃子会在知识库问答里参考它。`,
-          source: 'personal',
-          url: url.trim(),
-        }),
+        body: JSON.stringify({ url: url.trim(), folder_id: activeKnowledgeFolderId }),
       })
       setPersonalKnowledge((current) => [data.item, ...current])
       setActiveKnowledgeId(data.item.id)
       setKnowledgeDraft(toKnowledgeDraft(data.item))
+      setKnowledgeActionResult('')
+      setKnowledgeActionMode('')
+      setIsCreatingKnowledge(false)
       setKnowledgeTab('personal')
-      setNotice('链接已加入个人知识库。')
+      await refreshKnowledgeFolders()
+      setNotice(data.file?.warning || '链接已解析并加入个人知识库。')
     } catch (err) {
       setError('链接解析失败，稍后再试一次。')
       console.error(err)
@@ -1083,11 +1608,15 @@ function App() {
   async function uploadKnowledgeFile(file: File) {
     begin('upload', '正在解析并添加知识库')
     try {
-      const data = await uploadApi<{ item: KnowledgeItem; file: ParsedUpload }>('/api/knowledge/upload', file)
+      const data = await uploadApi<{ item: KnowledgeItem; file: ParsedUpload }>('/api/knowledge/upload', file, { folder_id: activeKnowledgeFolderId })
       setPersonalKnowledge((current) => [data.item, ...current])
       setActiveKnowledgeId(data.item.id)
       setKnowledgeDraft(toKnowledgeDraft(data.item))
+      setKnowledgeActionResult('')
+      setKnowledgeActionMode('')
+      setIsCreatingKnowledge(false)
       setKnowledgeTab('personal')
+      await refreshKnowledgeFolders()
       setNotice(data.file.warning || '文件已解析并加入知识库。')
     } catch (err) {
       setError(fileUploadErrorMessage(err))
@@ -1198,26 +1727,73 @@ function App() {
     setNotice(`已沉淀到${profileSectionMeta[activeProfileSection].title}。`)
   }
 
-  function submitProfileNote() {
-    if (!profileInput.trim()) return
-    const nextSections = {
-      ...profileSections,
-      [activeProfileSection]: [profileSections[activeProfileSection], profileInput.trim()].filter(Boolean).join('\n\n'),
+  async function runKnowledgeItemAction(action: string) {
+    const active = knowledgeItems.find((item) => item.id === activeKnowledgeId)
+    const title = knowledgeDraft.title.trim() || active?.title || '当前资料'
+    const summary = knowledgeDraft.summary.trim() || active?.summary || ''
+    const content = knowledgeDraft.content.trim() || active?.content || active?.summary || ''
+    if (!content.trim()) {
+      setError('当前资料还没有正文，先补充内容再让桃子调整。')
+      return
     }
-    setProfileSections(nextSections)
-    setNotice(`已补充到${profileSectionMeta[activeProfileSection].title}。`)
-    setProfileInput('')
+    const actionPrompt: Record<string, string> = {
+      智能摘要: '请为这份求职知识资料生成一段 120 字以内的摘要。只输出摘要本身。',
+      优化正文: '请优化这份求职知识资料的正文，让结构更清楚、更适合后续求职问答引用。不要编造新事实，只输出优化后的正文。',
+      提炼面试题: '请基于这份资料提炼 8 个高质量面试题，并给出每题考察点。不要使用 markdown 加粗。',
+      生成行动项: '请基于这份资料整理一份求职行动项，要求具体、可执行、按优先级排列。',
+    }
+    begin('knowledge', `桃子正在${action}`)
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode(action)
+    try {
+      const data = await api<{ reply: string }>('/api/chat', {
+        method: 'POST',
+        body: JSON.stringify({
+          message: [
+            actionPrompt[action] ?? action,
+            `标题：${title}`,
+            `摘要：${summary || '暂无'}`,
+            `正文：${content.slice(0, 14000)}`,
+          ].join('\n\n'),
+        }),
+      })
+      setKnowledgeActionResult(cleanAssistantText(data.reply))
+      setNotice(`${action}已生成。`)
+    } catch (err) {
+      setError(`${action}失败，桃子刚刚没有拿到结果。`)
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
+  function acceptKnowledgeActionResult() {
+    if (!knowledgeActionResult.trim()) return
+    if (knowledgeActionMode === '智能摘要') {
+      setKnowledgeDraft((current) => ({ ...current, summary: knowledgeActionResult.trim() }))
+    } else {
+      setKnowledgeDraft((current) => ({
+        ...current,
+        content: [current.content, knowledgeActionResult.trim()].filter(Boolean).join('\n\n'),
+      }))
+    }
+    setKnowledgeActionResult('')
+    setKnowledgeActionMode('')
+    setNotice('已采纳到当前资料，记得保存修改。')
   }
 
   async function askKnowledgeQuestion() {
     const question = knowledgeQuestion.trim()
     if (!question || busy.chat) return
+    const folder = [...knowledgeFolders.personal, ...knowledgeFolders.saved].find((item) => item.id === activeKnowledgeFolderId)
+    const folderIds = folder?.item_ids ?? []
     const sourceItems = knowledgeItems
       .filter((item) => {
         if (knowledgeTab === 'personal') return item.source === 'personal'
         if (knowledgeTab === 'saved') return savedKnowledge.includes(item.id)
         return item.source === 'discover'
       })
+      .filter((item) => (knowledgeTab === 'discover' || !folder ? true : folderIds.includes(item.id)))
       .slice(0, 8)
     setKnowledgeQuestion('')
     setKnowledgeMessages((current) => [...current, { role: 'user', content: question }, { role: 'system', content: '桃子正在基于知识库回答。' }])
@@ -1250,24 +1826,49 @@ function App() {
 
   const hasSubNav = module === 'peach' || module === 'knowledge'
   const appClass = `app-shell module-${module} ${hasSubNav ? 'has-sub-nav' : 'no-sub-nav'} ${subNavCollapsed ? 'subnav-collapsed' : ''}`
+  const activeKnowledgeFolder = knowledgeTab === 'discover'
+    ? undefined
+    : [...knowledgeFolders.personal, ...knowledgeFolders.saved].find((item) => item.id === activeKnowledgeFolderId)
+  const activeKnowledgeFolderItems = activeKnowledgeFolder
+    ? folderKnowledgeItems(activeKnowledgeFolder, activeKnowledgeFolder.scope)
+    : []
+
+  if (!account) {
+    return (
+      <AccountGate
+        username={accountInput}
+        message={accountMessage}
+        busy={Boolean(busy.account)}
+        onUsername={setAccountInput}
+        onLogin={() => void loginAccount()}
+        onCreate={() => void createAccount()}
+      />
+    )
+  }
 
   return (
     <main className={appClass}>
       <aside className="main-nav" aria-label="主导航栏">
         <nav className="main-nav-list">
           <button className={module === 'peach' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('peach')}>
-            <span className="nav-icon">桃</span>
-            <strong>桃子</strong>
+            <span className="nav-icon"><img src={NAV_ICONS.peach} alt="" /></span>
+            <strong>问问桃子</strong>
           </button>
           <button className={module === 'profile' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('profile')}>
-            <span className="nav-icon">档</span>
+            <span className="nav-icon"><img src={NAV_ICONS.profile} alt="" /></span>
             <strong>个人档案</strong>
           </button>
           <button className={module === 'knowledge' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('knowledge')}>
-            <span className="nav-icon">库</span>
+            <span className="nav-icon"><img src={NAV_ICONS.knowledge} alt="" /></span>
             <strong>求职知识库</strong>
           </button>
         </nav>
+        <div className="account-switcher" aria-label="账号管理">
+          <div className="account-avatar">{account.username.slice(0, 1).toUpperCase()}</div>
+          <strong title={account.username}>{account.username}</strong>
+          <button type="button" onClick={switchAccount}>切换</button>
+          <button type="button" onClick={() => void resetAccount()}>重置</button>
+        </div>
       </aside>
 
       {module === 'peach' ? (
@@ -1278,6 +1879,8 @@ function App() {
           collapsed={subNavCollapsed}
           onNew={createConversation}
           onOpenHistory={openConversation}
+          onRenameHistory={renameConversation}
+          onDeleteHistory={deleteConversation}
           onToggle={() => setSubNavCollapsed((value) => !value)}
         />
       ) : null}
@@ -1287,37 +1890,30 @@ function App() {
           collapsed={subNavCollapsed}
           tab={knowledgeTab}
           query={knowledgeQuery}
-          items={knowledgeItems}
-          savedIds={savedKnowledge}
-          activeId={activeKnowledgeId}
           folders={knowledgeFolders}
           activeFolderId={activeKnowledgeFolderId}
           folderSort={knowledgeFolderSort}
-          fileSort={knowledgeFileSort}
           onToggle={() => setSubNavCollapsed((value) => !value)}
           onTab={(tab) => {
             setKnowledgeTab(tab)
+            setActiveKnowledgeId('')
+            setKnowledgeDraft({ title: '', summary: '', content: '', url: '' })
+            setKnowledgeActionResult('')
+            setKnowledgeActionMode('')
+            setIsCreatingKnowledge(false)
             if (tab === 'personal') setActiveKnowledgeFolderId(knowledgeFolders.personal[0]?.id ?? 'personal-default')
             if (tab === 'saved') setActiveKnowledgeFolderId(knowledgeFolders.saved[0]?.id ?? 'saved-default')
           }}
           onQuery={setKnowledgeQuery}
-          onSelectFolder={setActiveKnowledgeFolderId}
           onFolderSort={setKnowledgeFolderSort}
-          onFileSort={setKnowledgeFileSort}
           onCreateFolder={createKnowledgeFolder}
-          onRenameFolder={renameKnowledgeFolder}
-          onDeleteFolder={deleteKnowledgeFolder}
-          onSelectItem={selectKnowledgeItem}
-          onNewItem={createKnowledgeDraft}
-          onRenameItem={(item) => void renameKnowledgeItem(item)}
-          onDeleteItem={(id) => void deleteKnowledgeItem(id)}
-          onParseLink={() => void parseKnowledgeLink()}
-          onUpload={(file) => void uploadKnowledgeFile(file)}
+          onSelectFolder={selectKnowledgeFolder}
+          getFolderItems={folderKnowledgeItems}
         />
       ) : null}
 
       <section className="workspace" aria-label="工作区">
-        {module === 'profile' || (module === 'peach' && peachPanel !== 'new-chat') ? (
+        {module === 'peach' && peachPanel !== 'new-chat' ? (
           <header className="workspace-topbar">
             <div>
               <p>{workspaceKicker(module, peachPanel)}</p>
@@ -1332,6 +1928,7 @@ function App() {
 
         {module === 'peach' ? (
           <PeachWorkspace
+            key={activeConversation.id}
             panel={peachPanel}
             profile={profile}
             conversation={activeConversation}
@@ -1345,6 +1942,11 @@ function App() {
             paused={paused}
             mediaReady={mediaReady}
             mediaStream={mediaStream}
+            ttsMuted={ttsMuted}
+            ttsSpeaking={ttsSpeaking}
+            lastTtsText={lastTtsText}
+            ttsRateMode={ttsRateMode}
+            immersiveInterview={immersiveInterview}
             subtitleCollapsed={subtitleCollapsed}
             timerCollapsed={timerCollapsed}
             videoRef={videoRef}
@@ -1352,6 +1954,7 @@ function App() {
             busy={busy}
             onInput={setInput}
             onSend={() => (peachPanel === 'live-interview' ? void sendInterviewAnswer() : void sendPrompt(input))}
+            onVoiceSubmit={(text) => void sendInterviewAnswerText(text)}
             onQuickSend={(value) => void sendPrompt(value)}
             onAction={runComposerAction}
             onSettingsChange={setSettings}
@@ -1361,9 +1964,18 @@ function App() {
             onUploadChatFile={(file) => void uploadChatFile(file)}
             onPauseToggle={() => setPaused((value) => !value)}
             onFinishInterview={() => void finishActiveInterview()}
+            onImmersiveToggle={() => setImmersiveInterview((value) => !value)}
+            onTtsMuteToggle={toggleTtsMuted}
+            onTtsStop={stopTts}
+            onTtsReplay={replayTts}
+            onTtsRateMode={setTtsRateMode}
             onSubtitleToggle={() => setSubtitleCollapsed((value) => !value)}
             onTimerToggle={() => setTimerCollapsed((value) => !value)}
-            onBackToSetup={() => setPeachPanel(liveKind === 'question-bank' ? 'question-bank-setup' : 'interview-setup')}
+            onBackToSetup={() => {
+              stopTts()
+              setImmersiveInterview(false)
+              setPeachPanel(liveKind === 'question-bank' ? 'question-bank-setup' : 'interview-setup')
+            }}
             onApproveAction={(action) => void approveAgentAction(action)}
             onDismissAction={dismissAgentAction}
           />
@@ -1371,22 +1983,27 @@ function App() {
 
         {module === 'profile' ? (
           <ProfileWorkspace
+            profile={profile}
             folders={resumeFolders}
+            interviews={dashboard?.recent_interviews ?? []}
             activeSection={activeProfileSection}
             sectionContent={profileSections[activeProfileSection]}
             sections={profileSections}
             actionResult={profileActionResult}
+            messages={profileMessages}
             resumeFiles={resumeFiles}
             isSaving={Boolean(busy.profile)}
             value={profileInput}
             onSelectSection={selectProfileSection}
             onSectionContent={(content) => updateProfileSection(activeProfileSection, content)}
             onValue={setProfileInput}
-            onSubmit={submitProfileNote}
+            onSubmit={() => void sendProfileChat()}
             onSave={() => void saveProfileSections()}
             onAction={(action) => void runProfileAction(action)}
             onAcceptResult={acceptProfileActionResult}
             onUploadFile={(file) => void uploadProfileFile(file)}
+            onApproveAction={(action) => void approveAgentAction(action)}
+            onDismissAction={dismissAgentAction}
           />
         ) : null}
 
@@ -1397,9 +2014,18 @@ function App() {
             messages={knowledgeMessages}
             items={knowledgeItems}
             savedIds={savedKnowledge}
+            activeFolder={activeKnowledgeFolder}
+            folderItems={activeKnowledgeFolderItems}
             activeId={activeKnowledgeId}
             draft={knowledgeDraft}
-            busy={Boolean(busy.knowledge || busy.upload)}
+            actionResult={knowledgeActionResult}
+            actionMode={knowledgeActionMode}
+            isCreating={isCreatingKnowledge}
+            busy={Boolean(busy.knowledge || busy.upload || busy.chat)}
+            fileSort={knowledgeFileSort}
+            onFileSort={setKnowledgeFileSort}
+            onApproveAction={(action) => void approveAgentAction(action)}
+            onDismissAction={dismissAgentAction}
             onQuestion={setKnowledgeQuestion}
             onAskQuestion={() => void askKnowledgeQuestion()}
             onSave={saveKnowledge}
@@ -1409,8 +2035,80 @@ function App() {
             onUpload={(file) => void uploadKnowledgeFile(file)}
             onAsk={sendKnowledgeToPeach}
             onUseInProfile={addKnowledgeToProfile}
+            onSelectItem={selectKnowledgeItem}
+            onNewItem={createKnowledgeDraft}
+            onRenameFolder={(scope, id) => void renameKnowledgeFolder(scope, id)}
+            onDeleteFolder={(scope, id) => void deleteKnowledgeFolder(scope, id)}
+            onRenameItem={(item) => void renameKnowledgeItem(item)}
+            onDeleteItem={(id) => void deleteKnowledgeItem(id)}
+            onParseLink={() => void parseKnowledgeLink()}
+            onBackToAsk={closeKnowledgeDetail}
+            onRunItemAction={(action) => void runKnowledgeItemAction(action)}
+            onAcceptActionResult={acceptKnowledgeActionResult}
           />
         ) : null}
+      </section>
+    </main>
+  )
+}
+
+function AccountGate({
+  username,
+  message,
+  busy,
+  onUsername,
+  onLogin,
+  onCreate,
+}: {
+  username: string
+  message: string
+  busy: boolean
+  onUsername: (value: string) => void
+  onLogin: () => void
+  onCreate: () => void
+}) {
+  return (
+    <main className="account-gate">
+      <section className="account-hero" aria-label="账号管理">
+        <div className="account-portrait-wrap">
+          <img src={PEACH_PORTRAIT} alt="桃子" />
+        </div>
+        <div className="account-copy">
+          <p>桃子账号</p>
+          <h1>先告诉桃子你是谁</h1>
+          <span>Demo 版本只需要用户名。每个用户名都有独立的档案、知识库、面试和练习记录。</span>
+        </div>
+      </section>
+
+      <section className="account-card">
+        <div className="account-card-head">
+          <img src={PEACH_ICON} alt="" />
+          <div>
+            <strong>进入你的求职空间</strong>
+            <span>{message}</span>
+          </div>
+        </div>
+        <label className="account-field">
+          <span>用户名</span>
+          <input
+            autoFocus
+            value={username}
+            maxLength={40}
+            placeholder="比如 Apple01 / Banana052 / Peach88"
+            onChange={(event) => onUsername(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') onLogin()
+            }}
+          />
+        </label>
+        <div className="account-actions">
+          <button className="primary" type="button" disabled={busy} onClick={onLogin}>
+            {busy ? '处理中' : '登录'}
+          </button>
+          <button type="button" disabled={busy} onClick={onCreate}>
+            创建账号
+          </button>
+        </div>
       </section>
     </main>
   )
@@ -1423,6 +2121,8 @@ function PeachSubNav({
   collapsed,
   onNew,
   onOpenHistory,
+  onRenameHistory,
+  onDeleteHistory,
   onToggle,
 }: {
   activePanel: PeachPanel
@@ -1431,6 +2131,8 @@ function PeachSubNav({
   collapsed: boolean
   onNew: () => void
   onOpenHistory: (id: string) => void
+  onRenameHistory: (id: string) => void
+  onDeleteHistory: (id: string) => void
   onToggle: () => void
 }) {
   return (
@@ -1449,15 +2151,19 @@ function PeachSubNav({
         <div className="section-label">历史对话</div>
         <div className="history-list">
           {conversations.map((conversation) => (
-            <button
+            <article
               className={conversation.id === activeConversationId ? 'history-item active' : 'history-item'}
               key={conversation.id}
-              type="button"
-              onClick={() => onOpenHistory(conversation.id)}
             >
-              <strong>{conversation.title}</strong>
-              <span>{conversation.updatedAt}</span>
-            </button>
+              <button className="history-open-button" type="button" onClick={() => onOpenHistory(conversation.id)}>
+                <strong>{conversation.title}</strong>
+                <span>{conversation.updatedAt}</span>
+              </button>
+              <div className="history-item-actions">
+                <button type="button" onClick={() => onRenameHistory(conversation.id)} aria-label={`重命名${conversation.title}`}>改名</button>
+                <button type="button" onClick={() => onDeleteHistory(conversation.id)} aria-label={`删除${conversation.title}`}>删除</button>
+              </div>
+            </article>
           ))}
         </div>
       </div>
@@ -1471,142 +2177,82 @@ function KnowledgeSubNav({
   collapsed,
   tab,
   query,
-  items,
-  savedIds,
-  activeId,
   folders,
   activeFolderId,
   folderSort,
-  fileSort,
   onToggle,
   onTab,
   onQuery,
-  onSelectFolder,
   onFolderSort,
-  onFileSort,
   onCreateFolder,
-  onRenameFolder,
-  onDeleteFolder,
-  onSelectItem,
-  onNewItem,
-  onRenameItem,
-  onDeleteItem,
-  onParseLink,
-  onUpload,
+  onSelectFolder,
+  getFolderItems,
 }: {
   collapsed: boolean
   tab: KnowledgeTab
   query: string
-  items: KnowledgeItem[]
-  savedIds: string[]
-  activeId: string
   folders: Record<Exclude<KnowledgeTab, 'discover'>, KnowledgeFolder[]>
   activeFolderId: string
   folderSort: SortMode
-  fileSort: SortMode
   onToggle: () => void
   onTab: (tab: KnowledgeTab) => void
   onQuery: (value: string) => void
-  onSelectFolder: (id: string) => void
   onFolderSort: (mode: SortMode) => void
-  onFileSort: (mode: SortMode) => void
   onCreateFolder: (scope: Exclude<KnowledgeTab, 'discover'>) => void
-  onRenameFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
-  onDeleteFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
-  onSelectItem: (item: KnowledgeItem) => void
-  onNewItem: () => void
-  onRenameItem: (item: KnowledgeItem) => void
-  onDeleteItem: (id: string) => void
-  onParseLink: () => void
-  onUpload: (file: File) => void
+  onSelectFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  getFolderItems: (folder: KnowledgeFolder, scope: Exclude<KnowledgeTab, 'discover'>) => KnowledgeItem[]
 }) {
-  const scope = tab === 'saved' ? 'saved' : 'personal'
-  const scopedFolders = sortFolders(folders[scope], folderSort)
-  const scopedItems = sortKnowledgeItems(items.filter((item) => {
-    if (tab === 'personal') return item.source === 'personal'
-    if (tab === 'saved') return savedIds.includes(item.id)
-    return false
-  }).filter((item) => {
-    const keyword = query.trim().toLowerCase()
-    if (!keyword) return true
-    return [item.title, item.summary, item.content, item.url].some((part) => part?.toLowerCase().includes(keyword))
-  }), fileSort)
+  const personalFolders = sortFolders(folders.personal, folderSort)
+
+  const renderGroup = (scope: Exclude<KnowledgeTab, 'discover'>, title: string, scopedFolders: KnowledgeFolder[]) => (
+    <section className="kb-nav-group" key={scope}>
+      <div className="kb-nav-group-head">
+        <button type="button" onClick={() => onTab(scope)} aria-label={`切换到${title}`}>
+          <span>⌄</span>
+          <strong>{title}</strong>
+        </button>
+        <button type="button" onClick={() => onCreateFolder(scope)} aria-label={`新建${title}`}>+</button>
+      </div>
+      <div className="kb-nav-folder-list">
+        {scopedFolders.map((folder) => {
+          const count = getFolderItems(folder, scope).length
+          return (
+            <button
+              className={tab === scope && folder.id === activeFolderId ? 'kb-nav-folder active' : 'kb-nav-folder'}
+              type="button"
+              key={folder.id}
+              onClick={() => onSelectFolder(scope, folder.id)}
+            >
+              <span className="kb-folder-mark" aria-hidden="true" />
+              <span>{folder.name}</span>
+              <small>{count}</small>
+            </button>
+          )
+        })}
+      </div>
+    </section>
+  )
 
   return (
     <aside className={collapsed ? 'sub-nav knowledge-sub-nav collapsed' : 'sub-nav knowledge-sub-nav'} aria-label="知识库副导航栏">
-      <button className="sub-nav-toggle" type="button" onClick={onToggle} aria-label={collapsed ? '展开副导航' : '收起副导航'}>
-        <span>{collapsed ? '›' : '‹'}</span>
-      </button>
+      <div className="kb-nav-top">
+        <button className="kb-icon-button" type="button" onClick={onToggle} aria-label={collapsed ? '展开副导航' : '收起副导航'}>
+          <span>{collapsed ? '›' : '‹'}</span>
+        </button>
+        {collapsed ? null : <button className="kb-icon-button" type="button" aria-label="搜索知识库">⌕</button>}
+      </div>
       {collapsed ? null : (
-        <>
-          <div className="knowledge-nav-tabs">
-            {(['personal', 'saved', 'discover'] as KnowledgeTab[]).map((item) => (
-              <button className={tab === item ? 'active' : ''} key={item} type="button" onClick={() => onTab(item)}>
-                {knowledgeTabLabel(item)}
-              </button>
-            ))}
+        <div className="kb-nav-content">
+          <div className="kb-nav-search">
+            <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索知识库" />
+            <select value={folderSort} onChange={(event) => onFolderSort(event.target.value as SortMode)} aria-label="知识库排序">
+              <option value="updated">最近更新</option>
+              <option value="name">名称排序</option>
+            </select>
           </div>
 
-          {tab === 'discover' ? (
-            <div className="knowledge-side-note">
-              <strong>发现知识库</strong>
-              <p>浏览精选和推荐内容，收藏后会进入收藏知识库。</p>
-            </div>
-          ) : (
-            <div className="knowledge-tree">
-              <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索知识库" />
-              <div className="tree-toolbar">
-                <button type="button" onClick={() => onCreateFolder(scope)}>新建文件夹</button>
-                <select value={folderSort} onChange={(event) => onFolderSort(event.target.value as SortMode)}>
-                  <option value="updated">最近更新</option>
-                  <option value="name">名称排序</option>
-                </select>
-              </div>
-
-              <div className="folder-list">
-                {scopedFolders.map((folder) => (
-                  <section className={folder.id === activeFolderId ? 'folder-block active' : 'folder-block'} key={folder.id}>
-                    <button className="folder-title" type="button" onClick={() => onSelectFolder(folder.id)}>
-                      <span>{folder.id === activeFolderId ? '⌄' : '›'}</span>
-                      <strong>{folder.name}</strong>
-                    </button>
-                    <div className="folder-actions">
-                      <button type="button" onClick={() => onRenameFolder(scope, folder.id)}>重命名</button>
-                      <button type="button" onClick={() => onDeleteFolder(scope, folder.id)}>删除</button>
-                    </div>
-                    {folder.id === activeFolderId ? (
-                      <div className="file-list">
-                        <div className="tree-toolbar file-toolbar">
-                          <button type="button" onClick={onNewItem}>新建</button>
-                          <button type="button" onClick={onParseLink}>链接</button>
-                          <label>
-                            <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUpload(event.target.files[0])} />
-                            <span>上传</span>
-                          </label>
-                          <select value={fileSort} onChange={(event) => onFileSort(event.target.value as SortMode)}>
-                            <option value="updated">最近</option>
-                            <option value="name">名称</option>
-                          </select>
-                        </div>
-                        {scopedItems.length ? scopedItems.map((item) => (
-                          <div className={item.id === activeId ? 'file-row active' : 'file-row'} key={item.id}>
-                            <button type="button" onClick={() => onSelectItem(item)}>
-                              <span>{item.title}</span>
-                            </button>
-                            <div>
-                              <button type="button" onClick={() => onRenameItem(item)}>改名</button>
-                              {item.source === 'personal' ? <button type="button" onClick={() => onDeleteItem(item.id)}>删除</button> : null}
-                            </div>
-                          </div>
-                        )) : <p className="tree-empty">这个文件夹还没有文件。</p>}
-                      </div>
-                    ) : null}
-                  </section>
-                ))}
-              </div>
-            </div>
-          )}
-        </>
+          {renderGroup('personal', '个人知识库', personalFolders)}
+        </div>
       )}
     </aside>
   )
@@ -1626,13 +2272,19 @@ function PeachWorkspace(props: {
   paused: boolean
   mediaReady: boolean
   mediaStream: MediaStream | null
+  ttsMuted: boolean
+  ttsSpeaking: boolean
+  lastTtsText: string
+  ttsRateMode: TtsRateMode
+  immersiveInterview: boolean
   subtitleCollapsed: boolean
   timerCollapsed: boolean
-  videoRef: React.RefObject<HTMLVideoElement | null>
-  chatScrollRef: React.RefObject<HTMLElement | null>
+  videoRef: RefObject<HTMLVideoElement | null>
+  chatScrollRef: RefObject<HTMLElement | null>
   busy: Partial<Record<BusyKey, string>>
   onInput: (value: string) => void
   onSend: () => void
+  onVoiceSubmit: (value: string) => void
   onQuickSend: (value: string) => void
   onAction: (value: string) => void
   onSettingsChange: (value: InterviewSettings) => void
@@ -1642,6 +2294,11 @@ function PeachWorkspace(props: {
   onUploadChatFile: (file: File) => void
   onPauseToggle: () => void
   onFinishInterview: () => void
+  onImmersiveToggle: () => void
+  onTtsMuteToggle: () => void
+  onTtsStop: () => void
+  onTtsReplay: () => void
+  onTtsRateMode: (mode: TtsRateMode) => void
   onSubtitleToggle: () => void
   onTimerToggle: () => void
   onBackToSetup: () => void
@@ -1660,18 +2317,22 @@ function PeachWorkspace(props: {
     return <LiveInterview {...props} />
   }
 
-  const hasStartedChat = props.conversation.messages.some((message) => message.role === 'user')
+  const isBlankConversation = props.conversation.messages.length === 0
+  const bubbleItems = uniqueStrings([...fixedBubbles, ...props.recommendations]).slice(0, 8)
 
   return (
-    <div className={hasStartedChat ? 'chat-home chatting' : 'chat-home'}>
-      {!hasStartedChat ? <section className="greeting-panel">
+    <div className={isBlankConversation ? 'chat-home' : 'chat-home chatting'}>
+      {isBlankConversation ? <section className="greeting-panel">
+        <div className="peach-hero-portrait">
+          <img src={PEACH_PORTRAIT} alt="桃子形象" />
+        </div>
         <div className="greeting-copy">
           <h2>{personalGreeting(props.profile)}</h2>
           <p>我是专属于你的求职搭子</p>
         </div>
         <div className="bubble-group">
           <div className="bubble-grid fixed-bubbles">
-            {[...fixedBubbles, ...props.recommendations].map((item) => (
+            {bubbleItems.map((item) => (
               <button key={item} type="button" onClick={() => props.onQuickSend(item)}>{item}</button>
             ))}
           </div>
@@ -1738,6 +2399,13 @@ function InterviewSetup({
           <h2>{title}</h2>
           <p>{isBank ? '选择题库、简历和面试形式，桃子会按题目连续追问。' : '配置简历、岗位和面试官风格，进入实时对话模式。'}</p>
         </div>
+        <div className="setup-peach-card" aria-label="桃子陪练官">
+          <img src={PEACH_PORTRAIT} alt="桃子" />
+          <div>
+            <strong>桃子在场</strong>
+            <span>{settings.style}陪练官</span>
+          </div>
+        </div>
       </div>
 
       <div className="setup-grid">
@@ -1773,7 +2441,7 @@ function InterviewSetup({
             placeholder="选填，粘贴岗位描述后追问会更贴近真实面试"
           />
         </Field>
-        <Field label="面试官性别">
+        <Field label="面试官">
           <Segmented value={settings.gender} options={['女性', '男性', '不指定']} onChange={(gender) => onSettingsChange({ ...settings, gender })} />
         </Field>
         <Field label="面试官风格">
@@ -1819,6 +2487,11 @@ function LiveInterview({
   paused,
   mediaReady,
   mediaStream,
+  ttsMuted,
+  ttsSpeaking,
+  lastTtsText,
+  ttsRateMode,
+  immersiveInterview,
   subtitleCollapsed,
   timerCollapsed,
   videoRef,
@@ -1826,9 +2499,15 @@ function LiveInterview({
   busy,
   onInput,
   onSend,
+  onVoiceSubmit,
   onUploadChatFile,
   onPauseToggle,
   onFinishInterview,
+  onImmersiveToggle,
+  onTtsMuteToggle,
+  onTtsStop,
+  onTtsReplay,
+  onTtsRateMode,
   onSubtitleToggle,
   onTimerToggle,
   onBackToSetup,
@@ -1863,9 +2542,7 @@ function LiveInterview({
         <div className="avatar-stage" aria-label="桃子的半身形象">
           <div className={paused ? 'peach-avatar paused' : 'peach-avatar'}>
             <div className="avatar-aura" />
-            <div className="avatar-face">
-              <span>桃</span>
-            </div>
+            <img className="peach-live-portrait" src={PEACH_PORTRAIT} alt="桃子面试官形象" />
             <div className="avatar-body">
               <strong>{liveTitle}</strong>
               <span>{settings.mode === 'video' ? '视频面试' : '语音面试'} / {settings.style}</span>
@@ -1881,6 +2558,10 @@ function LiveInterview({
           </div>
           <div className="live-controls">
             <button type="button" onClick={onPauseToggle}>{paused ? '继续面试' : '暂停面试'}</button>
+            <button type="button" className={immersiveInterview ? 'secondary active' : 'secondary'} onClick={onImmersiveToggle}>
+              {immersiveInterview ? '文字面试' : '沉浸式面试'}
+            </button>
+            <button type="button" className="danger" onClick={onFinishInterview}>结束面试</button>
             <button type="button" className="secondary" onClick={onBackToSetup}>返回设置</button>
           </div>
         </div>
@@ -1901,13 +2582,18 @@ function LiveInterview({
 
         <ChatComposer
           value={input}
-          placeholder={paused ? '面试暂停中，点击继续后再回答' : '输入你的回答，也可以后续接入语音转写'}
-          actions={[paused ? '继续面试' : '暂停面试', '结束面试']}
-          disabled={paused || Boolean(busy.chat)}
+          placeholder={immersiveInterview ? (paused ? '面试暂停中' : ttsSpeaking ? '桃子正在说话' : '沉浸式已开启，说完后桃子会自动追问') : (paused ? '面试暂停中，点击继续后再回答' : '输入你的回答，或点击麦克风实时转写')}
+          actions={immersiveInterview ? ['结束面试'] : [paused ? '继续面试' : '暂停面试', '结束面试']}
+          disabled={paused || Boolean(busy.chat) || (immersiveInterview && ttsSpeaking)}
           button={busy.chat ? '发送中' : '语音输入'}
           buttonKind="voice"
+          voiceMode="stream"
+          voiceOnly={immersiveInterview}
+          autoListen={immersiveInterview && !ttsSpeaking && !paused && !busy.chat}
+          listeningText={immersiveInterview ? '麦克风已开，说完自动提交' : undefined}
           onChange={onInput}
           onSubmit={onSend}
+          onVoiceSubmit={onVoiceSubmit}
           onAction={(action) => {
             if (action === '结束面试') onFinishInterview()
             else onPauseToggle()
@@ -1933,6 +2619,33 @@ function LiveInterview({
               <span className={item.done ? 'done' : ''} key={item.key}>{item.done ? '✓' : '○'} {item.label}</span>
             ))}
           </div>
+        </section>
+
+        <section className="side-widget voice-widget">
+          <div className="widget-head">
+            <span>面试官语音</span>
+            <strong>{ttsSpeaking ? '朗读中' : ttsMuted ? '已静音' : '待命'}</strong>
+          </div>
+          <div className="voice-widget-actions">
+            <button type="button" className={ttsMuted ? 'active' : ''} onClick={onTtsMuteToggle}>
+              {ttsMuted ? '开声' : '静音'}
+            </button>
+            <button type="button" onClick={onTtsStop} disabled={!ttsSpeaking}>打断</button>
+            <button type="button" onClick={onTtsReplay} disabled={!lastTtsText}>重播</button>
+          </div>
+          <label className="tts-rate-control">
+            <span>语速</span>
+            <input
+              type="range"
+              min={0}
+              max={2}
+              step={1}
+              value={ttsRateIndex(ttsRateMode)}
+              onChange={(event) => onTtsRateMode(ttsRateFromIndex(Number(event.target.value)))}
+              aria-label="面试官语速"
+            />
+            <strong>{ttsRateLabel(ttsRateMode)}</strong>
+          </label>
         </section>
 
         {settings.mode === 'video' ? (
@@ -1982,11 +2695,14 @@ function LiveInterview({
 }
 
 function ProfileWorkspace({
+  profile,
   folders,
+  interviews,
   activeSection,
   sectionContent,
   sections,
   actionResult,
+  messages,
   resumeFiles,
   isSaving,
   value,
@@ -1998,12 +2714,17 @@ function ProfileWorkspace({
   onAction,
   onAcceptResult,
   onUploadFile,
+  onApproveAction,
+  onDismissAction,
 }: {
+  profile: Profile
   folders: ResumeFolder[]
+  interviews: Dashboard['recent_interviews']
   activeSection: ProfileSectionId
   sectionContent: string
   sections: Record<ProfileSectionId, string>
   actionResult: string
+  messages: ChatMessage[]
   resumeFiles: ParsedUpload[]
   isSaving: boolean
   value: string
@@ -2015,10 +2736,16 @@ function ProfileWorkspace({
   onAction: (action: string) => void
   onAcceptResult: () => void
   onUploadFile: (file: File) => void
+  onApproveAction: (action: AgentToolProposal) => void
+  onDismissAction: (action: AgentToolProposal) => void
 }) {
   const current = profileSectionMeta[activeSection]
   const sectionItems = flattenResumeFolders(folders)
-  const filledCount = sectionItems.filter((item) => sections[item.id]?.trim()).length
+  const [reportsCollapsed, setReportsCollapsed] = useState(false)
+  const [resumeListCollapsed, setResumeListCollapsed] = useState(false)
+  const [resumeSortMode, setResumeSortMode] = useState<'time' | 'role'>('time')
+  const [selectedReportId, setSelectedReportId] = useState('')
+  const selectedReport = interviews.find((item) => item.id === selectedReportId) ?? interviews[0]
 
   return (
     <section className="profile-workspace">
@@ -2026,7 +2753,6 @@ function ProfileWorkspace({
         <aside className="profile-overview-panel" aria-label="个人档案分区">
           <div className="profile-overview-head">
             <strong>个人档案</strong>
-            <p>{filledCount} 个分区已有内容。先补经历，桃子再帮你变成简历和面试答案。</p>
           </div>
 
           <div className="profile-section-list">
@@ -2050,7 +2776,7 @@ function ProfileWorkspace({
           </div>
         </aside>
 
-        <section className="profile-detail-panel">
+        <section className={`profile-detail-panel${activeSection === 'full' ? ' with-resume-files' : ''}${activeSection === 'reviews' ? ' with-review-board' : ''}`}>
           <div className="profile-detail-head">
             <div>
               <span>正在编辑</span>
@@ -2061,6 +2787,55 @@ function ProfileWorkspace({
             </button>
           </div>
 
+          {activeSection === 'reviews' ? (
+            <section className="profile-review-board">
+              <article className="profile-review-card">
+                <div className="profile-card-head">
+                  <strong>历史面试总结</strong>
+                  <span>{interviews.length} 份报告</span>
+                </div>
+                <p>{buildInterviewHistorySummary(interviews, profile)}</p>
+              </article>
+
+              <article className="profile-review-card report-list-card">
+                <div className="profile-card-head">
+                  <strong>历史面试报告</strong>
+                  <button type="button" onClick={() => setReportsCollapsed((value) => !value)}>{reportsCollapsed ? '展开' : '收起'}</button>
+                </div>
+                {!reportsCollapsed ? (
+                  <div className="profile-report-list">
+                    {interviews.length ? interviews.map((interview) => (
+                      <button
+                        className={selectedReport?.id === interview.id ? 'active' : ''}
+                        type="button"
+                        key={interview.id}
+                        onClick={() => setSelectedReportId(interview.id)}
+                      >
+                        <strong>{formatInterviewReportTitle(interview, profile)}</strong>
+                        <span>{interview.report?.summary || '点击查看报告详情'}</span>
+                      </button>
+                    )) : <p>还没有生成过面试复盘报告。</p>}
+                  </div>
+                ) : null}
+              </article>
+
+              {selectedReport ? (
+                <InterviewReportPanel interview={selectedReport} profile={profile} onDownload={() => downloadInterviewReport(selectedReport, profile)} />
+              ) : null}
+
+              <article className="profile-review-upload">
+                <strong>上传其他面试的语音/文字，桃子帮你面试复盘</strong>
+                <div>
+                  <label>
+                    <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUploadFile(event.target.files[0])} />
+                    上传材料
+                  </label>
+                  <button type="button" onClick={() => onAction('面试复盘')}>生成复盘</button>
+                </div>
+              </article>
+            </section>
+          ) : null}
+
           {activeSection === 'full' ? (
             <div className="resume-file-strip">
               <label className="resume-upload-card">
@@ -2069,23 +2844,39 @@ function ProfileWorkspace({
                 <strong>上传简历附件</strong>
               </label>
               <div className="resume-file-list">
-                {resumeFiles.length ? resumeFiles.map((file) => (
-                  <button type="button" key={file.filename} onClick={() => onSectionContent([sectionContent, `【${file.title}】\n${file.content}`].filter(Boolean).join('\n\n'))}>
-                    <strong>{file.filename}</strong>
-                    <span>{file.summary || '已解析'}</span>
-                  </button>
-                )) : <p>还没有上传简历文件。</p>}
+                <div className="resume-list-toolbar">
+                  <button type="button" onClick={() => setResumeListCollapsed((value) => !value)}>{resumeListCollapsed ? '展开简历列表' : '收起简历列表'}</button>
+                  <select value={resumeSortMode} onChange={(event) => setResumeSortMode(event.target.value as 'time' | 'role')} aria-label="简历排序">
+                    <option value="time">按上传时间</option>
+                    <option value="role">按对应岗位</option>
+                  </select>
+                </div>
+                <div className="resume-file-items">
+                  {!resumeListCollapsed && resumeFiles.length ? sortResumeFiles(resumeFiles, resumeSortMode).map((file) => (
+                    <button type="button" key={file.filename} onClick={() => onSectionContent([sectionContent, `【${file.title}】\n${file.content}`].filter(Boolean).join('\n\n'))}>
+                      <strong>{file.filename}</strong>
+                      <span>{file.summary || '已解析'}</span>
+                    </button>
+                  )) : null}
+                  {!resumeListCollapsed && !resumeFiles.length ? <p>还没有上传简历文件。</p> : null}
+                </div>
               </div>
             </div>
           ) : null}
 
-          <textarea
-            className="profile-editor"
-            value={sectionContent}
-            onChange={(event) => onSectionContent(event.target.value)}
-            placeholder={`在这里整理${current.title}。桃子会基于这些内容帮你生成简历、优化表达和准备追问题。`}
-            rows={10}
-          />
+          {activeSection === 'reviews' ? null : (
+            <>
+              {activeSection === 'full' ? <ResumeInsightCard profile={profile} sectionContent={sectionContent} resumeFiles={resumeFiles} /> : null}
+              {(activeSection === 'internship' || activeSection === 'project') ? <ExperienceNameList title={current.title} content={sectionContent} /> : null}
+              <textarea
+                className="profile-editor"
+                value={sectionContent}
+                onChange={(event) => onSectionContent(event.target.value)}
+                placeholder={`在这里整理${current.title}。桃子会基于这些内容帮你生成简历、优化表达和准备追问题。`}
+                rows={10}
+              />
+            </>
+          )}
 
           {actionResult ? (
             <section className="profile-action-result">
@@ -2096,10 +2887,28 @@ function ProfileWorkspace({
               <p>{actionResult}</p>
             </section>
           ) : (
-            <section className="profile-empty-hint" aria-label="当前分区状态">
-              <strong>{sectionContent.trim() ? '当前文件已可用于对话和面试。' : '当前文件暂无内容。'}</strong>
-            </section>
+            activeSection === 'reviews' || activeSection === 'full' ? null : (
+              <section className="profile-empty-hint" aria-label="当前分区状态">
+                <strong>{sectionContent.trim() ? '这部分内容已记录，后续可继续优化。' : '当前文件暂无内容。'}</strong>
+              </section>
+            )
           )}
+
+          {messages.length ? (
+            <section className="profile-chat-thread" aria-label="个人档案对话">
+              {messages.map((message, index) => (
+                <Message
+                  key={`${message.role}-${index}`}
+                  role={message.role}
+                  actions={message.actions}
+                  onApproveAction={onApproveAction}
+                  onDismissAction={onDismissAction}
+                >
+                  {message.content}
+                </Message>
+              ))}
+            </section>
+          ) : null}
         </section>
       </div>
       <ChatComposer
@@ -2119,15 +2928,123 @@ function ProfileWorkspace({
   )
 }
 
+function InterviewReportPanel({
+  interview,
+  profile,
+  onDownload,
+}: {
+  interview: Dashboard['recent_interviews'][number]
+  profile: Profile
+  onDownload: () => void
+}) {
+  const report = normalizeInterviewReport(interview.report, interview, profile)
+  return (
+    <article className="interview-report-panel">
+      <div className="profile-card-head">
+        <strong>{report.position}</strong>
+        <button type="button" onClick={onDownload}>下载 PDF</button>
+      </div>
+      <div className="report-score-row">
+        <div>
+          <span>得分</span>
+          <strong>{report.overall_score}</strong>
+        </div>
+        <div>
+          <span>等级</span>
+          <strong>{report.level}</strong>
+        </div>
+        <div>
+          <span>超过同类求职者</span>
+          <strong>{report.percentile}%</strong>
+        </div>
+      </div>
+      <p>{report.summary}</p>
+      <section className="report-dimension-card" aria-label="多维评价">
+        <strong>多维评价</strong>
+        {report.dimensions.map((item) => (
+          <div className="report-dimension-row" key={item.name}>
+            <span>{item.name}</span>
+            <div><i style={{ width: `${Math.max(8, Math.min(100, item.score))}%` }} /></div>
+            <strong>{item.score}</strong>
+          </div>
+        ))}
+      </section>
+      <div className="report-suggestions">
+        <strong>评价建议</strong>
+        <ul>{report.key_improvements.map((item) => <li key={item}>{item}</li>)}</ul>
+      </div>
+      <div className="report-question-review">
+        <strong>问题回顾</strong>
+        {report.question_review.map((item, index) => (
+          <section key={`${item.question}-${index}`}>
+            <h4>{item.question || '待优化问题'}</h4>
+            <p><b>考察点：</b>{item.assessment_focus || '岗位匹配、表达结构和证据质量。'}</p>
+            <p><b>回答转文字：</b>{item.candidate_transcript || '暂无转文字。'}</p>
+            <p><b>示例回答：</b>{item.sample_answer || '建议按结论、经历证据、岗位匹配三段式回答。'}</p>
+          </section>
+        ))}
+      </div>
+    </article>
+  )
+}
+
+function ResumeInsightCard({
+  profile,
+  sectionContent,
+  resumeFiles,
+}: {
+  profile: Profile
+  sectionContent: string
+  resumeFiles: ParsedUpload[]
+}) {
+  const hasContent = Boolean(sectionContent.trim() || resumeFiles.length)
+  return (
+    <section className="resume-insight-card">
+      <div>
+        <strong>已有简历总结</strong>
+        <p>{hasContent ? summarizeClientText(sectionContent || resumeFiles[0]?.summary || '', 120) : '暂时还没有完整简历，可以先上传或粘贴一版。'}</p>
+      </div>
+      <div>
+        <strong>与目标岗位匹配度</strong>
+        <p>{hasContent ? `当前与「${profile.target_role}」已有基础匹配，建议继续补充量化结果、项目角色和业务指标。` : `目标岗位是「${profile.target_role}」，先补经历后才能判断匹配度。`}</p>
+      </div>
+      <div>
+        <strong>改进建议</strong>
+        <p>{hasContent ? '优先把“负责”改成“主导/推动 + 动作 + 结果”，每段经历至少补 1 个可追问证据。' : '先上传主简历，再让桃子做简历优化和面试深挖。'}</p>
+      </div>
+    </section>
+  )
+}
+
+function ExperienceNameList({ title, content }: { title: string; content: string }) {
+  const names = extractExperienceNames(content)
+  return (
+    <section className="experience-name-list">
+      <div className="profile-card-head">
+        <strong>{title}列表</strong>
+        <span>按上传/录入时间排序</span>
+      </div>
+      {names.length ? names.map((name) => <span key={name}>{name}</span>) : <p>还没有可识别的经历名称。</p>}
+    </section>
+  )
+}
+
 function KnowledgeWorkspace({
   tab,
   question,
   messages,
   items,
   savedIds,
+  activeFolder,
+  folderItems,
   activeId,
   draft,
+  actionResult,
+  actionMode,
+  isCreating,
   busy,
+  fileSort,
+  onFileSort,
   onQuestion,
   onAskQuestion,
   onSave,
@@ -2137,15 +3054,34 @@ function KnowledgeWorkspace({
   onUpload,
   onAsk,
   onUseInProfile,
+  onSelectItem,
+  onNewItem,
+  onRenameFolder,
+  onDeleteFolder,
+  onRenameItem,
+  onDeleteItem,
+  onParseLink,
+  onApproveAction,
+  onDismissAction,
+  onBackToAsk,
+  onRunItemAction,
+  onAcceptActionResult,
 }: {
   tab: KnowledgeTab
   question: string
   messages: ChatMessage[]
   items: KnowledgeItem[]
   savedIds: string[]
+  activeFolder?: KnowledgeFolder
+  folderItems: KnowledgeItem[]
   activeId: string
   draft: KnowledgeDraft
+  actionResult: string
+  actionMode: string
+  isCreating: boolean
   busy: boolean
+  fileSort: SortMode
+  onFileSort: (mode: SortMode) => void
   onQuestion: (value: string) => void
   onAskQuestion: () => void
   onSave: (id: string) => void
@@ -2155,10 +3091,21 @@ function KnowledgeWorkspace({
   onUpload: (file: File) => void
   onAsk: (item: KnowledgeItem) => void
   onUseInProfile: (item: KnowledgeItem) => void
+  onSelectItem: (item: KnowledgeItem) => void
+  onNewItem: () => void
+  onRenameFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onDeleteFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onRenameItem: (item: KnowledgeItem) => void
+  onDeleteItem: (id: string) => void
+  onParseLink: () => void
+  onApproveAction: (action: AgentToolProposal) => void
+  onDismissAction: (action: AgentToolProposal) => void
+  onBackToAsk: () => void
+  onRunItemAction: (action: string) => void
+  onAcceptActionResult: () => void
 }) {
   const activeItem = items.find((item) => item.id === activeId)
-  const canEdit = !activeItem || activeItem.source === 'personal'
-  const isCreating = canEdit && !activeItem
+  const canEdit = isCreating || activeItem?.source === 'personal'
   const discoverItems = items.filter((item) => item.source === 'discover')
 
   return (
@@ -2189,7 +3136,7 @@ function KnowledgeWorkspace({
             {['推荐', '科技', '教育', '职场', '财经', '产业', 'AI'].map((item) => <button key={item} type="button">{item}</button>)}
           </div>
           <div className="recommend-grid">
-            {discoverKnowledgeFeed().map((item, index) => (
+            {discoverItems.map((item, index) => (
               <KnowledgeFeedCard
                 item={item}
                 index={index}
@@ -2202,84 +3149,351 @@ function KnowledgeWorkspace({
           </div>
         </section>
       ) : (
-        <section className="knowledge-qa">
-          <div className="knowledge-qa-empty">
-            <h2>基于知识库问答</h2>
-            {!messages.length ? (
-              <p>{tab === 'personal' ? '可以围绕个人知识库梳理经历、准备面试题和整理投递策略。' : '可以围绕收藏知识库解释概念、拆解方法论和迁移到你的求职场景。'}</p>
-            ) : null}
-          </div>
-          <div className="knowledge-chat-thread">
-            {messages.map((message, index) => (
-              <Message
-                key={`${message.role}-${index}`}
-                role={message.role}
-                actions={message.actions}
-                onApproveAction={() => undefined}
-                onDismissAction={() => undefined}
-              >
-                {message.content}
-              </Message>
-            ))}
-          </div>
-
-          {activeItem ? (
-            <section className="knowledge-inline-editor">
-              <div className="knowledge-detail-head">
-                <div>
-                  <span>{canEdit ? '当前资料' : '已选资料'}</span>
-                  <h2>{activeItem.title}</h2>
-                </div>
-                <div className="knowledge-detail-actions">
-                  {activeItem.source === 'discover' ? (
-                    <button type="button" onClick={() => onSave(activeItem.id)} disabled={savedIds.includes(activeItem.id)}>
-                      {savedIds.includes(activeItem.id) ? '已收藏' : '收藏'}
-                    </button>
-                  ) : null}
-                  <button type="button" onClick={() => onAsk(activeItem)}>问桃子</button>
-                  <button type="button" onClick={() => onUseInProfile(activeItem)}>沉淀到档案</button>
-                </div>
-              </div>
-              {canEdit ? (
-                <div className="knowledge-editor compact">
-                  <label>
-                    <span>标题</span>
-                    <input value={draft.title} onChange={(event) => onDraft({ ...draft, title: event.target.value })} />
-                  </label>
-                  <label>
-                    <span>摘要</span>
-                    <textarea rows={2} value={draft.summary} onChange={(event) => onDraft({ ...draft, summary: event.target.value })} />
-                  </label>
-                  <label>
-                    <span>正文</span>
-                    <textarea rows={5} value={draft.content} onChange={(event) => onDraft({ ...draft, content: event.target.value })} />
-                  </label>
-                  <div className="knowledge-editor-actions">
-                    {activeItem.source === 'personal' ? <button type="button" className="secondary-danger" onClick={() => onDelete(activeItem.id)}>删除</button> : null}
-                    <button type="button" onClick={onSaveDraft} disabled={busy || !draft.title.trim() || !draft.content.trim()}>
-                      {busy ? '保存中' : isCreating ? '新建资料' : '保存修改'}
-                    </button>
-                  </div>
-                </div>
-              ) : <p className="knowledge-preview-text">{activeItem.content || activeItem.summary}</p>}
-            </section>
-          ) : null}
-
-          <ChatComposer
-            value={question}
-            placeholder={tab === 'personal' ? '基于知识库向桃子提问，如基于个人知识库，梳理一下我在快手 AI 产品经理岗位的求职经历' : '基于知识库向桃子提问，如基于所收藏知识库，解释一下 auto-rubric 是什么意思'}
-            actions={[]}
-            disabled={Boolean(busy)}
-            button={busy ? '回答中' : '语音输入'}
-            buttonKind="voice"
-            onChange={onQuestion}
-            onSubmit={onAskQuestion}
-            onAction={() => undefined}
+        <section className="knowledge-library">
+          <KnowledgeCollectionPanel
+            folder={activeFolder}
+            items={folderItems}
+            activeId={activeId}
+            fileSort={fileSort}
+            busy={busy}
+            onFileSort={onFileSort}
+            onSelectItem={onSelectItem}
+            onNewItem={onNewItem}
+            onRenameFolder={onRenameFolder}
+            onDeleteFolder={onDeleteFolder}
+            onRenameItem={onRenameItem}
+            onDeleteItem={onDeleteItem}
+            onParseLink={onParseLink}
             onUpload={onUpload}
-            uploadDisabled={Boolean(busy)}
           />
+          <div className="knowledge-reader-shell">
+            {activeItem || isCreating ? (
+              <KnowledgeDetailView
+                activeItem={activeItem}
+                canEdit={canEdit}
+                isCreating={isCreating}
+                draft={draft}
+                actionResult={actionResult}
+                actionMode={actionMode}
+                busy={busy}
+                saved={Boolean(activeItem && savedIds.includes(activeItem.id))}
+                onBack={onBackToAsk}
+                onDraft={onDraft}
+                onSaveDraft={onSaveDraft}
+                onDelete={onDelete}
+                onSave={onSave}
+                onAsk={onAsk}
+                onUseInProfile={onUseInProfile}
+                onRunItemAction={onRunItemAction}
+                onAcceptActionResult={onAcceptActionResult}
+              />
+            ) : (
+              <KnowledgeAskView
+                tab={tab}
+                question={question}
+                messages={messages}
+                busy={busy}
+                onQuestion={onQuestion}
+                onAskQuestion={onAskQuestion}
+                onUpload={onUpload}
+                onApproveAction={onApproveAction}
+                onDismissAction={onDismissAction}
+              />
+            )}
+          </div>
         </section>
       )}
+    </section>
+  )
+}
+
+function KnowledgeCollectionPanel({
+  folder,
+  items,
+  activeId,
+  fileSort,
+  busy,
+  onFileSort,
+  onSelectItem,
+  onNewItem,
+  onRenameFolder,
+  onDeleteFolder,
+  onRenameItem,
+  onDeleteItem,
+  onParseLink,
+  onUpload,
+}: {
+  folder?: KnowledgeFolder
+  items: KnowledgeItem[]
+  activeId: string
+  fileSort: SortMode
+  busy: boolean
+  onFileSort: (mode: SortMode) => void
+  onSelectItem: (item: KnowledgeItem) => void
+  onNewItem: () => void
+  onRenameFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onDeleteFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onRenameItem: (item: KnowledgeItem) => void
+  onDeleteItem: (id: string) => void
+  onParseLink: () => void
+  onUpload: (file: File) => void
+}) {
+  const title = folder?.name || '个人知识库'
+  const scopeLabel = folder?.scope === 'saved' ? '共享资料' : '个人资料'
+
+  return (
+    <section className="knowledge-collection-panel">
+      <header className="kb-collection-head">
+        <div className="kb-collection-cover" aria-hidden="true">
+          <span />
+        </div>
+        <div>
+          <h2>{title}</h2>
+          <p>{scopeLabel}</p>
+          <small>{items.length ? `${items.length} 份内容` : '快来填写描述吧'}</small>
+        </div>
+      </header>
+
+      <div className="kb-collection-meta">
+        <span>{folder?.scope === 'saved' ? '已收藏' : '已设为私密'}</span>
+        {folder ? (
+          <div>
+            <button type="button" onClick={() => onRenameFolder(folder.scope, folder.id)}>重命名</button>
+            <button type="button" onClick={() => onDeleteFolder(folder.scope, folder.id)}>删除</button>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="kb-content-head">
+        <strong>内容({items.length})</strong>
+        <div>
+          <button type="button" onClick={onNewItem} disabled={busy}>新建</button>
+          <button type="button" onClick={onParseLink} disabled={busy}>链接</button>
+          <label>
+            <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUpload(event.target.files[0])} disabled={busy} />
+            <span>上传</span>
+          </label>
+          <select value={fileSort} onChange={(event) => onFileSort(event.target.value as SortMode)} aria-label="内容排序">
+            <option value="updated">最近</option>
+            <option value="name">名称</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="kb-content-list">
+        {items.length ? items.map((item) => (
+          <article className={item.id === activeId ? 'kb-content-item active' : 'kb-content-item'} key={item.id}>
+            <button type="button" onClick={() => onSelectItem(item)}>
+              <span className="kb-file-mark" aria-hidden="true" />
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.summary || '暂无摘要'}</small>
+              </span>
+            </button>
+            <div>
+              <button type="button" onClick={() => onRenameItem(item)}>改名</button>
+              {item.source === 'personal' ? <button type="button" onClick={() => onDeleteItem(item.id)}>删除</button> : null}
+            </div>
+          </article>
+        )) : (
+          <div className="kb-content-empty">
+            <strong>没有更多内容了</strong>
+            <p>上传文件、解析链接，或新建一份资料。</p>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function KnowledgeAskView({
+  tab,
+  question,
+  messages,
+  busy,
+  onQuestion,
+  onAskQuestion,
+  onUpload,
+  onApproveAction,
+  onDismissAction,
+}: {
+  tab: KnowledgeTab
+  question: string
+  messages: ChatMessage[]
+  busy: boolean
+  onQuestion: (value: string) => void
+  onAskQuestion: () => void
+  onUpload: (file: File) => void
+  onApproveAction: (action: AgentToolProposal) => void
+  onDismissAction: (action: AgentToolProposal) => void
+}) {
+  return (
+    <section className="knowledge-ask-view">
+      <div className="knowledge-ask-center">
+        <h2>基于知识库问答</h2>
+        {!messages.length ? (
+          <p>{tab === 'personal' ? '可以围绕个人资料梳理经历、准备面试题和整理投递策略。' : '可以围绕收藏资料解释概念、拆解方法并迁移到你的求职场景。'}</p>
+        ) : null}
+      </div>
+      <div className="knowledge-chat-thread">
+        {messages.map((message, index) => (
+          <Message
+            key={`${message.role}-${index}`}
+            role={message.role}
+            actions={message.actions}
+            onApproveAction={onApproveAction}
+            onDismissAction={onDismissAction}
+          >
+            {message.content}
+          </Message>
+        ))}
+      </div>
+
+      <ChatComposer
+        value={question}
+        placeholder={tab === 'personal' ? '基于个人知识库向桃子提问' : '基于收藏知识库向桃子提问'}
+        actions={[]}
+        disabled={Boolean(busy)}
+        button={busy ? '回答中' : '语音输入'}
+        buttonKind="voice"
+        onChange={onQuestion}
+        onSubmit={onAskQuestion}
+        onAction={() => undefined}
+        onUpload={onUpload}
+        uploadDisabled={Boolean(busy)}
+      />
+    </section>
+  )
+}
+
+function KnowledgeDetailView({
+  activeItem,
+  canEdit,
+  isCreating,
+  draft,
+  actionResult,
+  actionMode,
+  busy,
+  saved,
+  onBack,
+  onDraft,
+  onSaveDraft,
+  onDelete,
+  onSave,
+  onAsk,
+  onUseInProfile,
+  onRunItemAction,
+  onAcceptActionResult,
+}: {
+  activeItem?: KnowledgeItem
+  canEdit: boolean
+  isCreating: boolean
+  draft: KnowledgeDraft
+  actionResult: string
+  actionMode: string
+  busy: boolean
+  saved: boolean
+  onBack: () => void
+  onDraft: (draft: KnowledgeDraft) => void
+  onSaveDraft: () => void
+  onDelete: (id: string) => void
+  onSave: (id: string) => void
+  onAsk: (item: KnowledgeItem) => void
+  onUseInProfile: (item: KnowledgeItem) => void
+  onRunItemAction: (action: string) => void
+  onAcceptActionResult: () => void
+}) {
+  const displayTitle = draft.title.trim() || activeItem?.title || '新建资料'
+  const displaySummary = draft.summary.trim() || activeItem?.summary || '暂无摘要'
+  const displayContent = draft.content.trim() || activeItem?.content || activeItem?.summary || ''
+
+  return (
+    <section className="knowledge-detail-view">
+      <header className="knowledge-detail-hero">
+        <button className="text-button" type="button" onClick={onBack}>返回问答</button>
+        <div>
+          <span>{isCreating ? '新建资料' : canEdit ? '个人资料' : '收藏资料'}</span>
+          <h2>{displayTitle}</h2>
+          <p>{displaySummary}</p>
+        </div>
+        <div className="knowledge-detail-actions">
+          {activeItem?.source === 'discover' ? (
+            <button type="button" onClick={() => onSave(activeItem.id)} disabled={saved}>{saved ? '已收藏' : '收藏'}</button>
+          ) : null}
+          {activeItem ? <button type="button" onClick={() => onAsk(activeItem)}>问桃子</button> : null}
+          {activeItem ? <button type="button" onClick={() => onUseInProfile(activeItem)}>沉淀到档案</button> : null}
+        </div>
+      </header>
+
+      <div className="knowledge-detail-body">
+        <section className="knowledge-edit-pane">
+          {canEdit ? (
+            <div className="knowledge-editor spacious">
+              <label>
+                <span>标题</span>
+                <input value={draft.title} onChange={(event) => onDraft({ ...draft, title: event.target.value })} />
+              </label>
+              <label>
+                <span>摘要</span>
+                <textarea rows={3} value={draft.summary} onChange={(event) => onDraft({ ...draft, summary: event.target.value })} />
+              </label>
+              <label>
+                <span>正文</span>
+                <textarea rows={12} value={draft.content} onChange={(event) => onDraft({ ...draft, content: event.target.value })} />
+              </label>
+            </div>
+          ) : (
+            <article className="knowledge-readonly">
+              <p>{displayContent || '这条收藏资料暂时没有正文。'}</p>
+            </article>
+          )}
+        </section>
+
+        <aside className="knowledge-ai-pane">
+          <div className="knowledge-ai-head">
+            <strong>桃子调整</strong>
+            <p>先生成建议，确认后再写入当前资料。</p>
+          </div>
+          <div className="knowledge-ai-actions">
+            {['智能摘要', '优化正文', '提炼面试题', '生成行动项'].map((action) => (
+              <button key={action} type="button" onClick={() => onRunItemAction(action)} disabled={busy || !displayContent.trim()}>
+                {busy && actionMode === action ? '处理中' : action}
+              </button>
+            ))}
+          </div>
+          {actionResult ? (
+            <section className="knowledge-ai-result">
+              <div>
+                <span>{actionMode || '桃子建议'}</span>
+                <button type="button" onClick={onAcceptActionResult}>采纳</button>
+              </div>
+              <p>{actionResult}</p>
+            </section>
+          ) : (
+            <section className="knowledge-ai-empty">
+              <strong>{canEdit ? '可以让桃子先整理，再决定是否采纳。' : '收藏资料不能直接改原文，但可以提炼成档案或面试题。'}</strong>
+            </section>
+          )}
+        </aside>
+      </div>
+
+      <footer className="knowledge-detail-footer">
+        <div>
+          <span>{draft.url || activeItem?.url ? '来源已记录' : '无来源链接'}</span>
+        </div>
+        <div className="knowledge-editor-actions">
+          {activeItem?.source === 'personal' ? <button type="button" className="secondary-danger" onClick={() => onDelete(activeItem.id)}>删除</button> : null}
+          {canEdit ? (
+            <button type="button" onClick={onSaveDraft} disabled={busy || !draft.title.trim() || !draft.content.trim()}>
+              {busy ? '保存中' : isCreating ? '新建资料' : '保存修改'}
+            </button>
+          ) : (
+            <button type="button" onClick={onSaveDraft} disabled={busy || !draft.title.trim() || !draft.content.trim()}>
+              {busy ? '保存中' : '保存为个人资料'}
+            </button>
+          )}
+        </div>
+      </footer>
     </section>
   )
 }
@@ -2322,9 +3536,14 @@ function ChatComposer({
   disabled,
   button,
   buttonKind = 'send',
+  voiceMode = 'single',
+  voiceOnly = false,
+  autoListen = false,
+  listeningText,
   uploadDisabled,
   onChange,
   onSubmit,
+  onVoiceSubmit,
   onAction,
   onUpload,
 }: {
@@ -2334,20 +3553,134 @@ function ChatComposer({
   disabled: boolean
   button: string
   buttonKind?: 'send' | 'voice'
+  voiceMode?: 'single' | 'stream'
+  voiceOnly?: boolean
+  autoListen?: boolean
+  listeningText?: string
   uploadDisabled?: boolean
   onChange: (value: string) => void
   onSubmit: () => void
+  onVoiceSubmit?: (value: string) => void
   onAction: (action: string) => void
   onUpload?: (file: File) => void
 }) {
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null)
+  const [listening, setListening] = useState(false)
+
+  useEffect(() => () => {
+    recognitionRef.current?.stop()
+  }, [])
+
+  const startVoiceInput = useCallback(() => {
+    if (disabled) return
+    if (recognitionRef.current || listening) return
+
+    const recognitionConstructor = (window as SpeechRecognitionWindow).SpeechRecognition ?? (window as SpeechRecognitionWindow).webkitSpeechRecognition
+    if (!recognitionConstructor) {
+      window.alert('当前浏览器暂不支持语音输入，可以直接打字。')
+      return
+    }
+
+    const baseValue = value.trim()
+    const recognition = new recognitionConstructor()
+    recognition.lang = 'zh-CN'
+    recognition.interimResults = true
+    recognition.continuous = voiceMode === 'stream'
+    let submittedFinalText = ''
+    recognition.onresult = (event) => {
+      const chunks = Array.from(event.results)
+      const transcript = chunks.map((result) => result[0]?.transcript || '').join('').trim()
+      const finalText = chunks
+        .filter((result) => result.isFinal)
+        .map((result) => result[0]?.transcript || '')
+        .join('')
+        .trim()
+      if (voiceMode === 'stream' && finalText && onVoiceSubmit) {
+        const nextFinal = finalText.startsWith(submittedFinalText)
+          ? finalText.slice(submittedFinalText.length).trim()
+          : finalText
+        submittedFinalText = finalText
+        if (!nextFinal) return
+        onChange('')
+        onVoiceSubmit(nextFinal)
+        recognition.stop()
+        setListening(false)
+        return
+      }
+      if (transcript) onChange([baseValue, transcript].filter(Boolean).join(' '))
+    }
+    recognition.onerror = () => {
+      recognitionRef.current = null
+      setListening(false)
+    }
+    recognition.onend = () => {
+      recognitionRef.current = null
+      setListening(false)
+    }
+    recognitionRef.current = recognition
+    setListening(true)
+    try {
+      recognition.start()
+    } catch {
+      recognitionRef.current = null
+      setListening(false)
+    }
+  }, [disabled, listening, onChange, onVoiceSubmit, value, voiceMode])
+
+  const stopVoiceInput = useCallback(() => {
+    recognitionRef.current?.stop()
+    recognitionRef.current = null
+    setListening(false)
+  }, [])
+
+  useEffect(() => {
+    if (!autoListen || disabled) {
+      if (listening) stopVoiceInput()
+      return
+    }
+    if (!listening && !value.trim()) startVoiceInput()
+  }, [autoListen, disabled, listening, startVoiceInput, stopVoiceInput, value])
+
+  function toggleVoiceInput() {
+    if (disabled && !listening) return
+    if (listening) {
+      stopVoiceInput()
+      return
+    }
+    startVoiceInput()
+  }
+
+  function handlePrimaryClick() {
+    if (buttonKind === 'voice' && !value.trim()) {
+      toggleVoiceInput()
+      return
+    }
+    onSubmit()
+  }
+
+  function handleForceSubmit() {
+    const content = value.trim()
+    if (!content || disabled) return
+    stopVoiceInput()
+    onSubmit()
+  }
+
+  const primaryDisabled = disabled || (buttonKind !== 'voice' && !value.trim())
+  const primaryClass = [
+    buttonKind === 'voice' ? 'voice-send-button' : '',
+    listening ? 'listening' : '',
+  ].filter(Boolean).join(' ')
+
   return (
-    <section className="bottom-composer">
+    <section className={voiceOnly ? 'bottom-composer immersive-composer' : 'bottom-composer'}>
       <div className="composer-input-row">
         <textarea
           rows={1}
           value={value}
+          readOnly={voiceOnly}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
+            if (voiceOnly) return
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
               onSubmit()
@@ -2358,7 +3691,8 @@ function ChatComposer({
       </div>
       <div className="composer-tool-row">
         <div className="composer-left-tools">
-          {onUpload ? (
+          {voiceOnly ? <span className={listening ? 'immersive-listening active' : 'immersive-listening'}>{listening ? (listeningText || '麦克风已开') : '麦克风已关'}</span> : null}
+          {!voiceOnly && onUpload ? (
             <label className={uploadDisabled ? 'composer-upload-button disabled' : 'composer-upload-button'} title="上传文件" aria-label="上传文件">
               <input
                 type="file"
@@ -2373,7 +3707,7 @@ function ChatComposer({
               <span aria-hidden="true">+</span>
             </label>
           ) : null}
-          {actions.length ? (
+          {!voiceOnly && actions.length ? (
             <div className="composer-action-row">
               {actions.map((action) => (
                 <button key={action} type="button" onClick={() => onAction(action)}>{action}</button>
@@ -2382,7 +3716,29 @@ function ChatComposer({
           ) : null}
         </div>
         <div className="composer-send-group">
-          <button className={buttonKind === 'voice' ? 'voice-send-button' : ''} type="button" onClick={onSubmit} disabled={disabled || !value.trim()} aria-label={button}>
+          {voiceOnly && actions.includes('结束面试') ? (
+            <button
+              className="immersive-end-button"
+              type="button"
+              onClick={() => {
+                stopVoiceInput()
+                onAction('结束面试')
+              }}
+            >
+              结束面试
+            </button>
+          ) : null}
+          {voiceOnly ? (
+            <button
+              className="immersive-force-send"
+              type="button"
+              onClick={handleForceSubmit}
+              disabled={disabled || !value.trim()}
+            >
+              发送转写
+            </button>
+          ) : null}
+          <button className={primaryClass} type="button" onClick={handlePrimaryClick} disabled={primaryDisabled} aria-label={listening ? '停止语音输入' : button}>
             {buttonKind === 'voice' ? <span className="mic-icon" aria-hidden="true" /> : button}
           </button>
         </div>
@@ -2406,6 +3762,7 @@ function Message({
 }) {
   return (
     <div className={`message-row ${role}`}>
+      {role === 'peach' ? <img className="message-avatar-image" src={PEACH_ICON} alt="桃子" /> : null}
       <div className="message-stack">
         <div className="message-bubble">{cleanAssistantText(children)}</div>
         {actions?.length ? (
@@ -2436,6 +3793,7 @@ function ToolApprovalCard({
 }) {
   const status = action.status ?? 'pending'
   const done = status === 'approved' || status === 'dismissed'
+  const [detailOpen, setDetailOpen] = useState(false)
   const statusLabel: Record<AgentActionStatus, string> = {
     pending: '待确认',
     executing: '执行中',
@@ -2452,14 +3810,35 @@ function ToolApprovalCard({
       </div>
       <div className="tool-approval-actions">
         <small>{statusLabel[status]}</small>
+        {status === 'approved' && action.result ? (
+          <button type="button" onClick={() => setDetailOpen(true)}>改动</button>
+        ) : null}
         {!done ? <button type="button" onClick={onDismiss} disabled={status === 'executing'}>取消</button> : null}
         {!done ? <button type="button" className="primary" onClick={onApprove} disabled={status === 'executing'}>{status === 'executing' ? '执行中' : '确认'}</button> : null}
       </div>
+      {detailOpen && action.result ? (
+        <div className="tool-change-overlay" role="presentation" onClick={() => setDetailOpen(false)}>
+          <section className="tool-change-dialog" role="dialog" aria-modal="true" aria-label="改动内容" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <span>改动内容</span>
+              <button type="button" onClick={() => setDetailOpen(false)} aria-label="关闭改动内容">×</button>
+            </header>
+            <strong>{action.result.title}</strong>
+            <p>{action.result.summary}</p>
+            {action.result.items.length ? (
+              <ul>
+                {action.result.items.map((item) => <li key={item}>{item}</li>)}
+              </ul>
+            ) : null}
+            {action.result.content ? <pre>{action.result.content}</pre> : null}
+          </section>
+        </div>
+      ) : null}
     </section>
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="field">
       <span>{label}</span>
@@ -2523,6 +3902,153 @@ function normalizeAgentActions(actions?: AgentToolProposal[]) {
     }))
 }
 
+function buildToolActionDetail(
+  action: AgentToolProposal,
+  data: {
+    message?: string
+    profile?: Profile
+    interview?: { id?: string; interview_type: string; interviewer_style: string; company: string; role: string; status: string; report?: InterviewReport }
+    opening?: { opening?: string; question?: string }
+    report?: InterviewReport
+    knowledge?: KnowledgeItem
+    deleted_knowledge_id?: string
+  },
+  beforeProfile: Profile,
+  beforeKnowledgeItems: KnowledgeItem[],
+): ToolActionDetail {
+  const contentFromPayload = String(action.payload.content ?? '').trim()
+  const generic: ToolActionDetail = {
+    title: data.message || action.title || '动作已完成',
+    summary: action.summary || '桃子已经执行了这个动作。',
+    items: [],
+  }
+
+  if (action.tool === 'start_interview') {
+    return {
+      title: '已创建模拟面试',
+      summary: '桃子已经进入面试模式，并生成了开场和第一题。',
+      items: [
+        `类型：${data.interview?.interview_type || action.payload.interview_type || '模拟面试'}`,
+        `岗位：${data.interview?.role || action.payload.role || beforeProfile.target_role || '未填写'}`,
+        `公司：${data.interview?.company || action.payload.company || beforeProfile.target_company || '未填写'}`,
+        `面试官风格：${data.interview?.interviewer_style || action.payload.interviewer_style || '温和型'}`,
+      ],
+      content: [data.opening?.opening, data.opening?.question].filter(Boolean).join('\n\n'),
+    }
+  }
+
+  if (action.tool === 'finish_latest_interview') {
+    return {
+      title: '已结束面试',
+      summary: '当前面试已收尾，并生成了复盘报告。',
+      items: [
+        `面试 ID：${data.interview?.id || action.payload.interview_id || '最近一场面试'}`,
+        data.report?.overall_score ? `综合分：${data.report.overall_score}` : '综合分：暂无',
+      ],
+      content: data.report?.summary || data.interview?.report?.summary || '',
+    }
+  }
+
+  if (action.tool === 'update_profile_fields') {
+    const fields = readPayloadFields(action.payload)
+    const labels: Record<string, string> = {
+      name: '姓名',
+      target_role: '目标岗位',
+      target_company: '目标公司',
+      target_city: '目标城市',
+      stage: '求职阶段',
+      communication_style: '沟通风格',
+    }
+    return {
+      title: '已修改个人档案',
+      summary: '以下基础字段已写入当前账号的个人档案。',
+      items: Object.entries(fields)
+        .filter(([key]) => key in labels)
+        .map(([key, value]) => `${labels[key]}：${displayValue(beforeProfile[key as keyof Profile])} → ${displayValue(value)}`),
+    }
+  }
+
+  if (action.tool === 'update_resume') {
+    const mode = String(action.payload.mode || 'append')
+    return {
+      title: mode === 'replace' ? '已替换完整简历' : '已追加到完整简历',
+      summary: mode === 'replace' ? '完整简历内容已被新版本替换。' : '新内容已追加到完整简历末尾。',
+      items: [
+        `写入方式：${mode === 'replace' ? '替换原文' : '追加内容'}`,
+        `写入字数：${contentFromPayload.length}`,
+      ],
+      content: excerpt(contentFromPayload, 1200),
+    }
+  }
+
+  if (action.tool === 'append_profile_note') {
+    const title = String(action.payload.title || profileSectionMeta[toProfileSectionId(action.payload.section)].title || '个人档案')
+    return {
+      title: `已新增${title}`,
+      summary: '这段内容已写入个人档案，并会参与后续简历、面试和问答。',
+      items: [`新增位置：${title}`, `新增字数：${contentFromPayload.length}`],
+      content: excerpt(contentFromPayload, 1200),
+    }
+  }
+
+  if (action.tool === 'add_knowledge_item') {
+    const item = data.knowledge
+    return {
+      title: '已新增知识库资料',
+      summary: '资料已加入个人知识库的默认文件夹。',
+      items: [
+        `标题：${item?.title || action.payload.title || '求职资料'}`,
+        `摘要：${item?.summary || action.payload.summary || '暂无摘要'}`,
+      ],
+      content: excerpt(item?.content || contentFromPayload, 1200),
+    }
+  }
+
+  if (action.tool === 'update_knowledge_item') {
+    const beforeItem = beforeKnowledgeItems.find((item) => item.id === String(action.payload.id))
+    const afterItem = data.knowledge
+    const changedKeys = ['title', 'summary', 'content', 'url'].filter((key) => key in action.payload)
+    const labels: Record<string, string> = { title: '标题', summary: '摘要', content: '正文', url: '来源链接' }
+    return {
+      title: '已修改知识库资料',
+      summary: `资料「${afterItem?.title || beforeItem?.title || '未命名资料'}」已更新。`,
+      items: changedKeys.map((key) => `${labels[key]}：${displayValue(beforeItem?.[key as keyof KnowledgeItem])} → ${displayValue(action.payload[key])}`),
+      content: 'content' in action.payload ? excerpt(String(action.payload.content || ''), 1200) : '',
+    }
+  }
+
+  if (action.tool === 'delete_knowledge_item') {
+    const deletedId = String(data.deleted_knowledge_id || action.payload.id || '')
+    const deletedItem = beforeKnowledgeItems.find((item) => item.id === deletedId)
+    return {
+      title: '已删除知识库资料',
+      summary: '这条资料已从个人知识库移除。',
+      items: [
+        `标题：${deletedItem?.title || '未找到标题'}`,
+        `资料 ID：${deletedId || '未提供'}`,
+      ],
+      content: excerpt(deletedItem?.summary || deletedItem?.content || '', 800),
+    }
+  }
+
+  return generic
+}
+
+function readPayloadFields(payload: Record<string, unknown>) {
+  const fields = payload.fields
+  return fields && typeof fields === 'object' && !Array.isArray(fields) ? fields as Record<string, unknown> : payload
+}
+
+function displayValue(value: unknown) {
+  const text = String(value ?? '').trim()
+  return text ? excerpt(text, 80) : '空'
+}
+
+function excerpt(value: string, maxLength: number) {
+  const text = cleanAssistantText(value || '').trim()
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text
+}
+
 function syncProfileSectionsFromAction(
   current: Record<ProfileSectionId, string>,
   action: AgentToolProposal,
@@ -2581,36 +4107,50 @@ function toKnowledgeDraft(item: KnowledgeItem): KnowledgeDraft {
   }
 }
 
+function uniqueKnowledgeItems(items: KnowledgeItem[]) {
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false
+    seen.add(item.id)
+    return true
+  })
+}
+
+function groupKnowledgeFolders(folders: KnowledgeFolder[]): Record<Exclude<KnowledgeTab, 'discover'>, KnowledgeFolder[]> {
+  const grouped: Record<Exclude<KnowledgeTab, 'discover'>, KnowledgeFolder[]> = {
+    personal: [],
+    saved: [],
+  }
+  folders.forEach((folder) => {
+    const scope = folder.scope === 'saved' ? 'saved' : 'personal'
+    grouped[scope].push({ ...folder, scope })
+  })
+  if (!grouped.personal.length) grouped.personal.push({ id: 'personal-default', name: '默认文件夹', scope: 'personal', item_ids: [] })
+  if (!grouped.saved.length) grouped.saved.push({ id: 'saved-default', name: '默认收藏', scope: 'saved', item_ids: [] })
+  return grouped
+}
+
 function sortFolders(folders: KnowledgeFolder[], mode: SortMode) {
-  return [...folders].sort((a, b) => (mode === 'name' ? a.name.localeCompare(b.name, 'zh-CN') : b.id.localeCompare(a.id)))
+  return [...folders].sort((a, b) => (mode === 'name' ? a.name.localeCompare(b.name, 'zh-CN') : compareUpdatedAt(b, a)))
 }
 
 function sortKnowledgeItems(items: KnowledgeItem[], mode: SortMode) {
   return [...items].sort((a, b) => (mode === 'name' ? a.title.localeCompare(b.title, 'zh-CN') : b.id.localeCompare(a.id)))
 }
 
-function knowledgeTabLabel(tab: KnowledgeTab) {
-  const labels: Record<KnowledgeTab, string> = {
-    personal: '个人知识库',
-    saved: '收藏知识库',
-    discover: '发现知识库',
-  }
-  return labels[tab]
+function compareUpdatedAt(a: KnowledgeFolder, b: KnowledgeFolder) {
+  const left = Date.parse(a.updated_at || a.created_at || '')
+  const right = Date.parse(b.updated_at || b.created_at || '')
+  if (Number.isNaN(left) && Number.isNaN(right)) return a.id.localeCompare(b.id)
+  if (Number.isNaN(left)) return -1
+  if (Number.isNaN(right)) return 1
+  return left - right
 }
 
 function knowledgeMetaLine(item: KnowledgeItem, index: number) {
   const subscribers = ['2.1万人已订阅', '538人已订阅', '1.2万人已订阅', '7989人已订阅', '6907人已订阅']
   const contents = ['100万+个内容', '729个内容', '164个内容', '4868个内容', '1077个内容']
   return `${subscribers[index % subscribers.length]} | ${contents[index % contents.length]} | @${item.source === 'discover' ? '桃子精选' : '个人资料'}`
-}
-
-function titleFromUrl(value: string) {
-  try {
-    const url = new URL(value)
-    return url.hostname.replace(/^www\./, '') || '链接资料'
-  } catch {
-    return value.slice(0, 48) || '链接资料'
-  }
 }
 
 function discoverKnowledgeFeed(): KnowledgeItem[] {
@@ -2636,21 +4176,96 @@ function isInterviewFinishIntent(value: string) {
   return ['结束面试', '停止面试', '结束并生成报告', '生成报告', '面试报告'].some((word) => clean.includes(word))
 }
 
-function formatInterviewReportMessage(report?: {
-  summary?: string
-  overall_score?: number
-  key_improvements?: string[]
-  next_plan?: string[]
-}) {
+function formatInterviewReportMessage(report?: InterviewReport) {
   if (!report) return '这场面试已结束。报告生成完成，可以在个人档案和成长记录里继续复盘。'
   const parts = [
-    '这场面试已结束，我先给你一版简短复盘。',
-    report.overall_score ? `综合表现：${report.overall_score} 分。` : '',
+    '这场面试已结束，报告已归档到个人档案的「面试复盘」。',
+    report.overall_score ? `综合评价：${report.overall_score} 分，等级 ${report.level || scoreLevel(report.overall_score)}，超过 ${report.percentile ?? scorePercentile(report.overall_score)}% 同类求职者。` : '',
     report.summary || '',
     report.key_improvements?.length ? `优先改进：${report.key_improvements.slice(0, 3).join('；')}` : '',
     report.next_plan?.length ? `下一步：${report.next_plan.slice(0, 3).join('；')}` : '',
   ].filter(Boolean)
   return parts.join('\n\n')
+}
+
+function normalizeInterviewReport(report: InterviewReport | undefined, interview: Dashboard['recent_interviews'][number], profile: Profile): Required<InterviewReport> {
+  const score = report?.overall_score ?? 78
+  return {
+    position: report?.position || `${interview.company || profile.target_company || '目标公司'} ${interview.role || profile.target_role}`,
+    overall_score: score,
+    level: report?.level || scoreLevel(score),
+    percentile: report?.percentile ?? scorePercentile(score),
+    dimensions: normalizeDimensions(report?.dimensions),
+    summary: report?.summary || '这份报告暂时只有基础信息，可以继续补充转文字或重新生成复盘。',
+    key_improvements: report?.key_improvements?.length ? report.key_improvements : ['每题先给结论，再展开证据。', '补充可量化结果和个人贡献边界。', '压力追问时先澄清事实，再回应质疑。'],
+    next_plan: report?.next_plan?.length ? report.next_plan : ['复练自我介绍', '准备 2 个 STAR 故事', '做一次压力追问'],
+    question_review: report?.question_review?.length ? report.question_review : [{
+      question: '请做一个 1 分钟自我介绍。',
+      assessment_focus: '背景概括、岗位匹配和开场稳定性。',
+      candidate_transcript: interview.transcript.find((item) => item.role === 'candidate')?.content || '暂无候选人回答转文字。',
+      sample_answer: '建议用“我是谁 + 相关经历 + 结果证据 + 为什么匹配岗位”四段式回答。',
+    }],
+  }
+}
+
+function normalizeDimensions(dimensions?: Array<{ name: string; score: number }>) {
+  const defaults = [
+    { name: '语言流畅度', score: 78 },
+    { name: '语言精简度', score: 72 },
+    { name: '自信度', score: 76 },
+    { name: '岗位核心能力', score: 80 },
+  ]
+  const incoming = dimensions?.length ? dimensions : defaults
+  const required = ['语言流畅度', '语言精简度', '自信度', '岗位核心能力']
+  return required.map((name, index) => incoming.find((item) => item.name === name) ?? incoming[index] ?? defaults[index])
+}
+
+function scoreLevel(score: number) {
+  if (score >= 90) return 'A'
+  if (score >= 82) return 'A-'
+  if (score >= 75) return 'B+'
+  if (score >= 65) return 'B'
+  return 'C'
+}
+
+function scorePercentile(score: number) {
+  return Math.max(35, Math.min(95, Math.round(score * 0.86)))
+}
+
+function formatInterviewReportTitle(interview: Dashboard['recent_interviews'][number], profile: Profile) {
+  const date = interview.created_at ? new Date(interview.created_at).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }).replace('/', '') : '今日'
+  return `${date}${interview.company || profile.target_company || '目标公司'}${interview.role || profile.target_role}`
+}
+
+function buildInterviewHistorySummary(interviews: Dashboard['recent_interviews'], profile: Profile) {
+  const completed = interviews.filter((item) => item.status === 'completed' || item.report?.summary)
+  if (!completed.length) return `还没有面试报告。完成一次${profile.target_role}模拟面试后，报告会自动归档到这里。`
+  const avg = Math.round(completed.reduce((sum, item) => sum + (item.report?.overall_score || 0), 0) / completed.length)
+  const latest = completed[0]
+  return `已归档 ${completed.length} 份面试报告，平均得分 ${avg || '暂无'}。最近一次是 ${formatInterviewReportTitle(latest, profile)}：${latest.report?.summary || '暂无摘要'}`
+}
+
+function downloadInterviewReport(interview: Dashboard['recent_interviews'][number], profile: Profile) {
+  const report = normalizeInterviewReport(interview.report, interview, profile)
+  const html = `
+    <html><head><title>${report.position} 面试复盘报告</title><style>
+      body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;padding:32px;color:#292126;line-height:1.7}
+      h1{font-size:28px}.score{display:flex;gap:16px;margin:18px 0}.score div{border:1px solid #f0dfd8;border-radius:14px;padding:12px 18px}
+      li{margin:6px 0}.dim{margin:8px 0}.bar{height:10px;background:#ffe2ee;border-radius:999px}.bar i{display:block;height:10px;background:#df4f83;border-radius:999px}
+      section{break-inside:avoid;margin-top:22px}
+    </style></head><body>
+      <h1>${report.position} 面试复盘报告</h1>
+      <div class="score"><div>得分 ${report.overall_score}</div><div>等级 ${report.level}</div><div>超过 ${report.percentile}% 同类求职者</div></div>
+      <p>${report.summary}</p>
+      <section><h2>多维评价</h2>${report.dimensions.map((item) => `<div class="dim">${item.name} ${item.score}<div class="bar"><i style="width:${item.score}%"></i></div></div>`).join('')}</section>
+      <section><h2>评价建议</h2><ul>${report.key_improvements.map((item) => `<li>${item}</li>`).join('')}</ul></section>
+      <section><h2>问题回顾</h2>${report.question_review.map((item) => `<h3>${item.question}</h3><p><b>考察点：</b>${item.assessment_focus}</p><p><b>回答转文字：</b>${item.candidate_transcript}</p><p><b>示例回答：</b>${item.sample_answer}</p>`).join('')}</section>
+      <script>window.print()</script>
+    </body></html>`
+  const printWindow = window.open('', '_blank', 'width=860,height=960')
+  if (!printWindow) return
+  printWindow.document.write(html)
+  printWindow.document.close()
 }
 
 async function responseErrorMessage(response: Response) {
@@ -2689,9 +4304,32 @@ function buildRecommendations(profile: Profile, dashboard: Dashboard | null) {
 function parseRecommendationReply(value: string) {
   return cleanAssistantText(value)
     .split('\n')
-    .map((line) => line.replace(/^\s*(\d+[.)、]|•)\s*/, '').trim())
+    .map((line) => line.replace(/^\s*(\d+[.)、]|•|-)\s*/, '').trim())
+    .map(cleanRecommendationText)
     .filter(Boolean)
     .slice(0, 4)
+}
+
+function cleanRecommendationText(value: string) {
+  const cleaned = value
+    .replace(/^["“”'「」]+|["“”'「」]+$/g, '')
+    .replace(/^我在[。,.，\s]*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return ''
+  if (cleaned.length > 28) return ''
+  if (/[。！？!?]/.test(cleaned.slice(0, -1))) return ''
+  return cleaned
+}
+
+function safeRecommendations(source: string[], fallback: string[]) {
+  const cleaned = uniqueStrings(source.map(cleanRecommendationText).filter(Boolean))
+  if (cleaned.length >= 3) return cleaned.slice(0, 4)
+  return uniqueStrings([...cleaned, ...fallback.map(cleanRecommendationText).filter(Boolean)]).slice(0, 4)
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
 }
 
 function buildInitialProfileSections(profile: Profile, dashboard: Dashboard | null): Record<ProfileSectionId, string> {
@@ -2762,25 +4400,32 @@ function buildKnowledgeItems(profile: Profile): KnowledgeItem[] {
       summary: '从个人档案中沉淀出的简历表达、项目证据和面试追问材料。',
       source: 'personal',
     },
-    {
-      id: 'pm-method',
-      title: '产品经理方法论题库',
-      summary: '覆盖用户洞察、需求判断、优先级、指标拆解和复盘表达。',
-      source: 'discover',
-    },
-    {
-      id: 'aigc-strategy',
-      title: 'AIGC 策略产品面试资料',
-      summary: '整理大模型产品、内容生态、商业化和评估指标相关问题。',
-      source: 'discover',
-    },
-    {
-      id: 'delivery-plan',
-      title: '秋招投递节奏清单',
-      summary: '按时间、岗位和公司梯队拆解投递节奏。',
-      source: 'discover',
-    },
   ]
+}
+
+function deliveryJobPool() {
+  return [
+    { company: '字节跳动', role: 'AI 产品经理实习生', city: '北京/上海', track: 'AIGC', priority: '高', note: '适合有 AI 产品、内容生态或策略项目经历的候选人。' },
+    { company: '快手', role: 'AI 产品策略实习生', city: '北京', track: '内容与增长', priority: '高', note: '适合有短视频、推荐、AIGC 工具或用户增长经历的候选人。' },
+    { company: '腾讯', role: '大模型应用产品实习生', city: '深圳/北京', track: '大模型应用', priority: '中高', note: '适合有工具型产品、ToB/ToC AI 应用设计经历的候选人。' },
+    { company: '阿里', role: '智能助手产品实习生', city: '杭州', track: 'AI Agent', priority: '中高', note: '适合有 Agent、效率工具、平台型产品经验的候选人。' },
+    { company: '美团', role: '策略产品实习生', city: '北京', track: '本地生活', priority: '中', note: '适合有数据分析、策略运营、供需匹配项目经历的候选人。' },
+  ]
+}
+
+function sortResumeFiles(files: ParsedUpload[], mode: 'time' | 'role') {
+  const values = [...files]
+  if (mode === 'role') return values.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'))
+  return values
+}
+
+function extractExperienceNames(content: string) {
+  return content
+    .split('\n')
+    .map((line) => line.replace(/^#+\s*/, '').replace(/^【|】$/g, '').trim())
+    .filter((line) => line && line.length <= 36)
+    .filter((line) => /(实习|项目|产品|平台|系统|增长|策略|运营|分析|大模型|AI|AIGC)/i.test(line))
+    .slice(0, 8)
 }
 
 function personalGreeting(profile: Profile) {
@@ -2812,6 +4457,29 @@ function workspaceTitle(module: PrimaryModule, panel: PeachPanel) {
   return '你好，我是桃子'
 }
 
+function ttsRateValue(mode: TtsRateMode) {
+  if (mode === 'slow') return 0.92
+  if (mode === 'fast') return 1.32
+  return 1.12
+}
+
+function ttsRateIndex(mode: TtsRateMode) {
+  if (mode === 'slow') return 0
+  if (mode === 'fast') return 2
+  return 1
+}
+
+function ttsRateFromIndex(index: number): TtsRateMode {
+  if (index <= 0) return 'slow'
+  if (index >= 2) return 'fast'
+  return 'medium'
+}
+
+function ttsRateLabel(mode: TtsRateMode) {
+  if (mode === 'slow') return '慢'
+  if (mode === 'fast') return '快'
+  return '中'
+}
 
 function formatTime(value: number) {
   const minutes = Math.floor(value / 60).toString().padStart(2, '0')

@@ -175,7 +175,7 @@ JSON 字段：message(str), task({{title, question, duration, focus}})
 """
         return await self.json_complete([{"role": "user", "content": prompt}], fallback)
 
-    async def evaluate_practice(self, profile: UserProfile, question: str, answer: str) -> dict[str, Any]:
+    async def evaluate_practice(self, profile: UserProfile, question: str, answer: str, memory_context: str = "") -> dict[str, Any]:
         fallback = {
             "score": 78,
             "summary": "整体方向是对的，信息也够真诚。下一步要把表达压得更有结构。",
@@ -188,6 +188,7 @@ JSON 字段：message(str), task({{title, question, duration, focus}})
 请以桃子的语气评估一次面试练习。先肯定，再给建议。
 用户目标岗位：{profile.target_role}
 薄弱点：{profile.weak_points or []}
+长期记忆：{memory_context[:1200] or "暂无可用长期记忆。"}
 题目：{question}
 用户回答：{answer}
 
@@ -203,13 +204,14 @@ JSON 字段：score(int 0-100), summary(str), highlights(list[str]), improvement
     ) -> dict[str, Any]:
         resume_text = profile.resume_text or ""
         context = context or {}
+        role = session.role or profile.target_role or "目标岗位"
         fallback = {
-            "opening": f"好，我们开始一场{session.interviewer_style}的{session.interview_type}模拟。先别急，按真实面试来就行。",
-            "question": f"请先做一个 1 分钟自我介绍，并重点讲讲你和{session.role or profile.target_role}最匹配的一段经历。",
+            "opening": f"你好，我们开始。流程是自我介绍、经历深挖、岗位理解和收尾反问。",
+            "question": first_interview_question(role),
             "rubric": ["表达逻辑", "岗位匹配", "经历可信度", "临场稳定性"],
         }
         prompt = f"""
-生成模拟面试开场和第一题。
+你现在是一名真实公司面试官，不是求职教练，不是陪聊助手。生成模拟面试开场和第一题。
 用户目标：{profile.target_role}，目标公司：{session.company or profile.target_company}
 面试类型：{session.interview_type}
 面试官风格：{session.interviewer_style}
@@ -217,65 +219,114 @@ JSON 字段：score(int 0-100), summary(str), highlights(list[str]), improvement
 岗位 JD：{str(context.get("jd") or "")[:2200]}
 题库材料：{str(context.get("question_bank") or "")[:2200]}
 薄弱点：{profile.weak_points or []}
+长期记忆：
+{str(context.get("memory_context") or "暂无可用长期记忆。")[:1200]}
 
 要求：
-1. 开场必须专业、简短，不要羞辱候选人。
-2. 压力型只体现为问题更具体、追问更严格。
-3. 如果简历信息不足，只说“简历信息有限”，不要攻击用户。
+1. 开场必须像真实面试官，专业、简短、克制，不要像 AI 助手或朋友。
+2. opening 最多 45 个汉字，只说明面试流程，不要开始追问具体经历。
+3. question 必须是 1 分钟自我介绍，且只能问自我介绍。
+4. 第一题绝不能问实习细节、项目决策、产品判断或业务问题。
+5. 不要说“别紧张”“先稳住”“冲”“我陪你”“提示”“我们换个轻的方式”。
+6. 压力型只体现为问题更具体、追问更严格。
+7. 如果简历信息不足，只说“简历信息有限”，不要攻击用户。
 
 JSON 字段：opening(str), question(str), rubric(list[str])
 """
-        return await self.json_complete([{"role": "user", "content": prompt}], fallback)
+        data = await self.json_complete([{"role": "user", "content": prompt}], fallback)
+        data["question"] = first_interview_question(role)
+        return normalize_interview_opening(data, fallback)
 
-    async def continue_interview(self, profile: UserProfile, session: InterviewSession, answer: str) -> dict[str, Any]:
+    async def continue_interview(
+        self,
+        profile: UserProfile,
+        session: InterviewSession,
+        answer: str,
+        memory_context: str = "",
+    ) -> dict[str, Any]:
+        answer_count = count_candidate_answers(session.transcript or [])
+        stage = interview_stage(answer_count)
         fallback = {
-            "micro_feedback": "这题你没有跑偏，经历也讲出来了。下一轮我们把追问压力稍微加一点。",
-            "next_question": "如果面试官质疑这个项目结果不是你主导的，你会怎么回应？",
-            "hint": "可以按事实边界、个人贡献、协作价值三个层次回答。",
-            "should_finish": count_candidate_answers(session.transcript or []) >= 10,
+            "micro_feedback": "我先追问一下。",
+            "next_question": stage_fallback_question(stage, session.role or profile.target_role or "目标岗位"),
+            "hint": "",
+            "should_finish": answer_count >= 10,
         }
         prompt = f"""
-继续一场模拟面试。根据用户刚才回答，给一句短反馈，再追问下一题。
+你现在是一名真实公司面试官，不是求职教练，不是陪聊助手。继续一场模拟面试，根据候选人刚才回答追问下一题。
 用户目标：{profile.target_role}
 面试风格：{session.interviewer_style}
+长期记忆：{memory_context[:1200] or "暂无可用长期记忆。"}
 历史对话：{(session.transcript or [])[-6:]}
 用户最新回答：{answer}
-候选人已回答轮数：{count_candidate_answers(session.transcript or [])}
+候选人已回答轮数：{answer_count}
+标准流程：第 1 轮自我介绍；第 2-4 轮经历深挖；第 5-6 轮岗位理解和业务判断；第 7-8 轮证据质量和压力追问；第 9 轮以后收尾、反问和补充。
+当前阶段：{stage["name"]}
+当前阶段追问目标：{stage["goal"]}
 
 要求：
 1. 你已经在面试中，不能说“是否要开始”或“准备好了再开始”。
-2. 把用户最新内容当作候选人回答，必须继续反馈和追问。
-3. 压力型也要专业，不要羞辱、嘲讽或人身攻击。
-4. should_finish 只有在候选人至少回答 10 轮，且已经覆盖自我介绍、经历深挖、岗位理解、证据质量、压力追问和收尾准备后才可以为 true。
-5. 如果还没覆盖完整 checklist，继续追问最薄弱的一项，不要急着结束。
+2. 把用户最新内容当作候选人回答，必须继续追问，不要重新开场。
+3. 第 1 轮回答之后，必须围绕候选人的自我介绍追问经历，不要跳到独立业务题。
+4. micro_feedback 最多 18 个汉字，可以为空；不要夸张鼓励，不要教学。
+5. next_question 只问 1 个问题，最多 45 个汉字；必须符合当前阶段追问目标。
+6. hint 默认输出空字符串。除非候选人连续两轮完全答非所问，才给不超过 18 个汉字的提示。
+7. 不要说“没关系”“不急”“我给你提示”“你可以按”“试着描述”“不需要结论”“像真实面试官一样”。
+8. 不要给示例答案，不要拆步骤，不要一次问多个问题，不要输出长段解释。
+9. 压力型也要专业，不要羞辱、嘲讽或人身攻击。
+10. should_finish 只有在候选人至少回答 10 轮，且已经覆盖自我介绍、经历深挖、岗位理解、证据质量、压力追问和收尾准备后才可以为 true。
+11. 如果还没覆盖完整 checklist，继续追问最薄弱的一项，不要急着结束。
 
 JSON 字段：micro_feedback(str), next_question(str), hint(str), should_finish(bool)
 """
-        return await self.json_complete([{"role": "user", "content": prompt}], fallback)
+        data = await self.json_complete([{"role": "user", "content": prompt}], fallback)
+        return normalize_interview_turn(data, fallback)
 
-    async def interview_report(self, profile: UserProfile, session: InterviewSession) -> dict[str, Any]:
+    async def interview_report(self, profile: UserProfile, session: InterviewSession, memory_context: str = "") -> dict[str, Any]:
         fallback = {
+            "position": f"{session.company or profile.target_company or '目标公司'} {session.role or profile.target_role}",
             "overall_score": 80,
+            "level": "B+",
+            "percentile": 68,
             "dimensions": [
-                {"name": "表达逻辑", "score": 82},
-                {"name": "专业深度", "score": 76},
-                {"name": "应变能力", "score": 78},
-                {"name": "岗位匹配", "score": 84},
+                {"name": "语言流畅度", "score": 82},
+                {"name": "语言精简度", "score": 74},
+                {"name": "自信度", "score": 78},
+                {"name": "岗位核心能力", "score": 84},
             ],
             "summary": "整体表现稳定，回答有真实经历支撑。继续强化结构化表达和追问应对，会更像真实候选人。",
             "key_improvements": ["每题先给结论", "把项目结果数字化", "压力追问时先稳住事实边界"],
             "next_plan": ["复练自我介绍", "准备 2 个 STAR 故事", "做一次压力型追问练习"],
+            "question_review": [
+                {
+                    "question": "请做一个 1 分钟自我介绍。",
+                    "assessment_focus": "候选人的背景概括、岗位匹配和开场稳定性。",
+                    "candidate_transcript": "候选人已完成回答，建议回看文字稿并补充量化证据。",
+                    "sample_answer": "我会用身份、核心经历、岗位匹配三段式回答，并用一项结果证明能力。",
+                }
+            ],
         }
         prompt = f"""
 为这场模拟面试生成完整报告。
 用户目标：{profile.target_role}
+面试岗位：{session.company or profile.target_company} {session.role or profile.target_role}
+长期记忆：{memory_context[:1200] or "暂无可用长期记忆。"}
 会话：{session.transcript}
 
-JSON 字段：overall_score(int), dimensions(list[{{name,score}}]), summary(str), key_improvements(list[str]), next_plan(list[str])
+JSON 字段：
+position(str，面试岗位),
+overall_score(int 0-100),
+level(str，如 A/B+/B/C),
+percentile(int，超过百分之多少同类求职者),
+dimensions(list[{{name,score}}]，必须包含语言流畅度、语言精简度、自信度、岗位核心能力),
+summary(str，面试综合评价),
+key_improvements(list[str]，可执行建议),
+next_plan(list[str]),
+question_review(list[{{question, assessment_focus, candidate_transcript, sample_answer}}]，挑 1-3 个最该优化的问题)
 """
         return await self.json_complete([{"role": "user", "content": prompt}], fallback)
 
-    async def post_interview_review(self, profile: UserProfile, payload: dict[str, str]) -> dict[str, Any]:
+    async def post_interview_review(self, profile: UserProfile, payload: dict[str, str], memory_context: str = "") -> dict[str, Any]:
         fallback = {
             "comfort": "面完先歇口气，能把这场走下来就已经很不容易了。我们慢慢拆，不急着否定自己。",
             "what_went_well": ["你能记住关键问题，说明临场注意力在线", "愿意复盘，这本身就会让下一场更稳"],
@@ -286,24 +337,29 @@ JSON 字段：overall_score(int), dimensions(list[{{name,score}}]), summary(str)
         prompt = f"""
 用户真实面试后找桃子复盘。请先情绪疏导，再复盘。
 用户目标：{profile.target_role}
+长期记忆：{memory_context[:1200] or "暂无可用长期记忆。"}
 面试信息：{payload}
 
 JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), archive(str), next_actions(list[str])
 """
         return await self.json_complete([{"role": "user", "content": prompt}], fallback)
 
-    async def chat(self, profile: UserProfile, message: str) -> str:
+    async def chat(self, profile: UserProfile, message: str, memory_context: str = "") -> str:
         fallback = f"我在。你刚刚说“{message[:60]}”，我们先把这件事拆小一点：你现在最想解决的是准备题目、复盘表现，还是先缓一缓情绪？"
         prompt = f"""
 用户正在和求职搭子桃子聊天。
 用户：{profile.name}，目标：{profile.target_role}，阶段：{profile.stage}
 优势：{profile.strengths or []}
 薄弱点：{profile.weak_points or []}
+长期记忆：
+{memory_context[:1200] or "暂无可用长期记忆。"}
 用户消息：{message}
+
+如果用户询问投递动态、可投岗位或投递节奏：只能基于桃子已导入的岗位池/用户给出的岗位表信息提出建议；不要建议用户去牛客、实习僧、公司官网或其他竞品网站自行搜索。
 """
         return await self.complete([{"role": "user", "content": prompt}], fallback)
 
-    async def plan_actions(self, profile: UserProfile, message: str, context: dict[str, Any]) -> dict[str, Any]:
+    async def plan_actions(self, profile: UserProfile, message: str, context: dict[str, Any], memory_context: str = "") -> dict[str, Any]:
         fallback = local_action_plan(profile, message, context)
         uploaded_file = context.get("uploaded_file") if isinstance(context, dict) else None
         prompt = f"""
@@ -331,6 +387,8 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 沟通偏好：{profile.communication_style}
 优势：{profile.strengths or []}
 薄弱点：{profile.weak_points or []}
+长期记忆：
+{memory_context[:1200] or "暂无可用长期记忆。"}
 当前完整简历片段：
 {(profile.resume_text or "")[:2600] or "暂无"}
 
@@ -350,6 +408,8 @@ actions: list, 每个动作包含 tool, title, summary, payload, approval_requir
         data = await self.json_complete([{"role": "user", "content": prompt}], fallback)
         if not isinstance(data.get("actions"), list):
             data["actions"] = []
+        if not data["actions"] and isinstance(fallback.get("actions"), list):
+            data["actions"] = fallback["actions"]
         if context.get("current_panel") == "live-interview" or context.get("interview_active"):
             allow_restart = any(word in message for word in ["重新开", "重开", "重新开始", "再开一场", "换一场"])
             user_requested_finish = any(word in message for word in ["结束面试", "停止面试", "生成报告", "面试报告", "结束并生成"])
@@ -365,6 +425,52 @@ actions: list, 每个动作包含 tool, title, summary, payload, approval_requir
                 ]
         data["actions"] = hydrate_uploaded_file_actions(data["actions"], uploaded_file)
         return data
+
+    async def extract_memories(
+        self,
+        profile: UserProfile,
+        source: str,
+        user_message: str,
+        assistant_reply: str,
+        context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        fallback: dict[str, Any] = {"memories": []}
+        prompt = f"""
+你是桃子的长期记忆提取器。请从本轮互动中提取“未来跨会话有用”的少量记忆。
+
+只允许记住这些类型：
+profile_fact: 稳定个人背景事实，如学校、专业、经历方向，但不要保存手机号、邮箱、证件号等隐私。
+preference: 用户明确表达的沟通、反馈、面试风格偏好。
+job_goal: 目标岗位、目标公司、城市、投递阶段、求职方向。
+skill_signal: 真实能力信号、项目优势、可复用经历亮点。
+weakness: 反复出现或用户明确承认的表达/面试/简历薄弱点。
+interview_pattern: 面试中反复出现的回答模式或卡点。
+episodic_summary: 某次重要互动的简短阶段总结。
+
+不要记住：
+一次性情绪宣泄、寒暄、无关闲聊、长篇原文、未经确认的猜测、敏感隐私、密码/密钥/联系方式。
+如果没有值得长期保存的信息，输出空数组。
+最多 3 条，每条 content 8-120 字，必须是可复用的具体事实，不要写“用户说了很多”这种废话。
+
+用户现有档案：
+姓名：{profile.name}
+目标岗位：{profile.target_role}
+目标公司：{profile.target_company}
+阶段：{profile.stage}
+优势：{profile.strengths or []}
+薄弱点：{profile.weak_points or []}
+
+来源：{source}
+上下文：{json.dumps(context, ensure_ascii=False)[:3000]}
+用户消息：{user_message[:5000]}
+桃子回复：{assistant_reply[:3000]}
+
+请输出 JSON：
+memories: list，每项包含 kind, content, tags(list[str]), confidence(int 0-100), reason
+"""
+        data = await self.json_complete([{"role": "user", "content": prompt}], fallback)
+        memories = data.get("memories")
+        return memories if isinstance(memories, list) else []
 
 
 def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -435,6 +541,17 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
                 "title": f"补充{title}",
                 "summary": f"把上传文件整理后加入{title}，之后简历生成和面试会参考它。",
                 "payload": {"section": section, "title": title, "content": material[:12000], "reason": "用户上传材料用于补充档案"},
+                "approval_required": True,
+            }
+        )
+    elif any(word in text for word in ["背成故事", "变成故事", "整理成故事", "打磨成故事", "量化收益", "项目量化", "面试答案"]):
+        section, title = infer_profile_section(text)
+        actions.append(
+            {
+                "tool": "append_profile_note",
+                "title": f"沉淀到{title}",
+                "summary": f"把这条材料整理成可复盘、可追问的{title}内容，确认后写入个人档案。",
+                "payload": {"section": section, "title": title, "content": material[:12000], "reason": "用户要求把素材打磨成面试可用故事"},
                 "approval_required": True,
             }
         )
@@ -576,6 +693,128 @@ def hydrate_uploaded_file_actions(actions: list[Any], uploaded_file: Any) -> lis
         action["payload"] = payload
         hydrated.append(action)
     return hydrated
+
+
+def normalize_interview_opening(data: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    opening = compact_interviewer_text(str(data.get("opening") or fallback["opening"]), max_chars=50, max_sentences=1)
+    question = compact_interviewer_text(str(data.get("question") or fallback["question"]), max_chars=64, max_sentences=1)
+    if is_opening_skipping_flow(opening):
+        opening = fallback["opening"]
+    rubric = data.get("rubric")
+    if not isinstance(rubric, list) or not rubric:
+        rubric = fallback["rubric"]
+    return {
+        "opening": opening,
+        "question": question,
+        "rubric": [str(item)[:18] for item in rubric[:6]],
+    }
+
+
+def normalize_interview_turn(data: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    feedback = compact_interviewer_text(str(data.get("micro_feedback") or ""), max_chars=22, max_sentences=1)
+    question = compact_interviewer_text(str(data.get("next_question") or fallback["next_question"]), max_chars=58, max_sentences=1)
+    hint = compact_interviewer_text(str(data.get("hint") or ""), max_chars=20, max_sentences=1)
+    if is_tutorial_like(feedback):
+        feedback = ""
+    if is_tutorial_like(question):
+        question = fallback["next_question"]
+    if is_tutorial_like(hint):
+        hint = ""
+    return {
+        "micro_feedback": feedback,
+        "next_question": question,
+        "hint": hint,
+        "should_finish": bool(data.get("should_finish")),
+    }
+
+
+def first_interview_question(role: str) -> str:
+    return f"请先做一个 1 分钟自我介绍，重点说明你和{role}最匹配的一段经历。"
+
+
+def interview_stage(answer_count: int) -> dict[str, str]:
+    if answer_count <= 1:
+        return {
+            "name": "自我介绍后的经历定位",
+            "goal": "围绕候选人刚才自我介绍里提到的一段经历，确认其本人角色、项目背景和真实贡献。",
+        }
+    if answer_count <= 4:
+        return {
+            "name": "经历深挖",
+            "goal": "追问具体项目、个人贡献、关键决策、协作冲突和量化结果。",
+        }
+    if answer_count <= 6:
+        return {
+            "name": "岗位理解",
+            "goal": "考察候选人对目标岗位、业务、用户、产品判断和优先级取舍的理解。",
+        }
+    if answer_count <= 8:
+        return {
+            "name": "证据质量和压力追问",
+            "goal": "质疑证据边界、结果归因和候选人个人贡献，要求更具体的事实。",
+        }
+    return {
+        "name": "收尾和反问",
+        "goal": "补齐遗漏信息，询问候选人反问或总结最匹配岗位的理由。",
+    }
+
+
+def stage_fallback_question(stage: dict[str, str], role: str) -> str:
+    name = stage["name"]
+    if name == "自我介绍后的经历定位":
+        return "你刚才提到的经历里，你本人具体负责哪一部分？"
+    if name == "经历深挖":
+        return "这个项目最关键的决策是什么，为什么由你来推动？"
+    if name == "岗位理解":
+        return f"你怎么理解{role}这个岗位最核心的能力要求？"
+    if name == "证据质量和压力追问":
+        return "这个结果有多少可以归因到你的工作，而不是团队或外部因素？"
+    return "最后你有什么想补充，或者有什么问题想问我？"
+
+
+def compact_interviewer_text(value: str, max_chars: int, max_sentences: int) -> str:
+    text = sanitize_agent_text(value)
+    text = text.replace("\n", " ").replace("  ", " ").strip()
+    if not text:
+        return ""
+    sentences: list[str] = []
+    current = ""
+    for char in text:
+        current += char
+        if char in "。？！?！":
+            sentences.append(current.strip())
+            current = ""
+            if len(sentences) >= max_sentences:
+                break
+    if not sentences and current:
+        sentences.append(current.strip())
+    text = "".join(sentences).strip() or text
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip("，,；;、 ") + "。"
+    return text
+
+
+def is_tutorial_like(value: str) -> bool:
+    banned = [
+        "没关系",
+        "不急",
+        "提示",
+        "可以按",
+        "试着",
+        "我给你",
+        "不需要结论",
+        "我们换个",
+        "先稳住",
+        "冲",
+        "别紧张",
+        "像真实面试官",
+    ]
+    return any(item in value for item in banned)
+
+
+def is_opening_skipping_flow(value: str) -> bool:
+    risky = ["先聊", "实习", "项目", "决策", "产品判断", "业务问题", "深挖", "你在"]
+    return any(item in value for item in risky)
 
 
 def sanitize_agent_text(value: str) -> str:

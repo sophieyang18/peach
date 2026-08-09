@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.api.routes import router
+from backend.app.api.routes import current_username, normalize_username, router
 from backend.app.core.config import get_settings
 from backend.app.db import init_db
 
@@ -30,6 +30,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def account_context_middleware(request, call_next):
+    username = request.headers.get("x-peach-user") or request.query_params.get("username")
+    token = current_username.set(normalize_username(username))
+    try:
+        return await call_next(request)
+    finally:
+        current_username.reset(token)
+
 
 app.include_router(router)
 

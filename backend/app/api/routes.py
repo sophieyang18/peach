@@ -1,25 +1,33 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import desc, select
+from contextvars import ContextVar
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db import get_session
-from backend.app.models import InterviewSession, KnowledgeResource, PracticeRecord, UserProfile
+from backend.app.models import AgentMemory, InterviewSession, KnowledgeFolder, KnowledgeResource, PracticeRecord, UserProfile
 from backend.app.schemas import (
+    AccountIn,
     AgentActionIn,
     AgentToolExecuteIn,
     ChatIn,
     InterviewAnswerIn,
     InterviewStartIn,
+    KnowledgeFolderIn,
     KnowledgeIn,
+    KnowledgeLinkIn,
     PracticeIn,
     ProfileIn,
     ReviewIn,
 )
 from backend.app.services.agent import PeachAgent
-from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_upload
+from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
+from backend.app.services.memory import build_memory_context, remember_interaction, retrieve_relevant_memories
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
+current_username: ContextVar[str] = ContextVar("peach_current_username", default="demo")
+USERNAME_MAX_LENGTH = 40
 MIN_INTERVIEW_ANSWERS_FOR_LLM_FINISH = 8
 TARGET_INTERVIEW_ANSWERS = 10
 MAX_INTERVIEW_ANSWERS = 12
@@ -33,13 +41,34 @@ INTERVIEW_CHECKLIST = [
 ]
 
 
-async def get_or_create_profile(session: AsyncSession) -> UserProfile:
-    result = await session.execute(select(UserProfile).order_by(UserProfile.created_at).limit(1))
+def normalize_username(value: str | None, fallback: str = "demo") -> str:
+    username = (value or "").strip()
+    if not username:
+        username = fallback
+    return username[:USERNAME_MAX_LENGTH]
+
+
+def require_username(value: str | None) -> str:
+    username = normalize_username(value, fallback="")
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+    return username
+
+
+async def get_existing_profile(session: AsyncSession, username: str) -> UserProfile | None:
+    result = await session.execute(select(UserProfile).where(UserProfile.username == username).limit(1))
+    return result.scalar_one_or_none()
+
+
+async def get_or_create_profile(session: AsyncSession, username: str | None = None) -> UserProfile:
+    resolved_username = normalize_username(username or current_username.get())
+    result = await session.execute(select(UserProfile).where(UserProfile.username == resolved_username).limit(1))
     profile = result.scalar_one_or_none()
     if profile:
         return profile
 
     profile = UserProfile(
+        username=resolved_username,
         name="同学",
         target_role="产品经理",
         stage="投递期",
@@ -53,6 +82,49 @@ async def get_or_create_profile(session: AsyncSession) -> UserProfile:
     await session.commit()
     await session.refresh(profile)
     return profile
+
+
+@router.post("/accounts/login")
+async def login_account(payload: AccountIn, session: AsyncSession = Depends(get_session)) -> dict:
+    username = require_username(payload.username)
+    profile = await get_existing_profile(session, username)
+    if not profile:
+        raise HTTPException(status_code=404, detail="账号不存在，可以直接创建这个账号")
+    return {"account": serialize_account(profile), "profile": serialize_profile(profile)}
+
+
+@router.post("/accounts")
+async def create_account(payload: AccountIn, session: AsyncSession = Depends(get_session)) -> dict:
+    username = require_username(payload.username)
+    profile = await get_existing_profile(session, username)
+    if not profile:
+        profile = await get_or_create_profile(session, username)
+        await ensure_default_folders(session, profile.id)
+    return {"account": serialize_account(profile), "profile": serialize_profile(profile)}
+
+
+@router.post("/accounts/reset")
+async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    await session.execute(delete(PracticeRecord).where(PracticeRecord.user_id == profile.id))
+    await session.execute(delete(InterviewSession).where(InterviewSession.user_id == profile.id))
+    await session.execute(delete(KnowledgeResource).where(KnowledgeResource.user_id == profile.id))
+    await session.execute(delete(KnowledgeFolder).where(KnowledgeFolder.user_id == profile.id))
+    await session.execute(delete(AgentMemory).where(AgentMemory.user_id == profile.id))
+    profile.name = "同学"
+    profile.target_role = "产品经理"
+    profile.target_company = ""
+    profile.target_city = ""
+    profile.stage = "投递期"
+    profile.resume_text = ""
+    profile.communication_style = "温暖直接"
+    profile.strengths = ["目标岗位聚焦", "愿意持续练习"]
+    profile.weak_points = ["回答结构需要稳定", "简历亮点需要量化"]
+    profile.plan = default_plan()
+    await session.commit()
+    await session.refresh(profile)
+    await ensure_default_folders(session, profile.id)
+    return {"account": serialize_account(profile), "profile": serialize_profile(profile)}
 
 
 @router.get("/health")
@@ -107,14 +179,34 @@ async def dashboard(session: AsyncSession = Depends(get_session)) -> dict:
         "checkin": checkin,
         "recent_practices": [serialize_practice(item) for item in records],
         "recent_interviews": [serialize_interview(item) for item in interviews],
+        "memories": [serialize_memory(item) for item in await list_recent_memories(session, profile.id, 8)],
         "growth": build_growth(profile, list(records), list(interviews)),
     }
+
+
+@router.get("/memories")
+async def list_memories(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    memories = await list_recent_memories(session, profile.id, 80)
+    return {"items": [serialize_memory(item) for item in memories]}
+
+
+@router.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    memory = await session.get(AgentMemory, memory_id)
+    if not memory or memory.user_id != profile.id:
+        raise HTTPException(status_code=404, detail="memory not found")
+    await session.delete(memory)
+    await session.commit()
+    return {"deleted": True, "id": memory_id}
 
 
 @router.post("/practice")
 async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    feedback = await agent.evaluate_practice(profile, payload.question, payload.answer)
+    memory_context = await relevant_memory_context(session, profile, f"{payload.question}\n{payload.answer}")
+    feedback = await agent.evaluate_practice(profile, payload.question, payload.answer, memory_context)
     record = PracticeRecord(
         user_id=profile.id,
         question=payload.question,
@@ -126,6 +218,15 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
     profile.weak_points = merge_points(profile.weak_points, feedback.get("improvements", []))
     profile.strengths = merge_points(profile.strengths, feedback.get("highlights", []))
     session.add(record)
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="practice",
+        user_message=f"题目：{payload.question}\n回答：{payload.answer}",
+        assistant_reply=str(feedback),
+        context={"memory_context_used": memory_context, "tags": payload.tags},
+    )
     await session.commit()
     await session.refresh(record)
     return {"record": serialize_practice(record), "feedback": feedback}
@@ -134,6 +235,7 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
 @router.post("/interviews")
 async def start_interview(payload: InterviewStartIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
+    memory_context = await relevant_memory_context(session, profile, "\n".join([payload.company, payload.role, payload.jd, payload.question_bank]))
     interview = InterviewSession(
         user_id=profile.id,
         interview_type=payload.interview_type,
@@ -144,7 +246,7 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
     opening = await agent.start_interview(
         profile,
         interview,
-        {"jd": payload.jd, "question_bank": payload.question_bank},
+        {"jd": payload.jd, "question_bank": payload.question_bank, "memory_context": memory_context},
     )
     interview.transcript = [
         *(
@@ -161,6 +263,15 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
         {"role": "interviewer", "content": opening["question"]},
     ]
     session.add(interview)
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="interview_start",
+        user_message=f"开始{payload.interview_type}：{payload.company} {payload.role}\nJD：{payload.jd[:1200]}",
+        assistant_reply="\n".join([opening["opening"], opening["question"]]),
+        context={"interviewer_style": payload.interviewer_style, "question_bank": payload.question_bank[:1200]},
+    )
     await session.commit()
     await session.refresh(interview)
     return {"interview": serialize_interview(interview), "opening": opening, "progress": build_interview_progress(interview)}
@@ -177,9 +288,10 @@ async def answer_interview(
     if not interview:
         raise HTTPException(status_code=404, detail="interview not found")
 
+    memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{payload.answer}")
     transcript = [*interview.transcript, {"role": "candidate", "content": payload.answer}]
     interview.transcript = transcript
-    next_turn = await agent.continue_interview(profile, interview, payload.answer)
+    next_turn = await agent.continue_interview(profile, interview, payload.answer, memory_context)
     interview.transcript = [
         *interview.transcript,
         {"role": "interviewer", "content": next_turn["micro_feedback"]},
@@ -194,9 +306,23 @@ async def answer_interview(
 
     if force_finish:
         interview.status = "completed"
-        interview.report = await agent.interview_report(profile, interview)
+        interview.report = await agent.interview_report(profile, interview, memory_context)
         progress = build_interview_progress(interview)
 
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="interview_answer",
+        user_message=payload.answer,
+        assistant_reply="\n".join([str(next_turn.get("micro_feedback") or ""), str(next_turn.get("next_question") or "")]),
+        context={
+            "company": interview.company,
+            "role": interview.role,
+            "interviewer_style": interview.interviewer_style,
+            "progress": progress,
+        },
+    )
     await session.commit()
     await session.refresh(interview)
     return {"interview": serialize_interview(interview), "next": next_turn, "report": interview.report, "progress": progress}
@@ -209,8 +335,18 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
     if not interview:
         raise HTTPException(status_code=404, detail="interview not found")
 
+    memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{interview.transcript[-8:]}")
     interview.status = "completed"
-    interview.report = await agent.interview_report(profile, interview)
+    interview.report = await agent.interview_report(profile, interview, memory_context)
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="interview_report",
+        user_message=f"结束面试：{interview.company} {interview.role}",
+        assistant_reply=str(interview.report),
+        context={"transcript_tail": interview.transcript[-8:]},
+    )
     await session.commit()
     await session.refresh(interview)
     return {"interview": serialize_interview(interview), "report": interview.report, "progress": build_interview_progress(interview)}
@@ -219,7 +355,8 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
 @router.post("/review")
 async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    feedback = await agent.post_interview_review(profile, payload.model_dump())
+    memory_context = await relevant_memory_context(session, profile, str(payload.model_dump()))
+    feedback = await agent.post_interview_review(profile, payload.model_dump(), memory_context)
     record = PracticeRecord(
         user_id=profile.id,
         question=f"{payload.company or profile.target_company} 面试后复盘",
@@ -230,6 +367,15 @@ async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)
     )
     profile.weak_points = merge_points(profile.weak_points, feedback.get("to_improve", []))
     session.add(record)
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="post_interview_review",
+        user_message=str(payload.model_dump()),
+        assistant_reply=str(feedback),
+        context={},
+    )
     await session.commit()
     await session.refresh(record)
     return {"review": feedback, "record": serialize_practice(record)}
@@ -238,14 +384,36 @@ async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)
 @router.post("/chat")
 async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    reply = await agent.chat(profile, payload.message)
+    memory_context = await relevant_memory_context(session, profile, payload.message)
+    reply = await agent.chat(profile, payload.message, memory_context)
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="chat",
+        user_message=payload.message,
+        assistant_reply=reply,
+        context={"memory_context_used": memory_context},
+    )
+    await session.commit()
     return {"reply": reply}
 
 
 @router.post("/agent/actions")
 async def agent_actions(payload: AgentActionIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    planned = await agent.plan_actions(profile, payload.message, payload.context)
+    memory_context = await relevant_memory_context(session, profile, payload.message)
+    planned = await agent.plan_actions(profile, payload.message, payload.context, memory_context)
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source="agent_actions",
+        user_message=payload.message,
+        assistant_reply=str(planned.get("reply", "")),
+        context={**payload.context, "memory_context_used": memory_context},
+    )
+    await session.commit()
     return {
         "reply": planned.get("reply", ""),
         "actions": [normalize_tool_action(action, index) for index, action in enumerate(planned.get("actions", []))],
@@ -295,6 +463,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         profile.plan = init.get("plan", profile.plan or [])
         await session.commit()
         await session.refresh(profile)
+        await remember_approved_action(session, profile, payload.tool, data, "个人信息已更新。")
         return {"message": "个人信息已更新。", "profile": serialize_profile(profile)}
 
     if payload.tool == "update_resume":
@@ -305,6 +474,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         profile.resume_text = content if mode == "replace" else "\n\n".join([item for item in [profile.resume_text, content] if item])
         await session.commit()
         await session.refresh(profile)
+        await remember_approved_action(session, profile, payload.tool, data, "简历已更新。")
         return {"message": "简历已更新。", "profile": serialize_profile(profile)}
 
     if payload.tool == "append_profile_note":
@@ -315,6 +485,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         profile.resume_text = "\n\n".join([item for item in [profile.resume_text, f"【{title}】\n{content}"] if item])
         await session.commit()
         await session.refresh(profile)
+        await remember_approved_action(session, profile, payload.tool, data, f"已补充到{title}。")
         return {"message": f"已补充到{title}。", "profile": serialize_profile(profile)}
 
     if payload.tool == "add_knowledge_item":
@@ -330,6 +501,8 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         session.add(resource)
         await session.commit()
         await session.refresh(resource)
+        await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+        await remember_approved_action(session, profile, payload.tool, data, "已添加到个人知识库。")
         return {"message": "已添加到个人知识库。", "knowledge": serialize_knowledge(resource)}
 
     if payload.tool == "update_knowledge_item":
@@ -345,6 +518,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         resource = await owned_knowledge(session, profile.id, str(data.get("id") or ""))
         item_id = resource.id
         await session.delete(resource)
+        await remove_item_from_folders(session, profile.id, item_id)
         await session.commit()
         return {"message": "知识库资料已删除。", "deleted_knowledge_id": item_id}
 
@@ -364,6 +538,56 @@ async def list_knowledge(session: AsyncSession = Depends(get_session)) -> dict:
     return {"items": [serialize_knowledge(item) for item in resources]}
 
 
+@router.get("/knowledge/discover")
+async def discover_knowledge() -> dict:
+    return {"items": discover_knowledge_items()}
+
+
+@router.get("/knowledge/folders")
+async def list_knowledge_folders(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    folders = await ensure_default_folders(session, profile.id)
+    return {"folders": [serialize_folder(folder) for folder in folders]}
+
+
+@router.post("/knowledge/folders")
+async def create_knowledge_folder(payload: KnowledgeFolderIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    folder = KnowledgeFolder(
+        user_id=profile.id,
+        name=payload.name.strip()[:120] or "新建文件夹",
+        scope=normalize_folder_scope(payload.scope),
+        item_ids=payload.item_ids,
+        sort_order=payload.sort_order,
+    )
+    session.add(folder)
+    await session.commit()
+    await session.refresh(folder)
+    return {"folder": serialize_folder(folder)}
+
+
+@router.put("/knowledge/folders/{folder_id}")
+async def update_knowledge_folder(folder_id: str, payload: KnowledgeFolderIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    folder = await owned_folder(session, profile.id, folder_id)
+    folder.name = payload.name.strip()[:120] or folder.name
+    folder.scope = normalize_folder_scope(payload.scope)
+    folder.item_ids = payload.item_ids
+    folder.sort_order = payload.sort_order
+    await session.commit()
+    await session.refresh(folder)
+    return {"folder": serialize_folder(folder)}
+
+
+@router.delete("/knowledge/folders/{folder_id}")
+async def delete_knowledge_folder(folder_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    folder = await owned_folder(session, profile.id, folder_id)
+    await session.delete(folder)
+    await session.commit()
+    return {"deleted": True, "id": folder_id}
+
+
 @router.post("/knowledge")
 async def create_knowledge(payload: KnowledgeIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
@@ -378,7 +602,36 @@ async def create_knowledge(payload: KnowledgeIn, session: AsyncSession = Depends
     session.add(resource)
     await session.commit()
     await session.refresh(resource)
+    if payload.folder_id:
+        await add_item_to_folder(session, profile.id, payload.folder_id, resource.id)
+    else:
+        await add_item_to_default_folder(session, profile.id, resource.id, "personal")
     return {"item": serialize_knowledge(resource)}
+
+
+@router.post("/knowledge/link")
+async def create_knowledge_from_link(payload: KnowledgeLinkIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    try:
+        parsed = await parse_link(payload.url)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"link parse failed: {exc}") from exc
+    resource = KnowledgeResource(
+        user_id=profile.id,
+        title=parsed.title[:160],
+        summary=parsed.summary,
+        content=parsed.content,
+        source="personal",
+        url=payload.url,
+    )
+    session.add(resource)
+    await session.commit()
+    await session.refresh(resource)
+    if payload.folder_id:
+        await add_item_to_folder(session, profile.id, payload.folder_id, resource.id)
+    else:
+        await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    return {"item": serialize_knowledge(resource), "file": serialize_parsed_file(parsed, payload.url)}
 
 
 @router.put("/knowledge/{item_id}")
@@ -400,6 +653,7 @@ async def delete_knowledge(item_id: str, session: AsyncSession = Depends(get_ses
     profile = await get_or_create_profile(session)
     resource = await owned_knowledge(session, profile.id, item_id)
     await session.delete(resource)
+    await remove_item_from_folders(session, profile.id, item_id)
     await session.commit()
     return {"deleted": True, "id": item_id}
 
@@ -411,7 +665,11 @@ async def parse_file(file: UploadFile = File(...)) -> dict:
 
 
 @router.post("/knowledge/upload")
-async def upload_knowledge(file: UploadFile = File(...), session: AsyncSession = Depends(get_session)) -> dict:
+async def upload_knowledge(
+    file: UploadFile = File(...),
+    folder_id: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
     profile = await get_or_create_profile(session)
     parsed = await parse_uploaded_file(file)
     resource = KnowledgeResource(
@@ -425,12 +683,17 @@ async def upload_knowledge(file: UploadFile = File(...), session: AsyncSession =
     session.add(resource)
     await session.commit()
     await session.refresh(resource)
+    if folder_id:
+        await add_item_to_folder(session, profile.id, folder_id, resource.id)
+    else:
+        await add_item_to_default_folder(session, profile.id, resource.id, "personal")
     return {"item": serialize_knowledge(resource), "file": parsed}
 
 
 def serialize_profile(profile: UserProfile) -> dict:
     return {
         "id": profile.id,
+        "username": profile.username,
         "name": profile.name,
         "target_role": profile.target_role,
         "target_company": profile.target_company,
@@ -441,6 +704,14 @@ def serialize_profile(profile: UserProfile) -> dict:
         "strengths": profile.strengths or [],
         "weak_points": profile.weak_points or [],
         "plan": profile.plan or [],
+    }
+
+
+def serialize_account(profile: UserProfile) -> dict:
+    return {
+        "username": profile.username,
+        "display_name": profile.name,
+        "created_at": profile.created_at.isoformat() if profile.created_at else None,
     }
 
 
@@ -470,6 +741,22 @@ def serialize_interview(interview: InterviewSession) -> dict:
     }
 
 
+def serialize_memory(memory: AgentMemory) -> dict:
+    return {
+        "id": memory.id,
+        "kind": memory.kind,
+        "content": memory.content,
+        "source": memory.source,
+        "confidence": memory.confidence,
+        "tags": memory.tags or [],
+        "metadata": memory.memory_metadata or {},
+        "use_count": memory.use_count or 0,
+        "last_used_at": memory.last_used_at.isoformat() if memory.last_used_at else None,
+        "created_at": memory.created_at.isoformat() if memory.created_at else None,
+        "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
+    }
+
+
 def serialize_knowledge(item: KnowledgeResource) -> dict:
     return {
         "id": item.id,
@@ -480,6 +767,151 @@ def serialize_knowledge(item: KnowledgeResource) -> dict:
         "url": item.url,
         "created_at": item.created_at.isoformat() if item.created_at else None,
     }
+
+
+def serialize_folder(folder: KnowledgeFolder) -> dict:
+    return {
+        "id": folder.id,
+        "name": folder.name,
+        "scope": folder.scope,
+        "item_ids": folder.item_ids or [],
+        "sort_order": folder.sort_order,
+        "created_at": folder.created_at.isoformat() if folder.created_at else None,
+        "updated_at": folder.updated_at.isoformat() if folder.updated_at else None,
+    }
+
+
+def serialize_parsed_file(parsed, url: str = "") -> dict:
+    return {
+        "filename": parsed.filename,
+        "extension": parsed.extension,
+        "title": parsed.title,
+        "summary": parsed.summary,
+        "content": parsed.content,
+        "warning": parsed.warning,
+        "url": url,
+    }
+
+
+def normalize_folder_scope(scope: str) -> str:
+    return "saved" if scope == "saved" else "personal"
+
+
+async def list_recent_memories(session: AsyncSession, user_id: str, limit: int) -> list[AgentMemory]:
+    return list((
+        await session.execute(
+            select(AgentMemory)
+            .where(AgentMemory.user_id == user_id)
+            .order_by(desc(AgentMemory.updated_at))
+            .limit(limit)
+        )
+    ).scalars().all())
+
+
+async def relevant_memory_context(session: AsyncSession, profile: UserProfile, query: str) -> str:
+    memories = await retrieve_relevant_memories(session, profile.id, query)
+    return build_memory_context(memories)
+
+
+async def remember_approved_action(
+    session: AsyncSession,
+    profile: UserProfile,
+    tool: str,
+    payload: dict,
+    message: str,
+) -> None:
+    await remember_interaction(
+        session,
+        agent,
+        profile,
+        source=f"approved_action:{tool}",
+        user_message=str(payload)[:5000],
+        assistant_reply=message,
+        context={"approved_tool": tool},
+    )
+    await session.commit()
+
+
+async def ensure_default_folders(session: AsyncSession, user_id: str) -> list[KnowledgeFolder]:
+    result = await session.execute(
+        select(KnowledgeFolder).where(KnowledgeFolder.user_id == user_id).order_by(KnowledgeFolder.sort_order, KnowledgeFolder.created_at)
+    )
+    folders = list(result.scalars().all())
+    existing_scopes = {folder.scope for folder in folders}
+    changed = False
+    if "personal" not in existing_scopes:
+        folder = KnowledgeFolder(user_id=user_id, name="默认文件夹", scope="personal", item_ids=[], sort_order=0)
+        session.add(folder)
+        folders.append(folder)
+        changed = True
+    if "saved" not in existing_scopes:
+        folder = KnowledgeFolder(user_id=user_id, name="默认收藏", scope="saved", item_ids=[], sort_order=0)
+        session.add(folder)
+        folders.append(folder)
+        changed = True
+    if changed:
+        await session.commit()
+        for folder in folders:
+            await session.refresh(folder)
+
+    resource_result = await session.execute(
+        select(KnowledgeResource.id).where(KnowledgeResource.user_id == user_id, KnowledgeResource.source == "personal")
+    )
+    personal_resource_ids = [row[0] for row in resource_result.all()]
+    if personal_resource_ids:
+        personal_folders = [folder for folder in folders if folder.scope == "personal"]
+        assigned_ids = {item_id for folder in personal_folders for item_id in (folder.item_ids or [])}
+        orphan_ids = [item_id for item_id in personal_resource_ids if item_id not in assigned_ids]
+        default_personal = next((folder for folder in personal_folders if folder.sort_order == 0), personal_folders[0] if personal_folders else None)
+        if default_personal and orphan_ids:
+            default_personal.item_ids = [*orphan_ids, *(default_personal.item_ids or [])]
+            await session.commit()
+            await session.refresh(default_personal)
+    return folders
+
+
+async def owned_folder(session: AsyncSession, user_id: str, folder_id: str) -> KnowledgeFolder:
+    folder = await session.get(KnowledgeFolder, folder_id)
+    if not folder or folder.user_id != user_id:
+        raise HTTPException(status_code=404, detail="knowledge folder not found")
+    return folder
+
+
+async def add_item_to_folder(session: AsyncSession, user_id: str, folder_id: str, item_id: str) -> None:
+    folder = await owned_folder(session, user_id, folder_id)
+    item_ids = list(folder.item_ids or [])
+    if item_id not in item_ids:
+        folder.item_ids = [item_id, *item_ids]
+        await session.commit()
+
+
+async def add_item_to_default_folder(session: AsyncSession, user_id: str, item_id: str, scope: str) -> None:
+    folders = await ensure_default_folders(session, user_id)
+    folder = next((item for item in folders if item.scope == normalize_folder_scope(scope)), folders[0])
+    await add_item_to_folder(session, user_id, folder.id, item_id)
+
+
+async def remove_item_from_folders(session: AsyncSession, user_id: str, item_id: str) -> None:
+    result = await session.execute(select(KnowledgeFolder).where(KnowledgeFolder.user_id == user_id))
+    folders = result.scalars().all()
+    for folder in folders:
+        if item_id in (folder.item_ids or []):
+            folder.item_ids = [value for value in folder.item_ids if value != item_id]
+
+
+def discover_knowledge_items() -> list[dict]:
+    items = [
+        ("pm-method", "产品经理方法论题库", "覆盖用户洞察、需求判断、优先级、指标拆解和复盘表达。", "产品经理方法论题库，适合准备产品思维、项目深挖和 case 面试。"),
+        ("aigc-strategy", "AIGC 策略产品面试资料", "整理大模型产品、内容生态、商业化和评估指标相关问题。", "AIGC 策略产品资料，包含模型能力、用户场景、指标设计和商业化问题。"),
+        ("delivery-plan", "秋招投递节奏清单", "按时间、岗位和公司梯队拆解投递节奏。", "秋招投递节奏清单，覆盖提前批、正式批、补录和复盘安排。"),
+        ("ai-pm-career", "AI 产品经理求职资料库", "覆盖 AI 产品方法论、岗位 JD 拆解、案例题和面试追问。", "AI 产品经理求职资料，包含 JD 拆解、简历表达、面试题和行动计划。"),
+        ("resume-library", "产品简历表达库", "收集项目经历、实习经历、量化表达和 STAR 改写样例。", "产品简历表达库，帮助候选人把经历改写成有证据的简历 bullet。"),
+        ("case-library", "商业分析与策略题库", "沉淀市场规模、增长策略、竞品分析和业务拆解题。", "商业分析和策略题库，适合练习结构化拆解和业务判断。"),
+    ]
+    return [
+        {"id": item_id, "title": title, "summary": summary, "content": content, "source": "discover", "url": ""}
+        for item_id, title, summary, content in items
+    ]
 
 
 def normalize_tool_action(action: dict, index: int) -> dict:
@@ -525,10 +957,10 @@ def build_interview_progress(interview: InterviewSession) -> dict:
     transcript = interview.transcript or []
     answer_count = sum(1 for item in transcript if item.get("role") == "candidate")
     question_count = sum(1 for item in transcript if item.get("role") == "interviewer")
-    transcript_text = "\n".join(str(item.get("content") or "") for item in transcript)
-    checklist = build_interview_checklist(transcript_text, answer_count)
+    candidate_text = "\n".join(str(item.get("content") or "") for item in transcript if item.get("role") == "candidate")
+    checklist = build_interview_checklist(candidate_text, answer_count)
     covered_count = sum(1 for item in checklist if item["done"])
-    completion = min(100, round(covered_count / len(INTERVIEW_CHECKLIST) * 100))
+    completion = 0 if answer_count == 0 else min(100, round(covered_count / len(INTERVIEW_CHECKLIST) * 100))
     return {
         "answer_count": answer_count,
         "question_count": question_count,
@@ -553,7 +985,7 @@ def build_interview_checklist(transcript_text: str, answer_count: int) -> list[d
     }
     checklist = []
     for key, label, description in INTERVIEW_CHECKLIST:
-        matched = any(word in text for word in keyword_groups.get(key, []))
+        matched = answer_count > 0 and any(word in text for word in keyword_groups.get(key, []))
         if key == "self_intro":
             matched = matched or answer_count >= 1
         if key == "experience_deep_dive":

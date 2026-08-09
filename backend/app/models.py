@@ -16,6 +16,7 @@ class UserProfile(Base):
     __tablename__ = "user_profiles"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=uuid_pk)
+    username: Mapped[str] = mapped_column(String(80), default="demo", index=True)
     name: Mapped[str] = mapped_column(String(80), default="同学")
     target_role: Mapped[str] = mapped_column(String(120), default="产品经理")
     target_company: Mapped[str] = mapped_column(String(120), default="")
@@ -33,6 +34,7 @@ class UserProfile(Base):
 
     practices: Mapped[list["PracticeRecord"]] = relationship(back_populates="user")
     interviews: Mapped[list["InterviewSession"]] = relationship(back_populates="user")
+    memories: Mapped[list["AgentMemory"]] = relationship(back_populates="user")
 
 
 class PracticeRecord(Base):
@@ -81,3 +83,39 @@ class KnowledgeResource(Base):
     source: Mapped[str] = mapped_column(String(40), default="personal")
     url: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class KnowledgeFolder(Base):
+    __tablename__ = "knowledge_folders"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"))
+    name: Mapped[str] = mapped_column(String(120))
+    scope: Mapped[str] = mapped_column(String(40), default="personal")
+    item_ids: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AgentMemory(Base):
+    __tablename__ = "agent_memories"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40), default="semantic", index=True)
+    content: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(80), default="chat")
+    confidence: Mapped[int] = mapped_column(Integer, default=70)
+    tags: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    memory_metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    user: Mapped[UserProfile] = relationship(back_populates="memories")

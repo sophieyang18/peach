@@ -1,6 +1,10 @@
 from pydantic import BaseModel, Field
 
 
+class AccountIn(BaseModel):
+    username: str
+
+
 class ProfileIn(BaseModel):
     name: str = "同学"
     target_role: str = "产品经理"
@@ -38,6 +42,19 @@ class KnowledgeIn(BaseModel):
     content: str = ""
     source: str = "personal"
     url: str = ""
+    folder_id: str = ""
+
+
+class KnowledgeLinkIn(BaseModel):
+    url: str
+    folder_id: str = ""
+
+
+class KnowledgeFolderIn(BaseModel):
+    name: str
+    scope: str = "personal"
+    item_ids: list[str] = Field(default_factory=list)
+    sort_order: int = 0
 
 
 class PracticeIn(BaseModel):
