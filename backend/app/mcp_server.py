@@ -32,6 +32,7 @@ peach_mcp = FastMCP(
         "工具支持求职咨询、模拟面试、面试复盘和简历生成。"
         "username 用于 Demo 账号隔离，不需要密码。"
     ),
+    host="0.0.0.0",
     streamable_http_path="/",
     stateless_http=True,
     json_response=True,
