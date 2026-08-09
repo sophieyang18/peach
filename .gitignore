@@ -23,6 +23,7 @@ frontend/dist/
 frontend/.vite/
 frontend/.env.*
 !frontend/.env.example
+dist-submission/
 .idea/
 .vscode/*
 !.vscode/extensions.json

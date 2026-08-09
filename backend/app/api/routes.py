@@ -1,9 +1,11 @@
 from contextvars import ContextVar
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.config import get_settings
 from backend.app.db import get_session
 from backend.app.models import AgentMemory, InterviewSession, KnowledgeFolder, KnowledgeResource, PracticeRecord, UserProfile
 from backend.app.schemas import (
@@ -79,7 +81,14 @@ async def get_or_create_profile(session: AsyncSession, username: str | None = No
         plan=default_plan(),
     )
     session.add(profile)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        existing = await get_existing_profile(session, resolved_username)
+        if existing:
+            return existing
+        raise
     await session.refresh(profile)
     return profile
 
@@ -130,6 +139,80 @@ async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
 @router.get("/health")
 async def health() -> dict:
     return {"status": "ok", "service": "peach-agent"}
+
+
+@router.get("/health/deep")
+async def deep_health(session: AsyncSession = Depends(get_session)) -> dict:
+    settings = get_settings()
+    checks: dict[str, dict] = {}
+
+    try:
+        await session.execute(text("select 1"))
+        checks["database"] = {"ok": True, "detail": "postgres reachable"}
+    except Exception as exc:
+        checks["database"] = {"ok": False, "detail": str(exc)[:240]}
+
+    checks["llm"] = {
+        "ok": bool(settings.deepseek_api_key),
+        "provider": "deepseek-openai-compatible",
+        "model": settings.deepseek_model,
+        "base_url": settings.deepseek_base_url,
+        "detail": "api key configured" if settings.deepseek_api_key else "api key missing, deterministic fallback enabled",
+    }
+    checks["file_parser"] = {
+        "ok": True,
+        "formats": sorted(SUPPORTED_EXTENSIONS),
+        "max_upload_mb": 12,
+    }
+    checks["agent_memory"] = {
+        "ok": True,
+        "scope": "per-user profile id",
+        "retrieval_limit": 5,
+        "max_user_memories": 80,
+    }
+    checks["runtime"] = {
+        "ok": True,
+        "app_env": settings.app_env,
+        "cors_origins": settings.cors_origins,
+    }
+
+    ok = checks["database"]["ok"] and checks["file_parser"]["ok"]
+    return {
+        "status": "ok" if ok else "degraded",
+        "service": "peach-agent",
+        "checks": checks,
+    }
+
+
+@router.get("/capabilities")
+async def capabilities() -> dict:
+    return {
+        "name": "桃子求职陪练 Agent",
+        "core_agentic_flows": [
+            "LLM 对话规划并提出需用户审批的工具动作",
+            "沉浸式语音模拟面试，支持 Web Speech 识别和浏览器 TTS",
+            "模拟面试结束后生成结构化复盘报告并归档到个人档案",
+            "个人档案、完整简历、实习/项目/教育/技能经历沉淀",
+            "个人知识库文件上传、链接解析、资料编辑和基于知识库问答",
+            "长期记忆按用户隔离检索，让 Agent 越用越了解用户",
+        ],
+        "tools": [
+            "start_interview",
+            "finish_latest_interview",
+            "update_profile_fields",
+            "update_resume",
+            "append_profile_note",
+            "add_knowledge_item",
+            "update_knowledge_item",
+            "delete_knowledge_item",
+        ],
+        "file_formats": sorted(SUPPORTED_EXTENSIONS),
+        "safety": [
+            "工具动作默认需要用户确认",
+            "进行中的面试会锁定导航，防止误切功能丢失上下文",
+            "账号 demo 使用用户名隔离数据和记忆",
+        ],
+    }
 
 
 @router.get("/profile")

@@ -792,7 +792,15 @@ function App() {
     setKnowledgeMessages(updateMessages)
   }
 
+  function warnInterviewNavigationLocked() {
+    setNotice('请先结束当前面试，再切换功能。')
+  }
+
   function openModule(nextModule: PrimaryModule) {
+    if (peachPanel === 'live-interview') {
+      warnInterviewNavigationLocked()
+      return
+    }
     setModule(nextModule)
     if (nextModule === 'peach') setPeachPanel('new-chat')
     if (nextModule === 'knowledge') {
@@ -807,6 +815,10 @@ function App() {
   }
 
   function createConversation() {
+    if (peachPanel === 'live-interview') {
+      warnInterviewNavigationLocked()
+      return
+    }
     const active = conversations.find((conversation) => conversation.id === activeConversationId)
     if (active && active.messages.length === 0) {
       setPeachPanel('new-chat')
@@ -824,12 +836,20 @@ function App() {
   }
 
   function openConversation(id: string) {
+    if (peachPanel === 'live-interview') {
+      warnInterviewNavigationLocked()
+      return
+    }
     setActiveConversationId(id)
     setPeachPanel('new-chat')
     setNotice('已切回历史对话。')
   }
 
   function renameConversation(id: string) {
+    if (peachPanel === 'live-interview') {
+      warnInterviewNavigationLocked()
+      return
+    }
     const conversation = conversations.find((item) => item.id === id)
     if (!conversation) return
     const nextTitle = window.prompt('重命名对话', conversation.title)?.trim()
@@ -841,6 +861,10 @@ function App() {
   }
 
   function deleteConversation(id: string) {
+    if (peachPanel === 'live-interview') {
+      warnInterviewNavigationLocked()
+      return
+    }
     const conversation = conversations.find((item) => item.id === id)
     if (!conversation) return
     const confirmed = window.confirm(`确定删除「${conversation.title}」吗？这会移除当前浏览器里的这条对话记录。`)
@@ -1825,6 +1849,7 @@ function App() {
   }
 
   const hasSubNav = module === 'peach' || module === 'knowledge'
+  const isInterviewNavigationLocked = peachPanel === 'live-interview'
   const appClass = `app-shell module-${module} ${hasSubNav ? 'has-sub-nav' : 'no-sub-nav'} ${subNavCollapsed ? 'subnav-collapsed' : ''}`
   const activeKnowledgeFolder = knowledgeTab === 'discover'
     ? undefined
@@ -1850,17 +1875,50 @@ function App() {
     <main className={appClass}>
       <aside className="main-nav" aria-label="主导航栏">
         <nav className="main-nav-list">
-          <button className={module === 'peach' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('peach')}>
+          <button
+            className={[
+              'main-nav-item',
+              module === 'peach' ? 'active' : '',
+              isInterviewNavigationLocked ? 'locked' : '',
+            ].filter(Boolean).join(' ')}
+            type="button"
+            aria-disabled={isInterviewNavigationLocked}
+            title={isInterviewNavigationLocked ? '请先结束当前面试' : undefined}
+            onClick={() => openModule('peach')}
+          >
             <span className="nav-icon"><img src={NAV_ICONS.peach} alt="" /></span>
             <strong>问问桃子</strong>
+            {isInterviewNavigationLocked ? <span className="nav-lock" aria-hidden="true">锁定</span> : null}
           </button>
-          <button className={module === 'profile' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('profile')}>
+          <button
+            className={[
+              'main-nav-item',
+              module === 'profile' ? 'active' : '',
+              isInterviewNavigationLocked ? 'locked' : '',
+            ].filter(Boolean).join(' ')}
+            type="button"
+            aria-disabled={isInterviewNavigationLocked}
+            title={isInterviewNavigationLocked ? '请先结束当前面试' : undefined}
+            onClick={() => openModule('profile')}
+          >
             <span className="nav-icon"><img src={NAV_ICONS.profile} alt="" /></span>
             <strong>个人档案</strong>
+            {isInterviewNavigationLocked ? <span className="nav-lock" aria-hidden="true">锁定</span> : null}
           </button>
-          <button className={module === 'knowledge' ? 'main-nav-item active' : 'main-nav-item'} type="button" onClick={() => openModule('knowledge')}>
+          <button
+            className={[
+              'main-nav-item',
+              module === 'knowledge' ? 'active' : '',
+              isInterviewNavigationLocked ? 'locked' : '',
+            ].filter(Boolean).join(' ')}
+            type="button"
+            aria-disabled={isInterviewNavigationLocked}
+            title={isInterviewNavigationLocked ? '请先结束当前面试' : undefined}
+            onClick={() => openModule('knowledge')}
+          >
             <span className="nav-icon"><img src={NAV_ICONS.knowledge} alt="" /></span>
             <strong>求职知识库</strong>
+            {isInterviewNavigationLocked ? <span className="nav-lock" aria-hidden="true">锁定</span> : null}
           </button>
         </nav>
         <div className="account-switcher" aria-label="账号管理">
@@ -1877,6 +1935,7 @@ function App() {
           conversations={conversations}
           activeConversationId={activeConversationId}
           collapsed={subNavCollapsed}
+          locked={isInterviewNavigationLocked}
           onNew={createConversation}
           onOpenHistory={openConversation}
           onRenameHistory={renameConversation}
@@ -2119,6 +2178,7 @@ function PeachSubNav({
   conversations,
   activeConversationId,
   collapsed,
+  locked,
   onNew,
   onOpenHistory,
   onRenameHistory,
@@ -2129,6 +2189,7 @@ function PeachSubNav({
   conversations: Conversation[]
   activeConversationId: string
   collapsed: boolean
+  locked?: boolean
   onNew: () => void
   onOpenHistory: (id: string) => void
   onRenameHistory: (id: string) => void
@@ -2143,8 +2204,19 @@ function PeachSubNav({
       {collapsed ? null : (
         <>
       <div className="sub-nav-actions">
-        <button className={activePanel === 'new-chat' ? 'sub-action active' : 'sub-action'} type="button" onClick={onNew}>
+        <button
+          className={[
+            'sub-action',
+            activePanel === 'new-chat' ? 'active' : '',
+            locked ? 'locked' : '',
+          ].filter(Boolean).join(' ')}
+          type="button"
+          aria-disabled={locked}
+          title={locked ? '请先结束当前面试' : undefined}
+          onClick={onNew}
+        >
           新建对话
+          {locked ? <span className="inline-lock" aria-hidden="true">锁定</span> : null}
         </button>
       </div>
       <div className="history-section">
@@ -2152,16 +2224,30 @@ function PeachSubNav({
         <div className="history-list">
           {conversations.map((conversation) => (
             <article
-              className={conversation.id === activeConversationId ? 'history-item active' : 'history-item'}
+              className={[
+                'history-item',
+                conversation.id === activeConversationId ? 'active' : '',
+                locked ? 'locked' : '',
+              ].filter(Boolean).join(' ')}
               key={conversation.id}
             >
-              <button className="history-open-button" type="button" onClick={() => onOpenHistory(conversation.id)}>
+              <button
+                className="history-open-button"
+                type="button"
+                aria-disabled={locked}
+                title={locked ? '请先结束当前面试' : undefined}
+                onClick={() => onOpenHistory(conversation.id)}
+              >
                 <strong>{conversation.title}</strong>
                 <span>{conversation.updatedAt}</span>
               </button>
               <div className="history-item-actions">
-                <button type="button" onClick={() => onRenameHistory(conversation.id)} aria-label={`重命名${conversation.title}`}>改名</button>
-                <button type="button" onClick={() => onDeleteHistory(conversation.id)} aria-label={`删除${conversation.title}`}>删除</button>
+                {locked ? <span className="history-lock" aria-hidden="true">锁定</span> : (
+                  <>
+                    <button type="button" onClick={() => onRenameHistory(conversation.id)} aria-label={`重命名${conversation.title}`}>改名</button>
+                    <button type="button" onClick={() => onDeleteHistory(conversation.id)} aria-label={`删除${conversation.title}`}>删除</button>
+                  </>
+                )}
               </div>
             </article>
           ))}
@@ -3515,7 +3601,7 @@ function KnowledgeFeedCard({
 }) {
   return (
     <article className={featured ? 'knowledge-feed-card featured' : 'knowledge-feed-card'}>
-      <div className="feed-cover" style={{ backgroundImage: `url(https://picsum.photos/seed/peach-knowledge-${index}/160/160)` }} />
+      <div className={`feed-cover feed-cover-${index % 6}`} aria-hidden="true" />
       <div>
         <h3>{item.title}</h3>
         <p>{item.summary}</p>

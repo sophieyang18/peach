@@ -983,9 +983,46 @@ textarea:focus {
   box-shadow: 0 10px 28px rgba(151, 76, 90, 0.08);
 }
 
+.main-nav-item.locked {
+  position: relative;
+  border-color: rgba(232, 203, 199, 0.7);
+  background: rgba(255, 255, 255, 0.46);
+  color: #9b8a92;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.main-nav-item.locked:hover,
+.main-nav-item.locked.active {
+  border-color: #f0dfd8;
+  background: rgba(255, 250, 246, 0.72);
+  color: #7f6e77;
+  box-shadow: none;
+}
+
 .main-nav-item strong {
   font-size: 12px;
   line-height: 1.2;
+}
+
+.nav-lock,
+.inline-lock,
+.history-lock {
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.nav-lock {
+  min-height: 16px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(255, 198, 218, 0.78);
+  border-radius: 999px;
+  background: rgba(255, 240, 246, 0.84);
+  padding: 0 6px;
 }
 
 .nav-icon {
@@ -1112,6 +1149,26 @@ textarea:focus {
   box-shadow: 0 12px 28px rgba(223, 79, 131, 0.18);
 }
 
+.sub-action.locked {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-color: rgba(232, 203, 199, 0.86);
+  background: rgba(255, 255, 255, 0.62);
+  color: #9b8a92;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.sub-action.locked:hover,
+.sub-action.locked.active {
+  border-color: #f0dfd8;
+  background: rgba(255, 250, 246, 0.78);
+  color: #8b7983;
+  box-shadow: none;
+}
+
 .history-section {
   min-height: 0;
   display: grid;
@@ -1155,6 +1212,18 @@ textarea:focus {
   background: rgba(255, 240, 246, 0.78);
 }
 
+.history-item.locked {
+  border-color: transparent;
+  color: #9b8a92;
+  cursor: not-allowed;
+}
+
+.history-item.locked:hover,
+.history-item.locked.active {
+  border-color: rgba(240, 223, 216, 0.86);
+  background: rgba(255, 255, 255, 0.56);
+}
+
 .history-open-button {
   min-width: 0;
   display: grid;
@@ -1163,6 +1232,10 @@ textarea:focus {
   color: inherit;
   padding: 0;
   text-align: left;
+}
+
+.history-item.locked .history-open-button {
+  cursor: not-allowed;
 }
 
 .history-open-button strong {
@@ -1211,6 +1284,16 @@ textarea:focus {
   border-color: #ffc6da;
   background: #fff0f7;
   color: var(--accent-strong);
+}
+
+.history-lock {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid rgba(255, 198, 218, 0.66);
+  border-radius: 999px;
+  background: rgba(255, 240, 246, 0.68);
+  padding: 0 7px;
 }
 
 .workspace {
@@ -3570,8 +3653,41 @@ button:active,
   width: 76px;
   height: 76px;
   border-radius: 16px;
-  background-size: cover;
-  background-position: center;
+  border: 1px solid rgba(255, 198, 218, 0.62);
+  background:
+    linear-gradient(135deg, transparent 63%, rgba(255, 255, 255, 0.78) 64%),
+    linear-gradient(135deg, #ffd8e8, #fff3bf);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 12px 24px rgba(151, 76, 90, 0.08);
+}
+
+.feed-cover-1 {
+  background:
+    radial-gradient(circle at 32% 34%, rgba(255, 255, 255, 0.86) 0 18%, transparent 19%),
+    linear-gradient(135deg, #f6b7cf, #fff0c9);
+}
+
+.feed-cover-2 {
+  background:
+    linear-gradient(45deg, transparent 46%, rgba(255, 255, 255, 0.72) 47% 57%, transparent 58%),
+    linear-gradient(135deg, #ffc4dc, #f48671);
+}
+
+.feed-cover-3 {
+  background:
+    radial-gradient(circle at 72% 22%, rgba(255, 255, 255, 0.84) 0 13%, transparent 14%),
+    linear-gradient(160deg, #fff1ba, #e65b8c);
+}
+
+.feed-cover-4 {
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.7) 0 14%, transparent 15%),
+    linear-gradient(135deg, #f8d0df, #ffdd81);
+}
+
+.feed-cover-5 {
+  background:
+    radial-gradient(circle at 28% 76%, rgba(255, 255, 255, 0.78) 0 16%, transparent 17%),
+    linear-gradient(135deg, #ec6f9d, #fff3c4);
 }
 
 .knowledge-feed-card h3 {

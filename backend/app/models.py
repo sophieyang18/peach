@@ -16,7 +16,7 @@ class UserProfile(Base):
     __tablename__ = "user_profiles"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=uuid_pk)
-    username: Mapped[str] = mapped_column(String(80), default="demo", index=True)
+    username: Mapped[str] = mapped_column(String(80), default="demo", index=True, unique=True)
     name: Mapped[str] = mapped_column(String(80), default="同学")
     target_role: Mapped[str] = mapped_column(String(120), default="产品经理")
     target_company: Mapped[str] = mapped_column(String(120), default="")
