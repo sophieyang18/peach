@@ -6,12 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api.routes import current_username, normalize_username, router
 from backend.app.core.config import get_settings
 from backend.app.db import init_db
+from backend.app.mcp_server import peach_mcp
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
-    yield
+    async with peach_mcp.session_manager.run():
+        await init_db()
+        yield
 
 
 settings = get_settings()
@@ -43,6 +45,7 @@ async def account_context_middleware(request, call_next):
 
 
 app.include_router(router)
+app.mount("/mcp", peach_mcp.streamable_http_app())
 
 
 @app.get("/")
