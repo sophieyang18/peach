@@ -272,8 +272,8 @@ const defaultProfile: Profile = {
   ],
 }
 
-const fixedBubbles = ['帮我模拟面试', '帮我写简历', '帮我改简历', '我能投哪些岗位']
-const composerActions = ['模拟面试', '题库练习', '简历优化', '简历撰写', '投递动态']
+const fixedBubbles = ['帮我模拟面试', '帮我写简历', '帮我改简历']
+const composerActions = ['模拟面试', '题库练习', '简历优化', '简历撰写']
 const defaultInterviewProgress: InterviewProgress = {
   answer_count: 0,
   question_count: 0,
@@ -1057,13 +1057,6 @@ function App() {
     const promptMap: Record<string, string> = {
       简历优化: '帮我优化简历，重点提升项目经历和岗位匹配度。',
       简历撰写: '帮我从零写一版适合目标岗位的简历。',
-      投递动态: [
-        '请基于桃子的岗位池为我推荐近期可投岗位和投递节奏。',
-        '岗位池来自飞书表导入数据；如果当前无法读取在线表格，就使用内置样例岗位池做降级推荐。',
-        '严禁建议我去牛客、实习僧、公司官网或其他竞品网站搜索。',
-        `内置岗位池：${JSON.stringify(deliveryJobPool())}`,
-        `我的目标岗位：${profile.target_role}，目标公司：${profile.target_company || '未填写'}，城市：${profile.target_city || '未填写'}。`,
-      ].join('\n'),
     }
     void sendPrompt(promptMap[action] ?? action)
   }
@@ -4486,16 +4479,6 @@ function buildKnowledgeItems(profile: Profile): KnowledgeItem[] {
       summary: '从个人档案中沉淀出的简历表达、项目证据和面试追问材料。',
       source: 'personal',
     },
-  ]
-}
-
-function deliveryJobPool() {
-  return [
-    { company: '字节跳动', role: 'AI 产品经理实习生', city: '北京/上海', track: 'AIGC', priority: '高', note: '适合有 AI 产品、内容生态或策略项目经历的候选人。' },
-    { company: '快手', role: 'AI 产品策略实习生', city: '北京', track: '内容与增长', priority: '高', note: '适合有短视频、推荐、AIGC 工具或用户增长经历的候选人。' },
-    { company: '腾讯', role: '大模型应用产品实习生', city: '深圳/北京', track: '大模型应用', priority: '中高', note: '适合有工具型产品、ToB/ToC AI 应用设计经历的候选人。' },
-    { company: '阿里', role: '智能助手产品实习生', city: '杭州', track: 'AI Agent', priority: '中高', note: '适合有 Agent、效率工具、平台型产品经验的候选人。' },
-    { company: '美团', role: '策略产品实习生', city: '北京', track: '本地生活', priority: '中', note: '适合有数据分析、策略运营、供需匹配项目经历的候选人。' },
   ]
 }
 

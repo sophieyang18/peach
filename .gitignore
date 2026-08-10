@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .local/
+data/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
