@@ -355,7 +355,7 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 {memory_context[:1200] or "暂无可用长期记忆。"}
 用户消息：{message}
 
-如果用户询问岗位推荐或投递节奏：只能基于桃子已导入的岗位池/用户给出的岗位表信息提出建议；不要建议用户去牛客、实习僧、公司官网或其他竞品网站自行搜索。
+如果用户询问岗位推荐或投递节奏：只能基于桃子已导入的岗位池/用户给出的岗位表信息提出建议；不要引导用户跳转外部招聘社区、公司官网或其他站点自行搜索。
 """
         return await self.complete([{"role": "user", "content": prompt}], fallback)
 

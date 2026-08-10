@@ -25,6 +25,16 @@ from backend.app.models import InterviewSession
 from backend.app.services.memory import remember_interaction
 
 
+REQUIRED_TOOLS = {
+    "peach_chat",
+    "peach_start_interview",
+    "peach_answer_interview",
+    "peach_finish_interview",
+    "peach_generate_resume",
+    "peach_profile_snapshot",
+}
+
+
 peach_mcp = FastMCP(
     "Peach Interview Companion",
     instructions=(

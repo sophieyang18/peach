@@ -17,7 +17,7 @@
 
 - 前端：React 19 + TypeScript + Vite
 - 后端：FastAPI + SQLAlchemy Async
-- 数据库：PostgreSQL
+- 数据库：SQLite demo fallback；生产可切 PostgreSQL
 - LLM：DeepSeek OpenAI-compatible API，默认模型 `deepseek-v4-flash`
 - 文件解析：PDF、DOC/DOCX、Markdown、HTML
 - 语音：浏览器 Web Speech Recognition + SpeechSynthesis
@@ -26,7 +26,8 @@
 
 ```text
 backend/                 FastAPI 后端
-  app/api/routes.py      API、账号隔离、面试、知识库、健康检查
+  app/api/routes.py      REST API、账号隔离、面试、知识库、健康检查
+  app/mcp_server.py      Streamable HTTP MCP 工具入口
   app/services/agent.py  LLM persona、工具规划、面试官、报告生成
   app/services/memory.py 长期记忆检索、提取、去重和裁剪
   app/services/file_parser.py 文件和链接解析
@@ -40,11 +41,19 @@ docker-compose.yml       容器化一键启动
 复制 `.env.example` 为 `.env`，至少配置：
 
 ```bash
-DATABASE_URL=postgresql+asyncpg://localhost/peach
+DATABASE_URL=sqlite+aiosqlite:///./data/peach-local.db
+SYNC_DATABASE_URL=sqlite:///./data/peach-local.db
 DEEPSEEK_API_KEY=your_deepseek_api_key_here
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
+```
+
+本地 demo 默认可以直接使用 SQLite，不需要先安装 PostgreSQL。生产部署如需持久化和并发能力，可改为：
+
+```bash
+DATABASE_URL=postgresql+asyncpg://peach:password@host:5432/peach
+SYNC_DATABASE_URL=postgresql://peach:password@host:5432/peach
 ```
 
 不要把真实 `.env` 打进源码 ZIP。
@@ -70,6 +79,7 @@ cd /Users/shihuiyang/work/0802/peach
 - 基础健康检查：http://localhost:8000/api/health
 - 深度健康检查：http://localhost:8000/api/health/deep
 - Agent 能力说明：http://localhost:8000/api/capabilities
+- MCP 本地地址：http://localhost:8000/mcp/
 
 ## Docker 启动
 
@@ -104,6 +114,31 @@ DEEPSEEK_API_KEY=your_key docker compose up --build
 - `POST /api/knowledge/link`：解析链接并加入知识库
 - `GET /api/memories` / `DELETE /api/memories/{id}`：查看和删除长期记忆
 
+## MCP 评测入口
+
+后端已提供 Streamable HTTP MCP，部署后公网地址格式为：
+
+```text
+https://<your-cloudbase-run-domain>/mcp/
+```
+
+当前核心工具：
+
+- `peach_chat`：个性化求职咨询，并更新长期记忆
+- `peach_start_interview`：创建模拟面试
+- `peach_answer_interview`：推进面试问答
+- `peach_finish_interview`：结束面试并生成复盘报告
+- `peach_generate_resume`：基于档案、知识库和记忆生成简历
+- `peach_profile_snapshot`：只读查看账号隔离后的档案、记忆和最近面试
+
+提交前建议用官方 MCP client 验证：
+
+```bash
+python scripts/verify_mcp.py --url https://<your-cloudbase-run-domain>/mcp/ --call-tool
+```
+
+预期输出包含 `MCP initialize: ok`、完整工具列表，以及 `peach_profile_snapshot` 返回的 `{"ok": true, ...}`。
+
 ## 测试与质量检查
 
 ```bash
@@ -111,6 +146,7 @@ python -m compileall backend/app
 pytest
 pnpm --dir frontend lint
 pnpm --dir frontend build
+python scripts/verify_mcp.py --url http://127.0.0.1:8000/mcp/ --call-tool
 ```
 
 当前测试覆盖：
@@ -118,6 +154,7 @@ pnpm --dir frontend build
 - 文件解析的 Markdown / HTML 基础抽取
 - 长期记忆内容过滤和上下文压缩
 - 面试进度 checklist 和最小轮数约束
+- MCP 工具注册和 CloudBase Streamable HTTP 挂载配置
 - 工具动作白名单和用户名归一化
 
 ## 比赛源码 ZIP
@@ -147,5 +184,5 @@ dist-submission/peach-agent-submission.zip
 ## 已知边界
 
 - 当前 demo 账号只有用户名，没有密码和正式鉴权；正式上线前需要接入登录态和权限校验。
+- 本地默认 SQLite 方便评测快速启动；正式上线建议使用 PostgreSQL 或腾讯云托管数据库。
 - 语音识别和 TTS 使用浏览器能力，效果取决于浏览器支持度；后续可替换云端流式 ASR/TTS。
-- MCP 接口将作为单独提交前增强项补充，目前此仓库先提供 Web App 和 REST API 评测入口。

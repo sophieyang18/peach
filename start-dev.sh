@@ -31,6 +31,7 @@ Environment variables:
   BACKEND_PORT=${BACKEND_PORT}
   FRONTEND_PORT=${FRONTEND_PORT}
   CONDA_ENV=${CONDA_ENV}
+  DATABASE_URL=${DATABASE_URL:-read from .env or SQLite fallback}
 EOF
 }
 
@@ -145,6 +146,70 @@ start_local_postgres() {
   conda run -n "${CONDA_ENV}" pg_ctl -D "${POSTGRES_DIR}" -l "${POSTGRES_LOG}" start >/dev/null
 }
 
+effective_database_url() {
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    echo "${DATABASE_URL}"
+    return
+  fi
+
+  local line=""
+  line="$(grep -E '^[[:space:]]*DATABASE_URL=' "${ROOT_DIR}/.env" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "${line}" ]]; then
+    line="${line#*=}"
+    line="${line%\"}"
+    line="${line#\"}"
+    line="${line%\'}"
+    line="${line#\'}"
+    echo "${line}"
+    return
+  fi
+
+  echo "sqlite+aiosqlite:///./data/peach-local.db"
+}
+
+uses_local_postgres() {
+  local url="$1"
+  [[ "${url}" == postgresql* ]] && {
+    [[ "${url}" == *"//localhost"* ]] || [[ "${url}" == *"//127.0.0.1"* ]] || [[ "${url}" == *"@localhost"* ]] || [[ "${url}" == *"@127.0.0.1"* ]]
+  }
+}
+
+use_sqlite_fallback() {
+  mkdir -p "${ROOT_DIR}/data"
+  export DATABASE_URL="sqlite+aiosqlite:///./data/peach-local.db"
+  export SYNC_DATABASE_URL="sqlite:///./data/peach-local.db"
+  echo "Falling back to SQLite for this dev run: ${DATABASE_URL}"
+}
+
+prepare_database() {
+  local db_url
+  db_url="$(effective_database_url)"
+
+  if [[ "${db_url}" == sqlite* ]]; then
+    mkdir -p "${ROOT_DIR}/data"
+    echo "Using SQLite for local development."
+    return
+  fi
+
+  if uses_local_postgres "${db_url}"; then
+    if ! conda run -n "${CONDA_ENV}" pg_ctl --version >/dev/null 2>&1; then
+      echo "Local PostgreSQL is configured, but pg_ctl is not available in conda env ${CONDA_ENV}."
+      use_sqlite_fallback
+      return
+    fi
+    if [[ ! -f "${POSTGRES_DIR}/PG_VERSION" ]]; then
+      echo "Local PostgreSQL is configured, but ${POSTGRES_DIR} is not an initialized data directory."
+      use_sqlite_fallback
+      echo "To use local PostgreSQL, initialize it first with: mkdir -p .local/postgres && initdb -D .local/postgres"
+      return
+    fi
+    start_local_postgres
+    return
+  fi
+
+  echo "Using configured remote database; skipping local PostgreSQL startup."
+}
+
 wait_for_backend() {
   echo "Waiting for backend health check..."
   for _ in {1..35}; do
@@ -228,7 +293,7 @@ if [[ "${BACKEND_RUNNING}" == false ]] && port_in_use "${BACKEND_PORT}"; then
   exit 1
 fi
 
-start_local_postgres
+prepare_database
 
 if [[ "${BACKEND_RUNNING}" == true ]]; then
   echo "Backend already running on http://${HOST}:${BACKEND_PORT}"
