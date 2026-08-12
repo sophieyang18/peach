@@ -133,3 +133,83 @@ class AgentMemoryEvent(Base):
     reason: Mapped[str] = mapped_column(Text, default="")
     event_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ActionState(Base):
+    __tablename__ = "action_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    action_type: Mapped[str] = mapped_column(String(80), default="targeted_interview_training", index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    target_issue_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    target_ability: Mapped[str] = mapped_column(String(80), default="", index=True)
+    related_experience_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=2)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserAbilityScore(Base):
+    __tablename__ = "user_ability_scores"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    ability_dimension: Mapped[str] = mapped_column(String(80), index=True)
+    current_score: Mapped[int] = mapped_column(Integer, default=60)
+    target_score: Mapped[int] = mapped_column(Integer, default=80)
+    confidence_level: Mapped[str] = mapped_column(String(24), default="low")
+    evidence_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AbilityScoreHistory(Base):
+    __tablename__ = "ability_score_history"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    ability_dimension: Mapped[str] = mapped_column(String(80), index=True)
+    score: Mapped[int] = mapped_column(Integer, default=60)
+    source_type: Mapped[str] = mapped_column(String(80), default="mock_interview")
+    source_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GrowthIssue(Base):
+    __tablename__ = "growth_issues"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    issue_key: Mapped[str] = mapped_column(String(120), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    ability_dimension: Mapped[str] = mapped_column(String(80), default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    first_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class GrowthInsight(Base):
+    __tablename__ = "growth_insights"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    insight_type: Mapped[str] = mapped_column(String(40), default="recommendation", index=True)
+    content: Mapped[str] = mapped_column(Text)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    confidence: Mapped[int] = mapped_column(Integer, default=70)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

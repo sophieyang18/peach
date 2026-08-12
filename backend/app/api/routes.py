@@ -7,7 +7,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
 from backend.app.db import SessionLocal, get_session
-from backend.app.models import AgentMemory, AgentMemoryEvent, InterviewSession, KnowledgeFolder, KnowledgeResource, PracticeRecord, UserProfile
+from backend.app.models import (
+    AbilityScoreHistory,
+    ActionState,
+    AgentMemory,
+    AgentMemoryEvent,
+    GrowthInsight,
+    GrowthIssue,
+    InterviewSession,
+    KnowledgeFolder,
+    KnowledgeResource,
+    PracticeRecord,
+    UserAbilityScore,
+    UserProfile,
+)
 from backend.app.schemas import (
     AccountIn,
     AgentActionIn,
@@ -24,6 +37,7 @@ from backend.app.schemas import (
 )
 from backend.app.services.agent import PeachAgent
 from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
+from backend.app.services.growth import apply_interview_growth_update, build_growth_center, build_home_context
 from backend.app.services.memory import PeachMemoryService, build_memory_context, remember_interaction, remember_interaction_isolated, retrieve_relevant_memories, upsert_memory
 
 router = APIRouter(prefix="/api")
@@ -156,6 +170,11 @@ async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
     await session.execute(delete(InterviewSession).where(InterviewSession.user_id == profile.id))
     await session.execute(delete(KnowledgeResource).where(KnowledgeResource.user_id == profile.id))
     await session.execute(delete(KnowledgeFolder).where(KnowledgeFolder.user_id == profile.id))
+    await session.execute(delete(ActionState).where(ActionState.user_id == profile.id))
+    await session.execute(delete(AbilityScoreHistory).where(AbilityScoreHistory.user_id == profile.id))
+    await session.execute(delete(UserAbilityScore).where(UserAbilityScore.user_id == profile.id))
+    await session.execute(delete(GrowthInsight).where(GrowthInsight.user_id == profile.id))
+    await session.execute(delete(GrowthIssue).where(GrowthIssue.user_id == profile.id))
     await session.execute(delete(AgentMemoryEvent).where(AgentMemoryEvent.user_id == profile.id))
     await session.execute(delete(AgentMemory).where(AgentMemory.user_id == profile.id))
     profile.name = "同学"
@@ -294,6 +313,8 @@ async def dashboard(session: AsyncSession = Depends(get_session)) -> dict:
         )
     ).scalars().all()
     checkin = build_local_checkin(profile, list(records))
+    home_context = await build_home_context(session, profile)
+    growth_center = await build_growth_center(session, profile)
 
     return {
         "profile": serialize_profile(profile),
@@ -302,7 +323,21 @@ async def dashboard(session: AsyncSession = Depends(get_session)) -> dict:
         "recent_interviews": [serialize_interview(item) for item in interviews],
         "memories": [serialize_memory(item) for item in await list_recent_memories(session, profile.id, 8)],
         "growth": build_growth(profile, list(records), list(interviews)),
+        "home_context": home_context,
+        "growth_center": growth_center,
     }
+
+
+@router.get("/home-context")
+async def home_context(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return await build_home_context(session, profile)
+
+
+@router.get("/growth")
+async def growth_center(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return await build_growth_center(session, profile)
 
 
 @router.get("/memories")
@@ -325,7 +360,7 @@ async def delete_memory(memory_id: str, session: AsyncSession = Depends(get_sess
 @router.post("/practice")
 async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    memory_context = await relevant_memory_context(session, profile, f"{payload.question}\n{payload.answer}")
+    memory_context = await relevant_memory_context(session, profile, f"{payload.question}\n{payload.answer}", task_type="growth_analysis")
     feedback = await agent.evaluate_practice(profile, payload.question, payload.answer, memory_context)
     record = PracticeRecord(
         user_id=profile.id,
@@ -355,7 +390,12 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
 @router.post("/interviews")
 async def start_interview(payload: InterviewStartIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    memory_context = await relevant_memory_context(session, profile, "\n".join([payload.company, payload.role, payload.jd, payload.question_bank]))
+    memory_context = await relevant_memory_context(
+        session,
+        profile,
+        "\n".join([payload.company, payload.role, payload.jd, payload.question_bank]),
+        task_type="mock_interview",
+    )
     interview = InterviewSession(
         user_id=profile.id,
         interview_type=payload.interview_type,
@@ -408,7 +448,7 @@ async def answer_interview(
     if not interview:
         raise HTTPException(status_code=404, detail="interview not found")
 
-    memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{payload.answer}")
+    memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{payload.answer}", task_type="mock_interview")
     transcript = [*interview.transcript, {"role": "candidate", "content": payload.answer}]
     interview.transcript = transcript
     next_turn = await agent.continue_interview(profile, interview, payload.answer, memory_context)
@@ -422,11 +462,13 @@ async def answer_interview(
     llm_can_finish = progress["can_llm_finish"]
     should_offer_finish = bool(next_turn.get("should_finish")) and llm_can_finish
     force_finish = progress["answer_count"] >= MAX_INTERVIEW_ANSWERS
+    growth_update = None
     next_turn["should_finish"] = should_offer_finish
 
     if force_finish:
         interview.status = "completed"
         interview.report = await agent.interview_report(profile, interview, memory_context)
+        growth_update = await apply_interview_growth_update(session, profile, interview)
         progress = build_interview_progress(interview)
 
     await session.commit()
@@ -445,7 +487,15 @@ async def answer_interview(
             "progress": progress,
         },
     )
-    return {"interview": serialize_interview(interview), "next": next_turn, "report": interview.report, "progress": progress}
+    return {
+        "interview": serialize_interview(interview),
+        "next": next_turn,
+        "report": interview.report,
+        "progress": progress,
+        "growth_update": serialize_growth_update(growth_update),
+        "memory_updates": growth_update.memory_updates if growth_update else [],
+        "next_actions": growth_update.actions if growth_update else [],
+    }
 
 
 @router.post("/interviews/{interview_id}/finish")
@@ -455,9 +505,10 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
     if not interview:
         raise HTTPException(status_code=404, detail="interview not found")
 
-    memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{interview.transcript[-8:]}")
+    memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{interview.transcript[-8:]}", task_type="growth_analysis")
     interview.status = "completed"
     interview.report = await agent.interview_report(profile, interview, memory_context)
+    growth_update = await apply_interview_growth_update(session, profile, interview)
     await session.commit()
     await session.refresh(interview)
     await remember_interaction_safely(
@@ -469,13 +520,20 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
         assistant_reply=str(interview.report),
         context={"transcript_tail": interview.transcript[-8:]},
     )
-    return {"interview": serialize_interview(interview), "report": interview.report, "progress": build_interview_progress(interview)}
+    return {
+        "interview": serialize_interview(interview),
+        "report": interview.report,
+        "progress": build_interview_progress(interview),
+        "growth_update": serialize_growth_update(growth_update),
+        "memory_updates": growth_update.memory_updates,
+        "next_actions": growth_update.actions,
+    }
 
 
 @router.post("/review")
 async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    memory_context = await relevant_memory_context(session, profile, str(payload.model_dump()))
+    memory_context = await relevant_memory_context(session, profile, str(payload.model_dump()), task_type="growth_analysis")
     feedback = await agent.post_interview_review(profile, payload.model_dump(), memory_context)
     record = PracticeRecord(
         user_id=profile.id,
@@ -886,6 +944,18 @@ def serialize_memory(memory: AgentMemory) -> dict:
     }
 
 
+def serialize_growth_update(update) -> dict:
+    if not update:
+        return {}
+    return {
+        "abilities": update.abilities,
+        "issues": update.issues,
+        "insights": update.insights,
+        "actions": update.actions,
+        "memory_updates": update.memory_updates,
+    }
+
+
 def serialize_knowledge(item: KnowledgeResource) -> dict:
     return {
         "id": item.id,
@@ -937,8 +1007,8 @@ async def list_recent_memories(session: AsyncSession, user_id: str, limit: int) 
     ).scalars().all())
 
 
-async def relevant_memory_context(session: AsyncSession, profile: UserProfile, query: str) -> str:
-    memories = await retrieve_relevant_memories(session, profile.id, query)
+async def relevant_memory_context(session: AsyncSession, profile: UserProfile, query: str, task_type: str = "chat") -> str:
+    memories = await retrieve_relevant_memories(session, profile.id, query, task_type=task_type)
     return build_memory_context(memories)
 
 

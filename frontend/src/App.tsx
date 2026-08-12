@@ -9,9 +9,10 @@ const NAV_ICONS: Record<PrimaryModule, string> = {
   peach: '/peach-assets/nav-peach.jpg',
   profile: '/peach-assets/nav-profile.jpg',
   knowledge: '/peach-assets/nav-knowledge.jpg',
+  growth: '/peach-assets/peach-icon.png',
 }
 
-type PrimaryModule = 'peach' | 'profile' | 'knowledge'
+type PrimaryModule = 'peach' | 'profile' | 'knowledge' | 'growth'
 type PeachPanel = 'new-chat' | 'interview-setup' | 'question-bank-setup' | 'live-interview'
 type InterviewMode = 'voice' | 'video'
 type TtsRateMode = 'slow' | 'medium' | 'fast'
@@ -105,6 +106,60 @@ type Dashboard = {
     weak_points: string[]
     progress_points: Array<{ label: string; score: number }>
   }
+  home_context?: HomeContext
+  growth_center?: GrowthCenter
+}
+
+type HomeContext = {
+  peach_view_of_user: Array<{ label: string; value: string }>
+  personalized_prompts: string[]
+  pending_actions: GrowthAction[]
+}
+
+type GrowthAction = {
+  id: string
+  action_type?: string
+  title: string
+  description: string
+  target_issue_id?: string
+  target_ability?: string
+  status?: string
+  priority?: number
+}
+
+type GrowthCenter = {
+  target: { role: string; company?: string; jd_status?: string }
+  readiness_score: number
+  abilities: Array<{
+    dimension: string
+    label: string
+    current_score: number | null
+    target_score: number
+    gap: number | null
+    status: 'pending' | 'achieved' | 'close' | 'improve' | 'priority'
+    confidence_level: string
+    evidence_count: number
+  }>
+  trend: Array<{ label: string; score: number }>
+  issues: {
+    solved: GrowthIssue[]
+    improving: GrowthIssue[]
+    new: GrowthIssue[]
+  }
+  insights: Array<{ id: string; insight_type: string; content: string; confidence: number }>
+  recommendation: GrowthAction
+  stats: { ability_evidence_count: number; tracked_issue_count: number; solved_issue_count: number }
+}
+
+type GrowthIssue = {
+  id: string
+  issue_key: string
+  title: string
+  description: string
+  ability_dimension: string
+  status: string
+  occurrence_count: number
+  evidence_ids: string[]
 }
 
 type InterviewReport = {
@@ -122,6 +177,10 @@ type InterviewReport = {
     candidate_transcript?: string
     sample_answer?: string
   }>
+  growth_findings?: Array<{ title: string; description: string; status: string; occurrence_count: number; ability_dimension: string }>
+  memory_updates?: Array<{ id?: string; content: string; status?: string }>
+  next_actions?: GrowthAction[]
+  growth_insights?: Array<{ id?: string; insight_type?: string; content: string; confidence?: number }>
 }
 
 type InterviewSettings = {
@@ -385,8 +444,8 @@ function App() {
   const busyText = Object.values(busy)[0]
   const fallbackRecommendations = useMemo(() => buildRecommendations(profile, dashboard), [profile, dashboard])
   const visibleRecommendations = useMemo(
-    () => safeRecommendations(recommendations, fallbackRecommendations),
-    [fallbackRecommendations, recommendations],
+    () => safeRecommendations([...(dashboard?.home_context?.personalized_prompts ?? []), ...recommendations], fallbackRecommendations),
+    [dashboard?.home_context?.personalized_prompts, fallbackRecommendations, recommendations],
   )
   const resumeFolders = useMemo(() => buildResumeFolders(profile, dashboard, profileSections), [profile, dashboard, profileSections])
   const knowledgeItems = useMemo(
@@ -1059,6 +1118,18 @@ function App() {
       简历撰写: '帮我从零写一版适合目标岗位的简历。',
     }
     void sendPrompt(promptMap[action] ?? action)
+  }
+
+  function startGrowthTraining(prompt: string) {
+    const focus = prompt || dashboard?.growth_center?.recommendation?.title || '项目深挖专项训练'
+    setModule('peach')
+    setPeachPanel('question-bank-setup')
+    setSettings((current) => ({
+      ...current,
+      style: current.style || '温和型',
+      questionBank: `${focus}：围绕为什么做、如何决策、指标结果和业务价值连续追问 3-5 题。`,
+    }))
+    setNotice('已为你预填专项训练配置。')
   }
 
   async function startLiveInterview(kind: 'interview' | 'question-bank') {
@@ -1920,6 +1991,21 @@ function App() {
             <strong>求职知识库</strong>
             {isInterviewNavigationLocked ? <span className="nav-lock" aria-hidden="true">锁定</span> : null}
           </button>
+          <button
+            className={[
+              'main-nav-item',
+              module === 'growth' ? 'active' : '',
+              isInterviewNavigationLocked ? 'locked' : '',
+            ].filter(Boolean).join(' ')}
+            type="button"
+            aria-disabled={isInterviewNavigationLocked}
+            title={isInterviewNavigationLocked ? '请先结束当前面试' : undefined}
+            onClick={() => openModule('growth')}
+          >
+            <span className="nav-icon"><img src={NAV_ICONS.growth} alt="" /></span>
+            <strong>成长中心</strong>
+            {isInterviewNavigationLocked ? <span className="nav-lock" aria-hidden="true">锁定</span> : null}
+          </button>
         </nav>
         <div className="account-switcher" aria-label="账号管理">
           <div className="account-avatar">{account.username.slice(0, 1).toUpperCase()}</div>
@@ -1991,6 +2077,7 @@ function App() {
             panel={peachPanel}
             profile={profile}
             conversation={activeConversation}
+            homeContext={dashboard?.home_context}
             recommendations={visibleRecommendations}
             input={input}
             settings={settings}
@@ -2015,6 +2102,8 @@ function App() {
             onSend={() => (peachPanel === 'live-interview' ? void sendInterviewAnswer() : void sendPrompt(input))}
             onVoiceSubmit={(text) => void sendInterviewAnswerText(text)}
             onQuickSend={(value) => void sendPrompt(value)}
+            onStartTraining={startGrowthTraining}
+            onOpenProfile={() => openModule('profile')}
             onAction={runComposerAction}
             onSettingsChange={setSettings}
             onStartInterview={() => void startLiveInterview('interview')}
@@ -2063,6 +2152,8 @@ function App() {
             onUploadFile={(file) => void uploadProfileFile(file)}
             onApproveAction={(action) => void approveAgentAction(action)}
             onDismissAction={dismissAgentAction}
+            onStartTraining={startGrowthTraining}
+            onOpenGrowth={() => openModule('growth')}
           />
         ) : null}
 
@@ -2104,6 +2195,14 @@ function App() {
             onBackToAsk={closeKnowledgeDetail}
             onRunItemAction={(action) => void runKnowledgeItemAction(action)}
             onAcceptActionResult={acceptKnowledgeActionResult}
+          />
+        ) : null}
+
+        {module === 'growth' ? (
+          <GrowthWorkspace
+            profile={profile}
+            growth={dashboard?.growth_center}
+            onStartTraining={(prompt) => void startGrowthTraining(prompt)}
           />
         ) : null}
       </section>
@@ -2348,6 +2447,7 @@ function PeachWorkspace(props: {
   panel: PeachPanel
   profile: Profile
   conversation: Conversation
+  homeContext?: HomeContext
   recommendations: string[]
   input: string
   settings: InterviewSettings
@@ -2372,6 +2472,8 @@ function PeachWorkspace(props: {
   onSend: () => void
   onVoiceSubmit: (value: string) => void
   onQuickSend: (value: string) => void
+  onStartTraining: (value: string) => void
+  onOpenProfile: () => void
   onAction: (value: string) => void
   onSettingsChange: (value: InterviewSettings) => void
   onStartInterview: () => void
@@ -2405,6 +2507,8 @@ function PeachWorkspace(props: {
 
   const isBlankConversation = props.conversation.messages.length === 0
   const bubbleItems = uniqueStrings([...fixedBubbles, ...props.recommendations]).slice(0, 8)
+  const peachView = props.homeContext?.peach_view_of_user ?? []
+  const personalized = props.homeContext?.personalized_prompts ?? []
 
   return (
     <div className={isBlankConversation ? 'chat-home' : 'chat-home chatting'}>
@@ -2417,9 +2521,21 @@ function PeachWorkspace(props: {
           <p>我是专属于你的求职搭子</p>
         </div>
         <div className="bubble-group">
+          <PeachViewOfUser items={peachView} onProfile={props.onOpenProfile} />
           <div className="bubble-grid fixed-bubbles">
             {bubbleItems.map((item) => (
-              <button key={item} type="button" onClick={() => props.onQuickSend(item)}>{item}</button>
+              <button
+                className={personalized.includes(item) ? 'personalized' : ''}
+                key={item}
+                type="button"
+                onClick={() => {
+                  if (/继续|专项训练|练一下|练练/.test(item)) props.onStartTraining(item)
+                  else props.onQuickSend(item)
+                }}
+              >
+                {personalized.includes(item) ? <span>为你推荐</span> : null}
+                {item}
+              </button>
             ))}
           </div>
         </div>
@@ -2477,6 +2593,8 @@ function InterviewSetup({
 }) {
   const isBank = kind === 'question-bank'
   const title = isBank ? '面试题库练习' : '模拟面试'
+  const targetedTraining = isBank && /(专项训练|继续|练一下|练练|深挖|决策|归因|业务价值)/.test(settings.questionBank)
+  const trainingFocus = targetedTraining ? settings.questionBank.split(/[：:]/)[0] : ''
 
   return (
     <section className="setup-panel">
@@ -2493,6 +2611,19 @@ function InterviewSetup({
           </div>
         </div>
       </div>
+
+      {targetedTraining ? (
+        <section className="targeted-training-card">
+          <span>专项训练确认</span>
+          <strong>{trainingFocus || '项目深挖专项训练'}</strong>
+          <p>桃子会结合你的当前简历、历史回答和成长问题，连续追问 3-5 题。</p>
+          <div>
+            <small>决策依据</small>
+            <small>数据结果</small>
+            <small>业务价值</small>
+          </div>
+        </section>
+      ) : null}
 
       <div className="setup-grid">
         {isBank ? (
@@ -2780,6 +2911,41 @@ function LiveInterview({
   )
 }
 
+function PeachViewOfUser({
+  items,
+  onProfile,
+}: {
+  items: Array<{ label: string; value: string }>
+  onProfile: () => void
+}) {
+  if (!items.length) {
+    return (
+      <section className="peach-view-card empty">
+        <strong>桃子还在认识你</strong>
+        <p>和我聊聊你的求职目标、上传简历，或者完成一次模拟面试后，这里会逐渐形成属于你的求职画像。</p>
+        <button type="button" onClick={onProfile}>完善个人档案</button>
+      </section>
+    )
+  }
+
+  return (
+    <section className="peach-view-card">
+      <div className="peach-view-head">
+        <strong>桃子眼中的你</strong>
+        <span>我会随着我们的对话和练习越来越了解你</span>
+      </div>
+      <div className="peach-view-list">
+        {items.slice(0, 6).map((item) => (
+          <article key={`${item.label}-${item.value}`}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function ProfileWorkspace({
   profile,
   folders,
@@ -2802,6 +2968,8 @@ function ProfileWorkspace({
   onUploadFile,
   onApproveAction,
   onDismissAction,
+  onStartTraining,
+  onOpenGrowth,
 }: {
   profile: Profile
   folders: ResumeFolder[]
@@ -2824,6 +2992,8 @@ function ProfileWorkspace({
   onUploadFile: (file: File) => void
   onApproveAction: (action: AgentToolProposal) => void
   onDismissAction: (action: AgentToolProposal) => void
+  onStartTraining: (prompt: string) => void
+  onOpenGrowth: () => void
 }) {
   const current = profileSectionMeta[activeSection]
   const sectionItems = flattenResumeFolders(folders)
@@ -2906,7 +3076,13 @@ function ProfileWorkspace({
               </article>
 
               {selectedReport ? (
-                <InterviewReportPanel interview={selectedReport} profile={profile} onDownload={() => downloadInterviewReport(selectedReport, profile)} />
+                <InterviewReportPanel
+                  interview={selectedReport}
+                  profile={profile}
+                  onDownload={() => downloadInterviewReport(selectedReport, profile)}
+                  onStartTraining={onStartTraining}
+                  onOpenGrowth={onOpenGrowth}
+                />
               ) : null}
 
               <article className="profile-review-upload">
@@ -3018,10 +3194,14 @@ function InterviewReportPanel({
   interview,
   profile,
   onDownload,
+  onStartTraining,
+  onOpenGrowth,
 }: {
   interview: Dashboard['recent_interviews'][number]
   profile: Profile
   onDownload: () => void
+  onStartTraining: (prompt: string) => void
+  onOpenGrowth: () => void
 }) {
   const report = normalizeInterviewReport(interview.report, interview, profile)
   return (
@@ -3070,7 +3250,175 @@ function InterviewReportPanel({
           </section>
         ))}
       </div>
+      <ReportGrowthLoop report={report} onStartTraining={onStartTraining} onOpenGrowth={onOpenGrowth} />
     </article>
+  )
+}
+
+function ReportGrowthLoop({
+  report,
+  onStartTraining,
+  onOpenGrowth,
+}: {
+  report: Required<InterviewReport>
+  onStartTraining: (prompt: string) => void
+  onOpenGrowth: () => void
+}) {
+  const hasLoop = Boolean(report.growth_findings?.length || report.memory_updates?.length || report.next_actions?.length)
+  if (!hasLoop) return null
+  const primaryAction = report.next_actions?.[0]
+  return (
+    <section className="report-growth-loop">
+      <div>
+        <strong>这次面试，桃子发现了什么</strong>
+        {(report.growth_findings ?? []).length ? (report.growth_findings ?? []).slice(0, 3).map((item) => (
+          <article key={`${item.title}-${item.status}`}>
+            <span>{growthStatusLabel(item.status)} · 出现 {item.occurrence_count} 次</span>
+            <b>{item.title}</b>
+            <p>{item.description}</p>
+          </article>
+        )) : <p>这场暂时没有形成新的持续性问题。</p>}
+      </div>
+      <div>
+        <strong>桃子更新了对你的了解</strong>
+        {(report.memory_updates ?? []).length ? (report.memory_updates ?? []).slice(0, 4).map((item) => (
+          <article key={`${item.id ?? item.content}`}>
+            <span>{item.status || 'active'}</span>
+            <p>{item.content}</p>
+          </article>
+        )) : <p>本次没有新增长期记忆变化。</p>}
+      </div>
+      <div>
+        <strong>下一步怎么练</strong>
+        {(report.next_actions ?? []).length ? (report.next_actions ?? []).slice(0, 3).map((item, index) => (
+          <article className={index === 0 ? 'primary' : ''} key={item.id || item.title}>
+            <span>{index === 0 ? '最值得先练' : '建议行动'}</span>
+            <b>{item.title}</b>
+            <p>{item.description}</p>
+          </article>
+        )) : <p>可以先复练自我介绍，再进入完整 Mock。</p>}
+      </div>
+      <div className="report-growth-cta">
+        <button type="button" onClick={() => onStartTraining(primaryAction?.title || '项目深挖专项训练')}>
+          针对本次薄弱点继续训练
+        </button>
+        <button type="button" onClick={onOpenGrowth}>查看我的成长中心</button>
+      </div>
+    </section>
+  )
+}
+
+function GrowthWorkspace({
+  profile,
+  growth,
+  onStartTraining,
+}: {
+  profile: Profile
+  growth?: GrowthCenter
+  onStartTraining: (prompt: string) => void
+}) {
+  const data = growth ?? emptyGrowthCenter(profile)
+  const topAbility = [...data.abilities]
+    .filter((item) => item.current_score !== null)
+    .sort((a, b) => (b.gap ?? 0) - (a.gap ?? 0))[0]
+
+  return (
+    <section className="growth-workspace">
+      <header className="growth-hero">
+        <div>
+          <p>成长中心</p>
+          <h1>你现在在哪里，下一步练什么</h1>
+          <span>{data.target.company ? `${data.target.company} · ` : ''}{data.target.role || profile.target_role}</span>
+        </div>
+        <div className="readiness-card">
+          <span>岗位准备度</span>
+          <strong>{data.readiness_score ? `${data.readiness_score}%` : '待评估'}</strong>
+          <small>{data.target.jd_status || '当前按照产品经理通用能力模型评估'}</small>
+        </div>
+      </header>
+
+      <div className="growth-grid">
+        <section className="growth-card ability-gap-card">
+          <div className="growth-card-head">
+            <strong>能力 Gap</strong>
+            <span>{data.stats.ability_evidence_count ? `${data.stats.ability_evidence_count} 条证据` : '数据不足'}</span>
+          </div>
+          <div className="ability-list">
+            {data.abilities.map((ability) => (
+              <article key={ability.dimension}>
+                <div>
+                  <strong>{ability.label}</strong>
+                  <span>{ability.evidence_count ? `${ability.current_score} / ${ability.target_score}` : '待进一步评估'}</span>
+                </div>
+                <div className="ability-bar">
+                  <i style={{ width: `${ability.current_score ?? 8}%` }} />
+                </div>
+                <small>{abilityStatusLabel(ability.status)} · {ability.confidence_level}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="growth-card next-training-card">
+          <div className="growth-card-head">
+            <strong>下一步最值得练</strong>
+            <span>{topAbility?.label || '项目深挖'}</span>
+          </div>
+          <h2>{data.recommendation?.title || '项目深挖专项训练'}</h2>
+          <p>{data.recommendation?.description || '先围绕为什么做、如何决策、指标结果和业务价值连续追问。'}</p>
+          <button type="button" onClick={() => onStartTraining(data.recommendation?.title || '项目深挖专项训练')}>开始专项训练</button>
+        </section>
+
+        <section className="growth-card trend-card">
+          <div className="growth-card-head">
+            <strong>成长趋势</strong>
+            <span>全部</span>
+          </div>
+          {data.trend.length ? (
+            <div className="trend-line">
+              {data.trend.map((point) => (
+                <article key={`${point.label}-${point.score}`}>
+                  <span style={{ height: `${Math.max(12, point.score)}%` }} />
+                  <small>{point.label}</small>
+                  <b>{point.score}</b>
+                </article>
+              ))}
+            </div>
+          ) : <p>完成一次模拟面试后，这里会出现真实趋势。</p>}
+        </section>
+
+        <section className="growth-card issue-card">
+          <div className="growth-card-head">
+            <strong>已攻克 / 正在提升 / 新发现</strong>
+            <span>{data.stats.tracked_issue_count} 个问题</span>
+          </div>
+          <IssueColumn title="已攻克" items={data.issues.solved} />
+          <IssueColumn title="正在提升" items={data.issues.improving} />
+          <IssueColumn title="新发现" items={data.issues.new} />
+        </section>
+
+        <section className="growth-card insight-card">
+          <div className="growth-card-head">
+            <strong>桃子最近发现</strong>
+            <span>基于真实证据</span>
+          </div>
+          {data.insights.length ? data.insights.slice(0, 3).map((item) => (
+            <p key={item.id || item.content}>{item.content}</p>
+          )) : <p>多聊几次、完成一次模拟面试后，桃子会沉淀更可靠的观察。</p>}
+        </section>
+      </div>
+    </section>
+  )
+}
+
+function IssueColumn({ title, items }: { title: string; items: GrowthIssue[] }) {
+  return (
+    <div className="issue-column">
+      <strong>{title}</strong>
+      {items.length ? items.slice(0, 4).map((item) => (
+        <span key={item.id}>{item.title}</span>
+      )) : <p>暂无</p>}
+    </div>
   )
 }
 
@@ -4454,6 +4802,10 @@ function normalizeInterviewReport(report: InterviewReport | undefined, interview
       candidate_transcript: interview.transcript.find((item) => item.role === 'candidate')?.content || '暂无候选人回答转文字。',
       sample_answer: '建议用“我是谁 + 相关经历 + 结果证据 + 为什么匹配岗位”四段式回答。',
     }],
+    growth_findings: report?.growth_findings ?? [],
+    memory_updates: report?.memory_updates ?? [],
+    next_actions: report?.next_actions ?? [],
+    growth_insights: report?.growth_insights ?? [],
   }
 }
 
@@ -4479,6 +4831,61 @@ function scoreLevel(score: number) {
 
 function scorePercentile(score: number) {
   return Math.max(35, Math.min(95, Math.round(score * 0.86)))
+}
+
+function growthStatusLabel(status: string) {
+  if (status === 'solved' || status === 'resolved') return '已攻克'
+  if (status === 'improving') return '持续提升中'
+  if (status === 'new') return '新发现'
+  return '持续关注'
+}
+
+function abilityStatusLabel(status: GrowthCenter['abilities'][number]['status']) {
+  const labels = {
+    pending: '待评估',
+    achieved: '已达标',
+    close: '接近目标',
+    improve: '待提升',
+    priority: '重点提升',
+  }
+  return labels[status] ?? '待评估'
+}
+
+function emptyGrowthCenter(profile: Profile): GrowthCenter {
+  const abilities: GrowthCenter['abilities'] = [
+    ['product_thinking', '产品思维', 80],
+    ['user_insight', '用户洞察', 80],
+    ['requirement_analysis', '需求分析', 80],
+    ['data_analysis', '数据分析', 82],
+    ['project_deep_dive', '项目深挖', 82],
+    ['project_management', '项目推进', 78],
+    ['business_judgment', '商业判断', 76],
+    ['structured_expression', '结构化表达', 75],
+  ].map(([dimension, label, target]) => ({
+    dimension: String(dimension),
+    label: String(label),
+    current_score: null,
+    target_score: Number(target),
+    gap: null,
+    status: 'pending',
+    confidence_level: '待评估',
+    evidence_count: 0,
+  }))
+  return {
+    target: { role: profile.target_role || '产品经理', company: profile.target_company, jd_status: '当前按照产品经理通用能力模型评估' },
+    readiness_score: 0,
+    abilities,
+    trend: [],
+    issues: { solved: [], improving: [], new: [] },
+    insights: [],
+    recommendation: {
+      id: 'default-growth-action',
+      title: '项目深挖专项训练',
+      description: '完成一次模拟面试后，桃子会基于真实问题推荐更精准的专项训练。',
+      target_ability: 'project_deep_dive',
+    },
+    stats: { ability_evidence_count: 0, tracked_issue_count: 0, solved_issue_count: 0 },
+  }
 }
 
 function formatInterviewReportTitle(interview: Dashboard['recent_interviews'][number], profile: Profile) {
@@ -4702,12 +5109,14 @@ function personalGreeting(profile: Profile) {
 function moduleNotice(module: PrimaryModule) {
   if (module === 'peach') return '已进入桃子。'
   if (module === 'profile') return '已进入个人档案。'
+  if (module === 'growth') return '已进入成长中心。'
   return '已进入求职知识库。'
 }
 
 function workspaceKicker(module: PrimaryModule, panel: PeachPanel) {
   if (module === 'profile') return '个人档案'
   if (module === 'knowledge') return '求职知识库'
+  if (module === 'growth') return '成长中心'
   if (panel === 'interview-setup') return '模拟面试'
   if (panel === 'question-bank-setup') return '面试题库练习'
   if (panel === 'live-interview') return '实时对话'
@@ -4717,6 +5126,7 @@ function workspaceKicker(module: PrimaryModule, panel: PeachPanel) {
 function workspaceTitle(module: PrimaryModule, panel: PeachPanel) {
   if (module === 'profile') return '简历、经历和复盘都在这里'
   if (module === 'knowledge') return '管理你的求职资料和收藏'
+  if (module === 'growth') return '你现在在哪里，下一步练什么'
   if (panel === 'interview-setup') return '配置一场真实感面试'
   if (panel === 'question-bank-setup') return '按题库连续练习'
   if (panel === 'live-interview') return '面试正在进行'

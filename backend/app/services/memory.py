@@ -52,6 +52,46 @@ MEMORY_KIND_WEIGHTS = {
     "knowledge_fact": 0.55,
     "episodic_summary": 0.45,
 }
+TASK_KIND_BOOSTS = {
+    "mock_interview": {
+        "job_goal": 0.16,
+        "target_company": 0.14,
+        "project_signal": 0.15,
+        "interview_pattern": 0.14,
+        "weakness": 0.14,
+        "resume_signal": 0.08,
+    },
+    "resume_generation": {
+        "project_signal": 0.16,
+        "resume_signal": 0.16,
+        "skill_signal": 0.12,
+        "profile_fact": 0.1,
+        "job_goal": 0.08,
+        "weakness": -0.08,
+    },
+    "resume_optimization": {
+        "resume_signal": 0.16,
+        "project_signal": 0.12,
+        "skill_signal": 0.1,
+        "weakness": 0.06,
+        "job_goal": 0.06,
+    },
+    "home_context": {
+        "job_goal": 0.15,
+        "project_signal": 0.12,
+        "resume_signal": 0.1,
+        "skill_signal": 0.1,
+        "weakness": 0.12,
+        "interview_pattern": 0.1,
+        "preference": 0.08,
+    },
+    "growth_analysis": {
+        "weakness": 0.16,
+        "interview_pattern": 0.16,
+        "project_signal": 0.08,
+        "job_goal": 0.08,
+    },
+}
 SUPERSEDING_KINDS = {"job_goal", "target_company"}
 ACTIVE_MEMORY_STATUS = "active"
 ARCHIVED_MEMORY_STATUS = "archived"
@@ -162,6 +202,7 @@ class PeachMemoryService:
         user_id: str,
         top_k: int = MEMORY_LIMIT,
         filters: dict[str, Any] | None = None,
+        task_type: str = "chat",
         explain: bool = False,
         touch: bool = False,
     ) -> dict[str, list[dict[str, Any]]]:
@@ -178,13 +219,13 @@ class PeachMemoryService:
         query_bm25_terms = bm25_terms(query)
 
         scored = [
-            score_memory(memory, query, query_terms, query_bm25_terms, query_entities, explain=explain)
+            score_memory(memory, query, query_terms, query_bm25_terms, query_entities, task_type=task_type, explain=explain)
             for memory in memories
         ]
         scored = [item for item in scored if item.score > 0]
         if not scored:
             scored = [
-                score_memory(memory, query, query_terms, query_bm25_terms, query_entities, explain=explain, fallback=True)
+                score_memory(memory, query, query_terms, query_bm25_terms, query_entities, task_type=task_type, explain=explain, fallback=True)
                 for memory in memories[: min(top_k, 3)]
             ]
 
@@ -316,7 +357,7 @@ class PeachMemoryService:
             existing.tags = merge_lists(existing.tags or [], candidate.tags)
             existing.memory_metadata = {
                 **merge_metadata(existing.memory_metadata or {}, candidate.metadata),
-                "status": ACTIVE_MEMORY_STATUS,
+                "status": str(candidate.metadata.get("status") or ACTIVE_MEMORY_STATUS),
                 "superseded_by": "",
             }
             event = "UPDATE" if normalize_text(old_content) != normalize_text(existing.content) else "NONE"
@@ -348,7 +389,7 @@ class PeachMemoryService:
                 "text_terms": sorted(tokenize(candidate.content))[:80],
                 "bm25_terms": bm25_terms(candidate.content)[:80],
                 "schema": "peach_memory_v2",
-                "status": ACTIVE_MEMORY_STATUS,
+                "status": str(candidate.metadata.get("status") or ACTIVE_MEMORY_STATUS),
                 "supersedes": [item.id for item in superseded],
             },
         )
@@ -520,9 +561,10 @@ async def retrieve_relevant_memories(
     user_id: str,
     query: str,
     limit: int = MEMORY_LIMIT,
+    task_type: str = "chat",
 ) -> list[AgentMemory]:
     service = PeachMemoryService(session)
-    result = await service.search(query, user_id=user_id, top_k=limit)
+    result = await service.search(query, user_id=user_id, top_k=limit, task_type=task_type)
     ids = [item["id"] for item in result["results"]]
     if not ids:
         return []
@@ -662,6 +704,7 @@ def score_memory(
     query_bm25_terms: list[str],
     query_entities: dict[str, list[str]],
     *,
+    task_type: str = "chat",
     explain: bool = False,
     fallback: bool = False,
 ) -> ScoredMemory:
@@ -673,6 +716,14 @@ def score_memory(
     confidence = (memory.confidence or 70) / 100
     recency = recency_score(memory.updated_at)
     usage = min(memory.use_count or 0, 10) / 10
+    metadata = memory.memory_metadata or {}
+    status = str(metadata.get("status") or ACTIVE_MEMORY_STATUS)
+    stability = str(metadata.get("stability") or default_stability(memory.kind))
+    evidence_count = clamp_int(metadata.get("evidence_count"), 0, 8, default=1)
+    status_boost = memory_status_boost(status)
+    stability_boost = memory_stability_boost(stability, task_type)
+    evidence_boost = min(evidence_count, 5) / 5 * 0.04
+    task_boost = TASK_KIND_BOOSTS.get(task_type, {}).get(memory.kind, 0.0)
 
     if fallback:
         semantic = max(semantic, 0.05)
@@ -685,8 +736,14 @@ def score_memory(
         + kind * 0.08
         + confidence * 0.06
         + recency * 0.06
-        + usage * 0.04
+        + usage * 0.015
+        + status_boost
+        + stability_boost
+        + evidence_boost
+        + task_boost
     )
+    if status in {ARCHIVED_MEMORY_STATUS, "superseded", "resolved"}:
+        score *= 0.25
     if query and normalize_text(query) in normalize_text(memory.content):
         score += 0.12
     score = min(score, 1.0)
@@ -698,6 +755,10 @@ def score_memory(
         "confidence": round(confidence, 4),
         "recency": round(recency, 4),
         "usage": round(usage, 4),
+        "status": round(status_boost, 4),
+        "stability": round(stability_boost, 4),
+        "evidence": round(evidence_boost, 4),
+        "task": round(task_boost, 4),
         "final": round(score, 4),
     }
     return ScoredMemory(memory=memory, score=score, details=details if explain else {})
@@ -887,6 +948,36 @@ def merge_memory_text(left: str, right: str) -> str:
 
 def is_archived_memory(memory: AgentMemory) -> bool:
     return (memory.memory_metadata or {}).get("status") == ARCHIVED_MEMORY_STATUS
+
+
+def default_stability(kind: str) -> str:
+    if kind in {"profile_fact", "project_signal", "resume_signal", "skill_signal", "knowledge_fact"}:
+        return "stable"
+    if kind in {"job_goal", "target_company", "weakness", "interview_pattern", "preference"}:
+        return "dynamic"
+    return "ephemeral" if kind == "plan" else "dynamic"
+
+
+def memory_status_boost(status: str) -> float:
+    if status == "active":
+        return 0.08
+    if status == "improving":
+        return 0.06
+    if status == "resolved":
+        return -0.12
+    if status in {"superseded", ARCHIVED_MEMORY_STATUS}:
+        return -0.2
+    return 0.02
+
+
+def memory_stability_boost(stability: str, task_type: str) -> float:
+    if stability == "stable":
+        return 0.04 if task_type in {"resume_generation", "resume_optimization", "mock_interview"} else 0.02
+    if stability == "dynamic":
+        return 0.04 if task_type in {"home_context", "mock_interview", "growth_analysis"} else 0.02
+    if stability == "ephemeral":
+        return 0.03 if task_type == "home_context" else -0.04
+    return 0.0
 
 
 def can_supersede_existing_memory(candidate: MemoryCandidate) -> bool:
