@@ -393,7 +393,7 @@ function App() {
 
   const api = useCallback(async <T,>(path: string, options?: RequestInit): Promise<T> => {
     setError('')
-    const response = await fetch(`${API_BASE}${path}`, {
+    return fetchJsonWithRetry<T>(`${API_BASE}${path}`, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
@@ -401,8 +401,6 @@ function App() {
         ...(options?.headers ?? {}),
       },
     })
-    if (!response.ok) throw new Error(await responseErrorMessage(response))
-    return response.json()
   }, [account?.username])
 
   const uploadApi = useCallback(async <T,>(path: string, file: File, fields: Record<string, string> = {}): Promise<T> => {
@@ -557,7 +555,7 @@ function App() {
   }, [mediaStream])
 
   const accountRequest = useCallback(async (path: string, username?: string) => {
-    const response = await fetch(`${API_BASE}${path}`, {
+    return fetchJsonWithRetry<{ account: Account; profile?: Profile }>(`${API_BASE}${path}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -565,8 +563,6 @@ function App() {
       },
       body: username ? JSON.stringify({ username }) : undefined,
     })
-    if (!response.ok) throw new Error(await responseErrorMessage(response))
-    return response.json() as Promise<{ account: Account; profile?: Profile }>
   }, [])
 
   const enterAccount = useCallback((nextAccount: Account) => {
@@ -913,7 +909,8 @@ function App() {
     } catch (err) {
       removeSystemMessage('桃子正在回复。')
       setInput(snapshot)
-      setError('桃子刚刚掉线了一下，内容已经放回输入框。')
+      const detail = err instanceof Error ? err.message : ''
+      setError(detail ? `桃子刚刚卡了一下：${detail}。内容已经放回输入框。` : '桃子刚刚掉线了一下，内容已经放回输入框。')
       console.error(err)
     } finally {
       end('chat')
@@ -3873,6 +3870,9 @@ function ToolApprovalCard({
   const status = action.status ?? 'pending'
   const done = status === 'approved' || status === 'dismissed'
   const [detailOpen, setDetailOpen] = useState(false)
+  const draftDetail = useMemo(() => buildPendingToolActionDetail(action), [action])
+  const visibleDetail = action.result ?? draftDetail
+  const detailLabel = action.result ? '改动' : '草案'
   const statusLabel: Record<AgentActionStatus, string> = {
     pending: '待确认',
     executing: '执行中',
@@ -3889,27 +3889,27 @@ function ToolApprovalCard({
       </div>
       <div className="tool-approval-actions">
         <small>{statusLabel[status]}</small>
-        {status === 'approved' && action.result ? (
-          <button type="button" onClick={() => setDetailOpen(true)}>改动</button>
+        {visibleDetail ? (
+          <button type="button" onClick={() => setDetailOpen(true)}>{detailLabel}</button>
         ) : null}
         {!done ? <button type="button" onClick={onDismiss} disabled={status === 'executing'}>取消</button> : null}
         {!done ? <button type="button" className="primary" onClick={onApprove} disabled={status === 'executing'}>{status === 'executing' ? '执行中' : '确认'}</button> : null}
       </div>
-      {detailOpen && action.result ? (
+      {detailOpen && visibleDetail ? (
         <div className="tool-change-overlay" role="presentation" onClick={() => setDetailOpen(false)}>
-          <section className="tool-change-dialog" role="dialog" aria-modal="true" aria-label="改动内容" onClick={(event) => event.stopPropagation()}>
+          <section className="tool-change-dialog" role="dialog" aria-modal="true" aria-label={action.result ? '改动内容' : '待确认草案'} onClick={(event) => event.stopPropagation()}>
             <header>
-              <span>改动内容</span>
-              <button type="button" onClick={() => setDetailOpen(false)} aria-label="关闭改动内容">×</button>
+              <span>{action.result ? '改动内容' : '待确认草案'}</span>
+              <button type="button" onClick={() => setDetailOpen(false)} aria-label="关闭弹窗">×</button>
             </header>
-            <strong>{action.result.title}</strong>
-            <p>{action.result.summary}</p>
-            {action.result.items.length ? (
+            <strong>{visibleDetail.title}</strong>
+            <p>{visibleDetail.summary}</p>
+            {visibleDetail.items.length ? (
               <ul>
-                {action.result.items.map((item) => <li key={item}>{item}</li>)}
+                {visibleDetail.items.map((item) => <li key={item}>{item}</li>)}
               </ul>
             ) : null}
-            {action.result.content ? <pre>{action.result.content}</pre> : null}
+            {visibleDetail.content ? <pre>{visibleDetail.content}</pre> : null}
           </section>
         </div>
       ) : null}
@@ -3979,6 +3979,50 @@ function normalizeAgentActions(actions?: AgentToolProposal[]) {
       payload: action.payload ?? {},
       approval_required: action.approval_required ?? true,
     }))
+}
+
+function buildPendingToolActionDetail(action: AgentToolProposal): ToolActionDetail | null {
+  if (action.tool === 'unsupported' || action.tool === 'start_interview' || action.tool === 'finish_latest_interview') return null
+
+  const payload = action.payload ?? {}
+  const content = String(payload.preview ?? payload.content ?? '').trim()
+  const diff = Array.isArray(payload.diff_summary)
+    ? payload.diff_summary.map((item) => String(item)).filter(Boolean)
+    : []
+  const reason = String(payload.reason ?? '').trim()
+  const items = diff.length ? diff : pendingActionItems(action)
+  if (!content && !items.length && !reason) return null
+
+  return {
+    title: `${action.title}草案`,
+    summary: reason || action.summary || '这是桃子本次已经生成好的可保存草案，确认后会直接写入，不再二次生成。',
+    items,
+    content: content ? excerpt(content, 1200) : '',
+  }
+}
+
+function pendingActionItems(action: AgentToolProposal) {
+  const payload = action.payload ?? {}
+  if (action.tool === 'update_profile_fields') {
+    return Object.keys(readPayloadFields(payload)).map((key) => `准备更新字段：${key}`)
+  }
+  if (action.tool === 'update_resume') {
+    const mode = String(payload.mode || 'append') === 'replace' ? '替换完整简历' : '追加到完整简历'
+    return [mode, `草案字数：${String(payload.content ?? '').trim().length}`]
+  }
+  if (action.tool === 'append_profile_note') {
+    return [`写入分区：${String(payload.title || '个人档案')}`, `新增字数：${String(payload.content ?? '').trim().length}`]
+  }
+  if (action.tool === 'add_knowledge_item') {
+    return [`新增资料：${String(payload.title || '求职资料')}`, `摘要：${String(payload.summary || '暂无摘要')}`]
+  }
+  if (action.tool === 'update_knowledge_item') {
+    return ['更新知识库资料']
+  }
+  if (action.tool === 'delete_knowledge_item') {
+    return [`删除资料 ID：${String(payload.id || '未提供')}`]
+  }
+  return []
 }
 
 function buildToolActionDetail(
@@ -4357,6 +4401,31 @@ async function responseErrorMessage(response: Response) {
     return text || response.statusText
   }
   return text || response.statusText
+}
+
+async function fetchJsonWithRetry<T>(url: string, options: RequestInit, retries = 1): Promise<T> {
+  try {
+    const response = await fetch(url, options)
+    if (!response.ok) throw new Error(await responseErrorMessage(response))
+    return response.json() as Promise<T>
+  } catch (err) {
+    if (retries > 0 && isNetworkFetchError(err)) {
+      await wait(450)
+      return fetchJsonWithRetry<T>(url, options, retries - 1)
+    }
+    if (isNetworkFetchError(err)) {
+      throw new Error(`Failed to fetch ${url}`)
+    }
+    throw err
+  }
+}
+
+function isNetworkFetchError(err: unknown) {
+  return err instanceof TypeError && /fetch/i.test(err.message)
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
 function fileUploadErrorMessage(err: unknown) {

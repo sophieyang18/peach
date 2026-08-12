@@ -24,7 +24,7 @@ from backend.app.schemas import (
 )
 from backend.app.services.agent import PeachAgent
 from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
-from backend.app.services.memory import build_memory_context, remember_interaction, retrieve_relevant_memories
+from backend.app.services.memory import build_memory_context, remember_interaction, retrieve_relevant_memories, upsert_memory
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
@@ -486,7 +486,13 @@ async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) ->
 async def agent_actions(payload: AgentActionIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
     memory_context = await relevant_memory_context(session, profile, payload.message)
-    planned = await agent.plan_actions(profile, payload.message, payload.context, memory_context)
+    try:
+        planned = await agent.plan_actions(profile, payload.message, payload.context, memory_context)
+    except Exception:
+        planned = {
+            "reply": "我在。刚刚有点卡，我们先继续聊，你可以直接说想练面试、改简历，还是补充档案。",
+            "actions": [],
+        }
     await remember_interaction(
         session,
         agent,
@@ -540,10 +546,6 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         for key, value in fields.items():
             if key in allowed:
                 setattr(profile, key, str(value))
-        init = await agent.initialize_profile(profile)
-        profile.strengths = init.get("strengths", profile.strengths or [])
-        profile.weak_points = init.get("weak_points", profile.weak_points or [])
-        profile.plan = init.get("plan", profile.plan or [])
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(session, profile, payload.tool, data, "个人信息已更新。")
@@ -903,16 +905,35 @@ async def remember_approved_action(
     payload: dict,
     message: str,
 ) -> None:
-    await remember_interaction(
+    summary = action_memory_summary(tool, payload, message)
+    if not summary:
+        return
+    await upsert_memory(
         session,
-        agent,
-        profile,
-        source=f"approved_action:{tool}",
-        user_message=str(payload)[:5000],
-        assistant_reply=message,
-        context={"approved_tool": tool},
+        profile.id,
+        {
+            "kind": "episodic_summary",
+            "content": summary,
+            "source": f"approved_action:{tool}",
+            "confidence": 75,
+            "tags": ["approved_action", tool],
+        },
     )
-    await session.commit()
+
+
+def action_memory_summary(tool: str, payload: dict, message: str) -> str:
+    if tool == "update_resume":
+        mode = str(payload.get("mode") or "append")
+        return f"用户确认{'替换' if mode == 'replace' else '追加'}完整简历，内容摘要：{str(payload.get('content') or '')[:180]}"
+    if tool == "append_profile_note":
+        title = str(payload.get("title") or "个人档案")
+        return f"用户确认补充{title}，内容摘要：{str(payload.get('content') or '')[:180]}"
+    if tool == "update_profile_fields":
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else payload
+        return f"用户确认更新个人档案字段：{', '.join(str(key) for key in fields.keys())[:160]}"
+    if tool == "add_knowledge_item":
+        return f"用户确认新增知识库资料：{str(payload.get('title') or '求职资料')[:120]}"
+    return message[:220]
 
 
 async def ensure_default_folders(session: AsyncSession, user_id: str) -> list[KnowledgeFolder]:
@@ -1018,14 +1039,92 @@ def normalize_tool_action(action: dict, index: int) -> dict:
             "payload": {},
             "approval_required": True,
         }
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    payload = normalize_action_payload(tool, payload)
     return {
         "id": str(action.get("id") or f"{tool}-{index}"),
         "tool": tool,
         "title": str(action.get("title") or "待确认动作"),
         "summary": str(action.get("summary") or "确认后桃子会执行这个动作。"),
-        "payload": action.get("payload") if isinstance(action.get("payload"), dict) else {},
+        "payload": payload,
         "approval_required": bool(action.get("approval_required", True)),
     }
+
+
+def normalize_action_payload(tool: str, payload: dict) -> dict:
+    normalized = dict(payload)
+    if tool not in {
+        "update_profile_fields",
+        "update_resume",
+        "append_profile_note",
+        "add_knowledge_item",
+        "update_knowledge_item",
+        "delete_knowledge_item",
+    }:
+        return normalized
+
+    normalized["write_policy"] = "confirm_only_no_llm"
+    normalized.setdefault("draft_ready", True)
+
+    if tool == "update_profile_fields":
+        fields = normalized.get("fields")
+        if not isinstance(fields, dict):
+            fields = {key: value for key, value in normalized.items() if key in {"name", "target_role", "target_company", "target_city", "stage", "communication_style"}}
+            normalized["fields"] = fields
+        normalized.setdefault("diff_summary", [f"更新字段：{key}" for key in fields.keys()])
+        normalized.setdefault("preview", "；".join(f"{key}={str(value)[:80]}" for key, value in fields.items()))
+
+    if tool == "update_resume":
+        content = str(normalized.get("content") or "").strip()
+        mode = str(normalized.get("mode") or "append")
+        normalized["mode"] = "replace" if mode == "replace" else "append"
+        normalized["content"] = content
+        normalized.setdefault(
+            "diff_summary",
+            [
+                "替换完整简历正文" if normalized["mode"] == "replace" else "追加到完整简历末尾",
+                f"草案字数：{len(content)}",
+            ],
+        )
+        normalized.setdefault("preview", content[:1200])
+
+    if tool == "append_profile_note":
+        content = str(normalized.get("content") or "").strip()
+        normalized["content"] = content
+        normalized.setdefault("section", "full")
+        normalized.setdefault("title", "个人档案")
+        normalized.setdefault(
+            "diff_summary",
+            [
+                f"写入分区：{normalized.get('title')}",
+                f"新增字数：{len(content)}",
+            ],
+        )
+        normalized.setdefault("preview", content[:1200])
+
+    if tool == "add_knowledge_item":
+        content = str(normalized.get("content") or "").strip()
+        normalized.setdefault("title", "求职资料")
+        normalized.setdefault("summary", content[:180])
+        normalized.setdefault(
+            "diff_summary",
+            [
+                f"新增资料：{normalized.get('title')}",
+                f"正文长度：{len(content)}",
+            ],
+        )
+        normalized.setdefault("preview", content[:1200] or str(normalized.get("summary") or ""))
+
+    if tool == "update_knowledge_item":
+        changed = [key for key in ["title", "summary", "content", "url"] if key in normalized]
+        normalized.setdefault("diff_summary", [f"更新知识库字段：{key}" for key in changed])
+        normalized.setdefault("preview", str(normalized.get("content") or normalized.get("summary") or "")[:1200])
+
+    if tool == "delete_knowledge_item":
+        normalized.setdefault("diff_summary", [f"删除资料 ID：{normalized.get('id') or '未提供'}"])
+        normalized.setdefault("preview", "确认后会从个人知识库移除这条资料。")
+
+    return normalized
 
 
 async def latest_interview(session: AsyncSession, user_id: str, active_only: bool) -> InterviewSession | None:

@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 HOST="${HOST:-127.0.0.1}"
+LOCAL_API_BASE_URL="${LOCAL_API_BASE_URL:-}"
+LOCAL_API_TARGET="${LOCAL_API_TARGET:-http://${HOST}:${BACKEND_PORT}}"
 CONDA_ENV="${CONDA_ENV:-peach}"
 FORCE_RESTART=false
 BACKEND_LOG="${ROOT_DIR}/.local/backend.log"
@@ -312,8 +314,12 @@ else
   mkdir -p "${ROOT_DIR}/.local"
   : > "${FRONTEND_LOG}"
   echo "Starting Peach frontend on http://${HOST}:${FRONTEND_PORT}"
+  echo "Frontend API base: ${LOCAL_API_BASE_URL:-same-origin /api proxy}"
+  echo "Frontend API proxy target: ${LOCAL_API_TARGET}"
   (
     cd "${ROOT_DIR}/frontend"
+    export VITE_API_BASE_URL="${LOCAL_API_BASE_URL}"
+    export VITE_DEV_API_TARGET="${LOCAL_API_TARGET}"
     "${PNPM_CMD[@]}" dev --host "${HOST}" --port "${FRONTEND_PORT}" --strictPort
   ) > "${FRONTEND_LOG}" 2>&1 &
   FRONTEND_PID="$!"

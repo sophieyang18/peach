@@ -121,9 +121,9 @@ class PeachAgent:
             json.dumps(fallback, ensure_ascii=False),
         )
         try:
-            return json.loads(content)
+            return sanitize_json_value(json.loads(content))
         except json.JSONDecodeError:
-            return fallback
+            return sanitize_json_value(fallback)
 
     async def initialize_profile(self, profile: UserProfile) -> dict[str, Any]:
         resume_text = profile.resume_text or ""
@@ -361,10 +361,15 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 
     async def plan_actions(self, profile: UserProfile, message: str, context: dict[str, Any], memory_context: str = "") -> dict[str, Any]:
         fallback = local_action_plan(profile, message, context)
+        if should_use_fast_local_action(message, context, fallback):
+            return sanitize_json_value(fallback)
         uploaded_file = context.get("uploaded_file") if isinstance(context, dict) else None
         prompt = f"""
 你正在和用户聊天。你可以正常回复，也可以在确实有帮助时提出待用户审批的工具动作。
 所有工具动作必须先让用户确认，不能直接执行。
+修改简历、修改档案、修改知识库这类动作必须在本次 JSON 里一次性给出最终可保存草案。用户确认后系统只做校验和写入，不会再调用大模型补写。
+所以 payload.content、payload.fields、payload.summary 等字段必须是确认后可以直接落库的内容，不能写“确认后再生成”“待后续整理”。
+修改类 payload 请尽量包含 diff_summary(list[str]) 和 preview(str)，说明将新增、删除、改写什么，方便用户确认前查看。
 不要为了显得智能而乱提动作。只有当用户明确表达要开始面试、结束面试、改档案、改简历、添加知识资料，或上传文件且意图明显时才提出动作。
 如果用户上传了文件，你要先判断文件更适合作为知识库资料、简历、项目/实习经历、面试题库还是 JD。可以同时提出 1-3 个动作，但必须解释每个动作会改哪里。
 如果前端上下文显示 current_panel 是 live-interview 或 interview_active 是 true，说明面试已经开始。此时不要再提出 start_interview，除非用户明确说重新开一场新的面试。
@@ -533,14 +538,15 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
                 "approval_required": True,
             }
         )
-    elif file_content and any(word in text for word in ["项目", "实习", "教育", "技能", "竞赛", "复盘", "档案", "经历"]):
+    elif (file_content or any(word in text for word in ["补到", "补充到", "写到", "加到", "加入", "放到"])) and any(word in text for word in ["项目", "实习", "教育", "技能", "竞赛", "复盘", "档案", "经历"]):
         section, title = infer_profile_section(text)
+        content = strip_profile_command_text(material, title)
         actions.append(
             {
                 "tool": "append_profile_note",
                 "title": f"补充{title}",
-                "summary": f"把上传文件整理后加入{title}，之后简历生成和面试会参考它。",
-                "payload": {"section": section, "title": title, "content": material[:12000], "reason": "用户上传材料用于补充档案"},
+                "summary": f"把这段材料加入{title}，之后简历生成和面试会参考它。",
+                "payload": {"section": section, "title": title, "content": content[:12000], "reason": "用户要求补充档案分区"},
                 "approval_required": True,
             }
         )
@@ -592,7 +598,7 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
             }
         )
 
-    reply = "我先帮你判断了一下，这件事可以直接变成一个可执行动作。你确认后我再动手。"
+    reply = "我在。你想先聊简历、模拟面试，还是把最近的求职卡点拆一下？"
     if interview_active and not actions:
         reply = "收到，这句话我会当作面试中的回答来处理。我们继续沿着当前面试追问，不会重新开一场。"
     elif actions:
@@ -602,6 +608,32 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
         "reply": reply,
         "actions": actions,
     }
+
+
+def should_use_fast_local_action(message: str, context: dict[str, Any], fallback: dict[str, Any]) -> bool:
+    actions = fallback.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return False
+    text = message.strip()
+    uploaded_file = context.get("uploaded_file") if isinstance(context, dict) else None
+    if uploaded_file:
+        return True
+    fast_markers = [
+        "补到",
+        "存起来",
+        "加入知识库",
+        "添加到知识库",
+        "记录一下",
+        "沉淀",
+        "改简历",
+        "优化简历",
+        "写简历",
+        "开始面试",
+        "模拟面试",
+        "结束面试",
+        "生成报告",
+    ]
+    return any(marker in text for marker in fast_markers)
 
 
 def infer_interviewer_style(text: str) -> str:
@@ -652,6 +684,17 @@ def infer_profile_section(text: str) -> tuple[str, str]:
     if "竞赛" in text or "比赛" in text:
         return "competition", "竞赛经历"
     return "full", "完整简历"
+
+
+def strip_profile_command_text(text: str, title: str) -> str:
+    cleaned = text.strip()
+    for marker in ["：", ":"]:
+        if marker in cleaned:
+            prefix, body = cleaned.split(marker, 1)
+            if any(word in prefix for word in ["补到", "补充到", "写到", "加到", "加入", "放到", title]):
+                cleaned = body.strip()
+                break
+    return cleaned or text.strip()
 
 
 def hydrate_uploaded_file_actions(actions: list[Any], uploaded_file: Any) -> list[Any]:
@@ -822,6 +865,9 @@ def sanitize_agent_text(value: str) -> str:
         "\u2014\u2014": "，",
         "\u2014": "，",
         "\u2013": "-",
+        "大猪猪": "同学",
+        "小猪猪": "同学",
+        "猪猪": "同学",
         "猪猪猪": "同学",
         "你是来面试产品经理，不是来给我猜谜语的": "这份简历信息还不够完整，我会用追问帮你补齐证据",
         "没反应就算你弃权": "我们直接进入第一题",
@@ -830,6 +876,16 @@ def sanitize_agent_text(value: str) -> str:
     for source, target in replacements.items():
         text = text.replace(source, target)
     return text.strip()
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_agent_text(value)
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_json_value(item) for key, item in value.items()}
+    return value
 
 
 def count_candidate_answers(transcript: list[dict[str, Any]]) -> int:
