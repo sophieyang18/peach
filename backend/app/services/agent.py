@@ -90,9 +90,11 @@ class PeachAgent:
             self.client = None
         return self.client
 
-    async def complete(self, messages: list[dict[str, str]], fallback: str) -> str:
+    async def complete(self, messages: list[dict[str, str]], fallback: str, allow_fallback: bool = True) -> str:
         client = self.get_client()
         if not client:
+            if not allow_fallback:
+                raise RuntimeError("LLM client is not configured")
             return fallback
 
         try:
@@ -101,14 +103,20 @@ class PeachAgent:
                 messages=[{"role": "system", "content": PEACH_PERSONA}, *messages],
                 temperature=0.7,
             )
-            return sanitize_agent_text(response.choices[0].message.content or fallback)
-        except Exception:
+            content = response.choices[0].message.content or ""
+            if not content.strip() and not allow_fallback:
+                raise RuntimeError("LLM returned an empty response")
+            return sanitize_agent_text(content or fallback)
+        except Exception as exc:
+            if not allow_fallback:
+                raise RuntimeError("LLM request failed") from exc
             return sanitize_agent_text(fallback)
 
     async def json_complete(
         self,
         messages: list[dict[str, str]],
         fallback: dict[str, Any],
+        allow_fallback: bool = True,
     ) -> dict[str, Any]:
         content = await self.complete(
             [
@@ -119,10 +127,13 @@ class PeachAgent:
                 },
             ],
             json.dumps(fallback, ensure_ascii=False),
+            allow_fallback=allow_fallback,
         )
         try:
             return sanitize_json_value(json.loads(content))
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            if not allow_fallback:
+                raise RuntimeError("LLM did not return valid JSON") from exc
             return sanitize_json_value(fallback)
 
     async def initialize_profile(self, profile: UserProfile) -> dict[str, Any]:
@@ -345,7 +356,6 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
         return await self.json_complete([{"role": "user", "content": prompt}], fallback)
 
     async def chat(self, profile: UserProfile, message: str, memory_context: str = "") -> str:
-        fallback = f"我在。你刚刚说“{message[:60]}”，我们先把这件事拆小一点：你现在最想解决的是准备题目、复盘表现，还是先缓一缓情绪？"
         prompt = f"""
 用户正在和求职搭子桃子聊天。
 用户：{profile.name}，目标：{profile.target_role}，阶段：{profile.stage}
@@ -357,12 +367,10 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 
 如果用户询问岗位推荐或投递节奏：只能基于桃子已导入的岗位池/用户给出的岗位表信息提出建议；不要引导用户跳转外部招聘社区、公司官网或其他站点自行搜索。
 """
-        return await self.complete([{"role": "user", "content": prompt}], fallback)
+        return await self.complete([{"role": "user", "content": prompt}], "", allow_fallback=False)
 
     async def plan_actions(self, profile: UserProfile, message: str, context: dict[str, Any], memory_context: str = "") -> dict[str, Any]:
         fallback = local_action_plan(profile, message, context)
-        if should_use_fast_local_action(message, context, fallback):
-            return sanitize_json_value(fallback)
         uploaded_file = context.get("uploaded_file") if isinstance(context, dict) else None
         prompt = f"""
 你正在和用户聊天。你可以正常回复，也可以在确实有帮助时提出待用户审批的工具动作。
@@ -410,11 +418,9 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 reply: string, 像桃子一样自然回复，简短说明建议
 actions: list, 每个动作包含 tool, title, summary, payload, approval_required
 """
-        data = await self.json_complete([{"role": "user", "content": prompt}], fallback)
+        data = await self.json_complete([{"role": "user", "content": prompt}], fallback, allow_fallback=False)
         if not isinstance(data.get("actions"), list):
             data["actions"] = []
-        if not data["actions"] and isinstance(fallback.get("actions"), list):
-            data["actions"] = fallback["actions"]
         if context.get("current_panel") == "live-interview" or context.get("interview_active"):
             allow_restart = any(word in message for word in ["重新开", "重开", "重新开始", "再开一场", "换一场"])
             user_requested_finish = any(word in message for word in ["结束面试", "停止面试", "生成报告", "面试报告", "结束并生成"])
@@ -433,7 +439,7 @@ actions: list, 每个动作包含 tool, title, summary, payload, approval_requir
 
     async def extract_memories(
         self,
-        profile: UserProfile,
+        profile: Any,
         source: str,
         user_message: str,
         assistant_reply: str,
@@ -441,7 +447,7 @@ actions: list, 每个动作包含 tool, title, summary, payload, approval_requir
     ) -> list[dict[str, Any]]:
         fallback: dict[str, Any] = {"memories": []}
         prompt = f"""
-你是桃子的长期记忆提取器。请从本轮互动中提取“未来跨会话有用”的少量记忆。
+你是桃子的长期记忆提取器。请从本轮互动中提取“未来跨会话有用”的少量记忆。桃子的目标是越用越懂用户，而不是把聊天流水账塞进长期记忆。
 
 只允许记住这些类型：
 profile_fact: 稳定个人背景事实，如学校、专业、经历方向，但不要保存手机号、邮箱、证件号等隐私。
@@ -454,8 +460,10 @@ episodic_summary: 某次重要互动的简短阶段总结。
 
 不要记住：
 一次性情绪宣泄、寒暄、无关闲聊、长篇原文、未经确认的猜测、敏感隐私、密码/密钥/联系方式。
+不要重复已有档案事实。目标岗位、目标公司、面试风格偏好发生变化时，只输出最新稳定表述，不要同时保留新旧两个目标。
+只有当信息对后续简历、面试、投递节奏或陪伴风格有帮助时才写入。
 如果没有值得长期保存的信息，输出空数组。
-最多 3 条，每条 content 8-120 字，必须是可复用的具体事实，不要写“用户说了很多”这种废话。
+最多 3 条，每条 content 8-120 字，必须是可复用的具体事实，不要写“用户说了很多”“用户很焦虑”这种废话。
 
 用户现有档案：
 姓名：{profile.name}
@@ -598,9 +606,9 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
             }
         )
 
-    reply = "我在。你想先聊简历、模拟面试，还是把最近的求职卡点拆一下？"
+    reply = ""
     if interview_active and not actions:
-        reply = "收到，这句话我会当作面试中的回答来处理。我们继续沿着当前面试追问，不会重新开一场。"
+        reply = "这句话会作为当前面试回答处理，不会重新开一场。"
     elif actions:
         reply = "我读完了，先给你整理成可确认的动作。你点确认后我再真正修改档案、简历或知识库。"
 
@@ -608,32 +616,6 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
         "reply": reply,
         "actions": actions,
     }
-
-
-def should_use_fast_local_action(message: str, context: dict[str, Any], fallback: dict[str, Any]) -> bool:
-    actions = fallback.get("actions")
-    if not isinstance(actions, list) or not actions:
-        return False
-    text = message.strip()
-    uploaded_file = context.get("uploaded_file") if isinstance(context, dict) else None
-    if uploaded_file:
-        return True
-    fast_markers = [
-        "补到",
-        "存起来",
-        "加入知识库",
-        "添加到知识库",
-        "记录一下",
-        "沉淀",
-        "改简历",
-        "优化简历",
-        "写简历",
-        "开始面试",
-        "模拟面试",
-        "结束面试",
-        "生成报告",
-    ]
-    return any(marker in text for marker in fast_markers)
 
 
 def infer_interviewer_style(text: str) -> str:

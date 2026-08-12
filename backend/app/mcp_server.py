@@ -22,7 +22,7 @@ from backend.app.api.routes import (
 )
 from backend.app.db import SessionLocal
 from backend.app.models import InterviewSession
-from backend.app.services.memory import remember_interaction
+from backend.app.services.memory import remember_interaction_isolated
 
 
 REQUIRED_TOOLS = {
@@ -177,17 +177,29 @@ async def peach_generate_resume(
             profile.target_role = target_role or profile.target_role
             profile.target_company = target_company or profile.target_company
             profile.resume_text = resume
-            await remember_interaction(
-                session,
+            await session.commit()
+            await session.refresh(profile)
+            await remember_interaction_isolated(
                 agent,
-                profile,
+                user_id=profile.id,
+                username=profile.username,
+                profile_snapshot={
+                    "name": profile.name,
+                    "target_role": profile.target_role,
+                    "target_company": profile.target_company,
+                    "target_city": profile.target_city,
+                    "stage": profile.stage,
+                    "resume_text": profile.resume_text,
+                    "communication_style": profile.communication_style,
+                    "strengths": list(profile.strengths or []),
+                    "weak_points": list(profile.weak_points or []),
+                    "plan": list(profile.plan or []),
+                },
                 source="mcp_resume_generation",
                 user_message=f"生成简历：{target_company} {target_role}\n{requirements}",
                 assistant_reply=resume,
                 context={"memory_context_used": memory_context},
             )
-            await session.commit()
-            await session.refresh(profile)
         return {"ok": True, "resume": resume, "saved": save_to_profile, "profile": serialize_profile(profile)}
 
     return await _with_user(username, run)

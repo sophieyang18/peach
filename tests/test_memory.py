@@ -4,14 +4,18 @@ from types import SimpleNamespace
 import pytest
 
 from backend.app.services.memory import (
+    ARCHIVED_MEMORY_STATUS,
     PeachMemoryService,
     build_memory_context,
+    explicit_memory_candidates,
     extract_entities,
     is_valid_memory_content,
     memory_hash,
     score_memory,
     tokenize,
 )
+from backend.app.models import AgentMemory, AgentMemoryEvent
+from sqlalchemy import select
 
 
 def test_memory_context_is_compact_and_labeled() -> None:
@@ -114,3 +118,70 @@ async def test_memory_service_search_is_user_scoped(db_session) -> None:
     result = await service.search("字节产品经理", user_id="u-a", top_k=3)
 
     assert all("字节" not in item["memory"] for item in result["results"])
+
+
+def test_explicit_memory_candidate_extracts_remember_instruction() -> None:
+    candidates = explicit_memory_candidates(
+        [{"role": "user", "content": "记住：我喜欢压力型面试，后面模拟面试优先用这个风格。"}],
+        "chat",
+        {},
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].kind == "preference"
+    assert "压力型面试" in candidates[0].content
+    assert candidates[0].confidence == 95
+
+
+@pytest.mark.asyncio
+async def test_memory_service_add_explicit_short_memory_without_llm(db_session) -> None:
+    service = PeachMemoryService(db_session)
+    result = await service.add(
+        [{"role": "user", "content": "记住：压力型面试"}],
+        user_id="u-explicit",
+        source="chat",
+        infer=True,
+        profile=SimpleNamespace(id="u-explicit", name="同学"),
+    )
+    await db_session.commit()
+
+    assert len(result["results"]) == 1
+    assert "压力型面试" in result["results"][0]["memory"]
+
+
+@pytest.mark.asyncio
+async def test_memory_service_supersedes_changed_job_goal_and_records_events(db_session) -> None:
+    service = PeachMemoryService(db_session)
+    first = await service.add(
+        "用户目标岗位是 AI 产品经理。",
+        user_id="u-goal",
+        source="test",
+        metadata={"reason": "初始目标"},
+        infer=False,
+    )
+    second = await service.add(
+        "用户目标岗位是策略产品经理。",
+        user_id="u-goal",
+        source="test",
+        metadata={"reason": "目标变化"},
+        infer=False,
+    )
+    await db_session.commit()
+
+    old_memory = await db_session.get(AgentMemory, first["results"][0]["id"])
+    new_memory = await db_session.get(AgentMemory, second["results"][0]["id"])
+    events = (
+        await db_session.execute(
+            select(AgentMemoryEvent)
+            .where(AgentMemoryEvent.user_id == "u-goal")
+            .order_by(AgentMemoryEvent.created_at)
+        )
+    ).scalars().all()
+
+    assert old_memory.memory_metadata["status"] == ARCHIVED_MEMORY_STATUS
+    assert old_memory.memory_metadata["superseded_by"] == new_memory.id
+    assert new_memory.memory_metadata["status"] == "active"
+    assert [event.event for event in events] == ["ADD", "ARCHIVE", "ADD"]
+
+    search = await service.search("AI 产品经理", user_id="u-goal", top_k=5)
+    assert all(item["id"] != old_memory.id for item in search["results"])

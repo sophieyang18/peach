@@ -1263,7 +1263,7 @@ textarea:focus {
 }
 
 .history-item:hover .history-item-actions,
-.history-item.active .history-item-actions {
+.history-item:focus-within .history-item-actions {
   opacity: 1;
   transform: translateX(0);
 }
@@ -1966,6 +1966,31 @@ textarea:focus {
   font-size: 12px;
   font-weight: 900;
   box-shadow: none;
+}
+
+.immersive-long-voice {
+  min-height: 30px !important;
+  border: 1px solid #ffc6da;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9) !important;
+  color: #8f5569 !important;
+  padding: 0 12px !important;
+  font-size: 12px;
+  font-weight: 900;
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.immersive-long-voice.active {
+  border-color: rgba(231, 69, 126, 0.4);
+  background: linear-gradient(135deg, #fff0f7, #fff5d8) !important;
+  color: var(--accent-strong) !important;
+  box-shadow: 0 0 0 5px rgba(255, 109, 159, 0.1);
+}
+
+.immersive-long-voice:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .immersive-force-send:not(:disabled):hover {

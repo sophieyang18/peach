@@ -45,6 +45,7 @@ def ensure_demo_columns(sync_conn) -> None:
     sync_conn.execute(text("UPDATE user_profiles SET username = 'demo' WHERE username IS NULL OR username = ''"))
 
 
+
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
         yield session

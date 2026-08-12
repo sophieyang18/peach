@@ -7,12 +7,14 @@ import re
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.models import AgentMemory, UserProfile
+from backend.app.models import AgentMemory, AgentMemoryEvent, UserProfile
+from backend.app.db import SessionLocal
 from backend.app.services.agent import PeachAgent
 
 
@@ -50,6 +52,9 @@ MEMORY_KIND_WEIGHTS = {
     "knowledge_fact": 0.55,
     "episodic_summary": 0.45,
 }
+SUPERSEDING_KINDS = {"job_goal", "target_company"}
+ACTIVE_MEMORY_STATUS = "active"
+ARCHIVED_MEMORY_STATUS = "archived"
 
 SENSITIVE_PATTERNS = [
     r"密码",
@@ -117,12 +122,18 @@ class PeachMemoryService:
         if not normalized:
             return {"results": []}
 
-        if infer and self.agent and profile:
-            candidates = await self._infer_candidates(normalized, user_id, source, metadata or {}, profile)
+        if infer:
+            candidates = explicit_memory_candidates(normalized, source, metadata or {})
         else:
+            candidates = []
+
+        if infer and self.agent and profile and not candidates:
+            inferred = await self._infer_candidates(normalized, user_id, source, metadata or {}, profile)
+            candidates = dedupe_candidates([*candidates, *inferred])
+        elif not candidates:
             candidates = [
                 MemoryCandidate(
-                    kind="episodic_summary",
+                    kind=infer_memory_kind_from_text(item["content"], source),
                     content=item["content"],
                     source=source,
                     tags=normalize_tags((metadata or {}).get("tags")),
@@ -138,7 +149,7 @@ class PeachMemoryService:
             if memory:
                 await self.session.flush()
                 await self.session.refresh(memory)
-                results.append(to_memory_result(memory, "ADD"))
+                results.append(to_memory_result(memory, getattr(memory, "_peach_memory_event", "ADD")))
 
         if results:
             await self.trim(user_id)
@@ -152,6 +163,7 @@ class PeachMemoryService:
         top_k: int = MEMORY_LIMIT,
         filters: dict[str, Any] | None = None,
         explain: bool = False,
+        touch: bool = False,
     ) -> dict[str, list[dict[str, Any]]]:
         query = (query or "").strip()
         if not query:
@@ -178,10 +190,11 @@ class PeachMemoryService:
 
         scored.sort(key=lambda item: item.score, reverse=True)
         selected = scored[:top_k]
-        now = datetime.now(timezone.utc)
-        for item in selected:
-            item.memory.use_count = (item.memory.use_count or 0) + 1
-            item.memory.last_used_at = now
+        if touch:
+            now = datetime.now(timezone.utc)
+            for item in selected:
+                item.memory.use_count = (item.memory.use_count or 0) + 1
+                item.memory.last_used_at = now
 
         return {
             "results": [
@@ -204,6 +217,15 @@ class PeachMemoryService:
         memory = await self.session.get(AgentMemory, memory_id)
         if not memory or memory.user_id != user_id:
             return False
+        await self._record_event(
+            user_id,
+            memory.id,
+            "DELETE",
+            old_content=memory.content,
+            new_content="",
+            source=memory.source,
+            reason="用户删除长期记忆",
+        )
         await self.session.delete(memory)
         return True
 
@@ -237,13 +259,17 @@ class PeachMemoryService:
             "last_messages": messages[-8:],
             "existing_memories": [to_memory_result(item) for item in await self._similar_existing(user_id, user_text)],
         }
-        raw_candidates = await self.agent.extract_memories(
-            profile,
-            source=source,
-            user_message=user_text,
-            assistant_reply=assistant_text,
-            context=context,
-        )
+        try:
+            raw_candidates = await self.agent.extract_memories(
+                profile,
+                source=source,
+                user_message=user_text,
+                assistant_reply=assistant_text,
+                context=context,
+            )
+        except Exception as exc:
+            logger.warning("memory inference skipped for user %s: %s", user_id, exc)
+            return []
 
         candidates: list[MemoryCandidate] = []
         for item in raw_candidates[:6]:
@@ -273,17 +299,41 @@ class PeachMemoryService:
 
     async def _add_candidate(self, user_id: str, candidate: MemoryCandidate) -> AgentMemory | None:
         candidate.content = normalize_memory_sentence(candidate.content)
-        if not is_valid_memory_content(candidate.content):
+        is_explicit = candidate.metadata.get("created_by") == "peach_explicit_memory"
+        if is_explicit:
+            valid_content = is_valid_explicit_memory_content(candidate.content)
+        else:
+            valid_content = is_valid_memory_content(candidate.content)
+        if not valid_content:
             return None
 
         existing = await self._find_duplicate(user_id, candidate)
         if existing:
+            old_content = existing.content
             existing.content = merge_memory_text(existing.content, candidate.content)
             existing.source = candidate.source or existing.source
             existing.confidence = max(int(existing.confidence or 0), candidate.confidence)
             existing.tags = merge_lists(existing.tags or [], candidate.tags)
-            existing.memory_metadata = merge_metadata(existing.memory_metadata or {}, candidate.metadata)
+            existing.memory_metadata = {
+                **merge_metadata(existing.memory_metadata or {}, candidate.metadata),
+                "status": ACTIVE_MEMORY_STATUS,
+                "superseded_by": "",
+            }
+            event = "UPDATE" if normalize_text(old_content) != normalize_text(existing.content) else "NONE"
+            setattr(existing, "_peach_memory_event", event)
+            await self._record_event(
+                user_id,
+                existing.id,
+                event,
+                old_content=old_content,
+                new_content=existing.content,
+                source=candidate.source,
+                reason=str(candidate.metadata.get("reason") or "相似记忆合并"),
+                metadata={"candidate_kind": candidate.kind},
+            )
             return existing
+
+        superseded = await self._find_superseded(user_id, candidate)
 
         memory = AgentMemory(
             user_id=user_id,
@@ -298,9 +348,31 @@ class PeachMemoryService:
                 "text_terms": sorted(tokenize(candidate.content))[:80],
                 "bm25_terms": bm25_terms(candidate.content)[:80],
                 "schema": "peach_memory_v2",
+                "status": ACTIVE_MEMORY_STATUS,
+                "supersedes": [item.id for item in superseded],
             },
         )
         self.session.add(memory)
+        await self.session.flush()
+        setattr(memory, "_peach_memory_event", "ADD")
+        for old_memory in superseded:
+            await self._archive_memory(
+                user_id,
+                old_memory,
+                superseded_by=memory.id,
+                source=candidate.source,
+                reason=f"被新的{MEMORY_KIND_LABELS.get(candidate.kind, candidate.kind)}替换",
+            )
+        await self._record_event(
+            user_id,
+            memory.id,
+            "ADD",
+            old_content="",
+            new_content=memory.content,
+            source=candidate.source,
+            reason=str(candidate.metadata.get("reason") or "新增长期记忆"),
+            metadata={"candidate_kind": candidate.kind, "supersedes": [item.id for item in superseded]},
+        )
         return memory
 
     async def _find_duplicate(self, user_id: str, candidate: MemoryCandidate) -> AgentMemory | None:
@@ -318,6 +390,8 @@ class PeachMemoryService:
         candidate_terms = tokenize(candidate.content)
         candidate_entities = extract_entities(candidate.content)
         for memory in memories:
+            if is_archived_memory(memory):
+                continue
             meta = memory.memory_metadata or {}
             if meta.get("hash") == content_hash:
                 return memory
@@ -328,6 +402,85 @@ class PeachMemoryService:
             if normalize_text(memory.content) == normalize_text(candidate.content):
                 return memory
         return None
+
+    async def _find_superseded(self, user_id: str, candidate: MemoryCandidate) -> list[AgentMemory]:
+        if not can_supersede_existing_memory(candidate):
+            return []
+        memories = (
+            await self.session.execute(
+                select(AgentMemory)
+                .where(AgentMemory.user_id == user_id)
+                .where(AgentMemory.kind == candidate.kind)
+                .order_by(desc(AgentMemory.updated_at))
+                .limit(SEARCH_POOL_SIZE)
+            )
+        ).scalars().all()
+        candidate_dimension = memory_dimension(candidate.kind, candidate.content)
+        superseded: list[AgentMemory] = []
+        for memory in memories:
+            if is_archived_memory(memory):
+                continue
+            if memory_dimension(memory.kind, memory.content) != candidate_dimension:
+                continue
+            if memory_hash(memory.content) == memory_hash(candidate.content):
+                continue
+            superseded.append(memory)
+        return superseded[:6]
+
+    async def _archive_memory(
+        self,
+        user_id: str,
+        memory: AgentMemory,
+        *,
+        superseded_by: str,
+        source: str,
+        reason: str,
+    ) -> None:
+        metadata = dict(memory.memory_metadata or {})
+        if metadata.get("status") == ARCHIVED_MEMORY_STATUS:
+            return
+        old_content = memory.content
+        memory.memory_metadata = {
+            **metadata,
+            "status": ARCHIVED_MEMORY_STATUS,
+            "superseded_by": superseded_by,
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await self._record_event(
+            user_id,
+            memory.id,
+            "ARCHIVE",
+            old_content=old_content,
+            new_content=memory.content,
+            source=source,
+            reason=reason,
+            metadata={"superseded_by": superseded_by},
+        )
+
+    async def _record_event(
+        self,
+        user_id: str,
+        memory_id: str,
+        event: str,
+        *,
+        old_content: str,
+        new_content: str,
+        source: str,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.session.add(
+            AgentMemoryEvent(
+                user_id=user_id,
+                memory_id=memory_id,
+                event=event,
+                old_content=old_content[:1000],
+                new_content=new_content[:1000],
+                source=source[:80],
+                reason=reason[:500],
+                event_metadata=metadata or {},
+            )
+        )
 
     async def _similar_existing(self, user_id: str, query: str) -> list[AgentMemory]:
         result = await self.search(query or "用户记忆", user_id=user_id, top_k=8)
@@ -355,7 +508,11 @@ class PeachMemoryService:
         if source:
             allowed = set(as_list(source))
             stmt = stmt.where(AgentMemory.source.in_(allowed))
-        return list((await self.session.execute(stmt.order_by(desc(AgentMemory.updated_at)).limit(limit))).scalars().all())
+        include_archived = bool(filters.get("include_archived"))
+        memories = list((await self.session.execute(stmt.order_by(desc(AgentMemory.updated_at)).limit(limit))).scalars().all())
+        if include_archived:
+            return memories
+        return [memory for memory in memories if not is_archived_memory(memory)]
 
 
 async def retrieve_relevant_memories(
@@ -420,9 +577,54 @@ async def remember_interaction(
         by_id = {memory.id: memory for memory in memories}
         return [by_id[item_id] for item_id in ids if item_id in by_id]
     except Exception as exc:
-        logger.warning("memory write skipped for user %s: %s", profile.id, exc)
-        await session.rollback()
+        logger.warning("memory write skipped for user %s: %r", profile.id, exc)
         return []
+
+
+async def remember_interaction_isolated(
+    agent: PeachAgent,
+    *,
+    user_id: str,
+    username: str,
+    profile_snapshot: dict[str, Any],
+    source: str,
+    user_message: str,
+    assistant_reply: str = "",
+    context: dict[str, Any] | None = None,
+) -> list[AgentMemory]:
+    """Write memory in a separate transaction so chat/interview writes are never rolled back."""
+
+    async with SessionLocal() as session:
+        profile = SimpleNamespace(
+            id=user_id,
+            username=username,
+            name=str(profile_snapshot.get("name") or "同学"),
+            target_role=str(profile_snapshot.get("target_role") or "产品经理"),
+            target_company=str(profile_snapshot.get("target_company") or ""),
+            target_city=str(profile_snapshot.get("target_city") or ""),
+            stage=str(profile_snapshot.get("stage") or "投递期"),
+            resume_text=str(profile_snapshot.get("resume_text") or ""),
+            communication_style=str(profile_snapshot.get("communication_style") or "温暖直接"),
+            strengths=list(profile_snapshot.get("strengths") or []),
+            weak_points=list(profile_snapshot.get("weak_points") or []),
+            plan=list(profile_snapshot.get("plan") or []),
+        )
+        try:
+            memories = await remember_interaction(
+                session,
+                agent,
+                profile,
+                source=source,
+                user_message=user_message,
+                assistant_reply=assistant_reply,
+                context=context,
+            )
+            await session.commit()
+            return memories
+        except Exception as exc:
+            logger.warning("isolated memory write skipped for user %s: %r", user_id, exc)
+            await session.rollback()
+            return []
 
 
 async def upsert_memory(session: AsyncSession, user_id: str, data: dict[str, Any]) -> AgentMemory:
@@ -541,11 +743,98 @@ def should_consider_memory(messages: str | list[dict[str, str]], assistant_reply
     return True
 
 
+EXPLICIT_MEMORY_PATTERNS = [
+    r"(?:请你|你要|帮我)?记住[:：,， ]*(.+)",
+    r"(?:请你|你要|帮我)?记一下[:：,， ]*(.+)",
+    r"(?:以后|之后)?(?:要)?记得[:：,， ]*(.+)",
+    r"别忘了[:：,， ]*(.+)",
+    r"帮我记(?:住|一下)?[:：,， ]*(.+)",
+]
+
+
+def explicit_memory_candidates(
+    messages: list[dict[str, str]],
+    source: str,
+    metadata: dict[str, Any],
+) -> list[MemoryCandidate]:
+    user_text = "\n".join(item.get("content", "") for item in messages if item.get("role") == "user").strip()
+    content = extract_explicit_memory_text(user_text)
+    if not content:
+        return []
+    content = normalize_memory_sentence(content)
+    if not is_valid_explicit_memory_content(content):
+        return []
+    entities = extract_entities(content)
+    kind = infer_explicit_memory_kind(content)
+    return [
+        MemoryCandidate(
+            kind=kind,
+            content=content,
+            source=f"{source}:explicit",
+            confidence=95,
+            tags=normalize_tags(["explicit_memory", *flatten_entities(entities)]),
+            metadata={
+                **metadata,
+                "reason": "用户明确要求桃子记住这条信息",
+                "entities": entities,
+                "hash": memory_hash(content),
+                "created_by": "peach_explicit_memory",
+            },
+        )
+    ]
+
+
+def extract_explicit_memory_text(text: str) -> str:
+    text = (text or "").strip()
+    for pattern in EXPLICIT_MEMORY_PATTERNS:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return clean_explicit_memory_text(match.group(1))
+    return ""
+
+
+def clean_explicit_memory_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text.strip())
+    text = re.split(r"(?:。|\n|$)", text, maxsplit=1)[0].strip()
+    return text.strip(" ：:，,。.")
+
+
+def infer_explicit_memory_kind(content: str) -> str:
+    inferred = infer_memory_kind_from_text(content)
+    if inferred != "episodic_summary":
+        return inferred
+    return "profile_fact"
+
+
+def infer_memory_kind_from_text(content: str, source: str = "") -> str:
+    if "面试" in source and any(word in content for word in ["卡", "不会", "紧张", "追问", "答得", "薄弱", "复盘"]):
+        return "interview_pattern"
+    if any(word in content for word in ["目标", "想投", "意向", "岗位", "公司", "秋招", "实习"]):
+        return "job_goal"
+    if any(word in content for word in ["喜欢", "偏好", "希望", "不要", "别", "语气", "风格", "压力型", "温和型"]):
+        return "preference"
+    if any(word in content for word in ["不擅长", "薄弱", "容易", "紧张", "卡", "问题", "短板"]):
+        return "weakness"
+    if any(word in content for word in ["做过", "负责", "主导", "项目", "实习", "能力", "会用"]):
+        return "skill_signal"
+    if any(word in content for word in ["学校", "大学", "专业", "年级", "背景"]):
+        return "profile_fact"
+    return "episodic_summary"
+
+
 def is_valid_memory_content(content: str) -> bool:
     content = (content or "").strip()
     if not 8 <= len(content) <= 240:
         return False
     if content.count("\n") > 1:
+        return False
+    lowered = content.lower()
+    return not any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in SENSITIVE_PATTERNS)
+
+
+def is_valid_explicit_memory_content(content: str) -> bool:
+    content = (content or "").strip()
+    if not 4 <= len(content) <= 240:
         return False
     lowered = content.lower()
     return not any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in SENSITIVE_PATTERNS)
@@ -594,6 +883,43 @@ def merge_memory_text(left: str, right: str) -> str:
     if normalize_text(left_clean) in normalize_text(right_clean):
         return right_clean
     return f"{left_clean}；{right_clean}"[:260]
+
+
+def is_archived_memory(memory: AgentMemory) -> bool:
+    return (memory.memory_metadata or {}).get("status") == ARCHIVED_MEMORY_STATUS
+
+
+def can_supersede_existing_memory(candidate: MemoryCandidate) -> bool:
+    if candidate.kind in SUPERSEDING_KINDS:
+        return True
+    if candidate.kind == "preference":
+        return memory_dimension(candidate.kind, candidate.content) != "preference:general"
+    return False
+
+
+def memory_dimension(kind: str, content: str) -> str:
+    text = normalize_text(content)
+    if kind == "job_goal":
+        if any(word in content for word in ["公司", "字节", "腾讯", "阿里", "快手", "美团", "百度", "小红书"]):
+            return "job_goal:company"
+        if any(word in content for word in ["岗位", "产品经理", "产品运营", "算法", "后端", "数据分析"]):
+            return "job_goal:role"
+        if any(word in content for word in ["城市", "北京", "上海", "深圳", "杭州", "广州"]):
+            return "job_goal:city"
+        return "job_goal:general"
+    if kind == "target_company":
+        return "target_company"
+    if kind == "preference":
+        if any(word in content for word in ["面试风格", "压力型", "温和型", "拷打", "严格"]):
+            return "preference:interview_style"
+        if any(word in content for word in ["语气", "直接", "温柔", "犀利", "鼓励"]):
+            return "preference:communication_tone"
+        if any(word in content for word in ["语速", "慢", "快", "中速"]):
+            return "preference:speech_rate"
+        if "不要" in content or "别" in content:
+            return f"preference:avoid:{text[:16]}"
+        return "preference:general"
+    return kind
 
 
 def normalize_memory_sentence(value: str) -> str:

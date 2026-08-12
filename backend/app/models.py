@@ -118,3 +118,18 @@ class AgentMemory(Base):
     )
 
     user: Mapped[UserProfile] = relationship(back_populates="memories")
+
+
+class AgentMemoryEvent(Base):
+    __tablename__ = "agent_memory_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    memory_id: Mapped[str] = mapped_column(String(36), index=True)
+    event: Mapped[str] = mapped_column(String(24), default="ADD", index=True)
+    old_content: Mapped[str] = mapped_column(Text, default="")
+    new_content: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(80), default="memory")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    event_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

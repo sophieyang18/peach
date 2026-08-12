@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from backend.app.api.routes import current_username, normalize_username, router
 from backend.app.core.config import get_settings
@@ -17,6 +19,7 @@ async def lifespan(app: FastAPI):
 
 
 settings = get_settings()
+logger = logging.getLogger("peach.api")
 
 app = FastAPI(
     title="Peach Interview Companion API",
@@ -46,6 +49,15 @@ async def account_context_middleware(request, call_next):
 
 app.include_router(router)
 app.mount("/mcp", peach_mcp.streamable_http_app())
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    logger.exception("Unhandled API error on %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "后端内部错误，请看 backend.log 或稍后重试。"},
+    )
 
 
 @app.get("/")

@@ -15,6 +15,7 @@ type PrimaryModule = 'peach' | 'profile' | 'knowledge'
 type PeachPanel = 'new-chat' | 'interview-setup' | 'question-bank-setup' | 'live-interview'
 type InterviewMode = 'voice' | 'video'
 type TtsRateMode = 'slow' | 'medium' | 'fast'
+type VoiceCaptureMode = 'auto' | 'dictation'
 type ProfileSectionId = 'reviews' | 'full' | 'internship' | 'project' | 'education' | 'skills' | 'competition'
 type AgentToolName =
   | 'start_interview'
@@ -43,6 +44,7 @@ type AgentToolProposal = {
   status?: AgentActionStatus
   result?: ToolActionDetail
 }
+type MemoryWrite = { id: string; kind: string; content: string }
 type ChatMessage = { role: 'peach' | 'user' | 'system'; content: string; actions?: AgentToolProposal[] }
 type Conversation = { id: string; title: string; updatedAt: string; messages: ChatMessage[] }
 type BusyKey = 'account' | 'refresh' | 'recommend' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload'
@@ -373,6 +375,7 @@ function App() {
   const chatScrollRef = useRef<HTMLElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
+  const lastInterviewAnswerRef = useRef<{ text: string; at: number }>({ text: '', at: 0 })
   const recommendationsHydratedRef = useRef(false)
   const profileHydratedRef = useRef(false)
   const knowledgeHydratedRef = useRef(false)
@@ -886,7 +889,7 @@ function App() {
     appendMessage({ role: 'system', content: '桃子正在回复。' })
     begin('chat', '桃子正在回复')
     try {
-      const data = await api<{ reply: string; actions?: AgentToolProposal[] }>('/api/agent/actions', {
+      const data = await api<{ reply: string; actions?: AgentToolProposal[]; memory_writes?: MemoryWrite[] }>('/api/agent/actions', {
         method: 'POST',
         body: JSON.stringify({
           message: snapshot,
@@ -905,7 +908,7 @@ function App() {
       })
       removeSystemMessage('桃子正在回复。')
       appendMessage({ role: 'peach', content: cleanAssistantText(data.reply), actions: normalizeAgentActions(data.actions) })
-      setNotice('回复已生成。')
+      setNotice(data.memory_writes?.length ? '桃子已记住。' : '回复已生成。')
     } catch (err) {
       removeSystemMessage('桃子正在回复。')
       setInput(snapshot)
@@ -1118,19 +1121,26 @@ function App() {
 
   async function sendInterviewAnswerText(answer: string) {
     if (!answer || paused || busy.chat) return
+    const normalizedAnswer = normalizeVoiceAnswer(answer)
+    if (!normalizedAnswer) return
+    const now = Date.now()
+    if (lastInterviewAnswerRef.current.text === normalizedAnswer && now - lastInterviewAnswerRef.current.at < 2400) {
+      return
+    }
+    lastInterviewAnswerRef.current = { text: normalizedAnswer, at: now }
     if (!activeInterviewId) {
       setError('当前没有连接到进行中的面试，请回到设置页重新开始。')
       return
     }
-    if (isInterviewFinishIntent(answer)) {
+    if (isInterviewFinishIntent(normalizedAnswer)) {
       setInput('')
-      appendMessage({ role: 'user', content: answer })
+      appendMessage({ role: 'user', content: normalizedAnswer })
       await finishActiveInterview()
       return
     }
     const interviewId = activeInterviewId
     setInput('')
-    appendMessage({ role: 'user', content: answer })
+    appendMessage({ role: 'user', content: normalizedAnswer })
     appendMessage({ role: 'system', content: '面试官正在追问。' })
     begin('chat', '面试官正在追问')
     try {
@@ -1141,7 +1151,7 @@ function App() {
         progress?: InterviewProgress
       }>(`/api/interviews/${interviewId}/answer`, {
         method: 'POST',
-        body: JSON.stringify({ answer }),
+        body: JSON.stringify({ answer: normalizedAnswer }),
       })
       removeSystemMessage('面试官正在追问。')
       const reply = [
@@ -3641,15 +3651,70 @@ function ChatComposer({
   onUpload?: (file: File) => void
 }) {
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null)
+  const valueRef = useRef(value)
+  const disabledRef = useRef(disabled)
+  const autoListenRef = useRef(autoListen)
+  const voiceModeRef = useRef(voiceMode)
+  const finalTextRef = useRef('')
+  const baseValueRef = useRef('')
+  const autoSubmitTimerRef = useRef<number | null>(null)
+  const manualStopRef = useRef(false)
+  const startingRef = useRef(false)
+  const submittingRef = useRef(false)
+  const [captureMode, setCaptureMode] = useState<VoiceCaptureMode>('auto')
   const [listening, setListening] = useState(false)
 
-  useEffect(() => () => {
-    recognitionRef.current?.stop()
+  useEffect(() => { valueRef.current = value }, [value])
+  useEffect(() => { disabledRef.current = disabled }, [disabled])
+  useEffect(() => { autoListenRef.current = autoListen }, [autoListen])
+  useEffect(() => { voiceModeRef.current = voiceMode }, [voiceMode])
+
+  const clearAutoSubmitTimer = useCallback(() => {
+    if (autoSubmitTimerRef.current) {
+      window.clearTimeout(autoSubmitTimerRef.current)
+      autoSubmitTimerRef.current = null
+    }
   }, [])
 
-  const startVoiceInput = useCallback(() => {
-    if (disabled) return
-    if (recognitionRef.current || listening) return
+  const stopRecognition = useCallback((manual = false) => {
+    if (manual) manualStopRef.current = true
+    clearAutoSubmitTimer()
+    const recognition = recognitionRef.current
+    recognitionRef.current = null
+    startingRef.current = false
+    if (recognition) {
+      try {
+        recognition.onresult = null
+        recognition.onerror = null
+        recognition.onend = null
+        recognition.stop()
+      } catch {
+        // Browser speech recognition may throw if already stopped.
+      }
+    }
+    setListening(false)
+  }, [clearAutoSubmitTimer])
+
+  const submitVoiceText = useCallback((text: string) => {
+    const content = normalizeVoiceAnswer(text)
+    if (!content || submittingRef.current) return
+    submittingRef.current = true
+    stopRecognition(true)
+    onChange('')
+    window.setTimeout(() => {
+      onVoiceSubmit?.(content)
+      window.setTimeout(() => {
+        submittingRef.current = false
+      }, 900)
+    }, 0)
+  }, [onChange, onVoiceSubmit, stopRecognition])
+
+  useEffect(() => () => {
+    stopRecognition(true)
+  }, [stopRecognition])
+
+  const startVoiceInput = useCallback((mode: VoiceCaptureMode = 'auto') => {
+    if (disabledRef.current || startingRef.current || recognitionRef.current) return
 
     const recognitionConstructor = (window as SpeechRecognitionWindow).SpeechRecognition ?? (window as SpeechRecognitionWindow).webkitSpeechRecognition
     if (!recognitionConstructor) {
@@ -3657,78 +3722,129 @@ function ChatComposer({
       return
     }
 
-    const baseValue = value.trim()
+    startingRef.current = true
+    manualStopRef.current = false
+    finalTextRef.current = ''
+    baseValueRef.current = valueRef.current.trim()
+    setCaptureMode(mode)
     const recognition = new recognitionConstructor()
     recognition.lang = 'zh-CN'
     recognition.interimResults = true
-    recognition.continuous = voiceMode === 'stream'
-    let submittedFinalText = ''
+    recognition.continuous = voiceModeRef.current === 'stream'
     recognition.onresult = (event) => {
+      if (manualStopRef.current) return
       const chunks = Array.from(event.results)
-      const transcript = chunks.map((result) => result[0]?.transcript || '').join('').trim()
+      const transcript = normalizeVoiceAnswer(chunks.map((result) => result[0]?.transcript || '').join(''))
       const finalText = chunks
         .filter((result) => result.isFinal)
         .map((result) => result[0]?.transcript || '')
         .join('')
-        .trim()
-      if (voiceMode === 'stream' && finalText && onVoiceSubmit) {
-        const nextFinal = finalText.startsWith(submittedFinalText)
-          ? finalText.slice(submittedFinalText.length).trim()
-          : finalText
-        submittedFinalText = finalText
-        if (!nextFinal) return
-        onChange('')
-        onVoiceSubmit(nextFinal)
-        recognition.stop()
-        setListening(false)
-        return
+      const cleanFinal = normalizeVoiceAnswer(finalText)
+      if (cleanFinal) finalTextRef.current = cleanFinal
+
+      if (transcript) {
+        const merged = [baseValueRef.current, transcript].filter(Boolean).join(' ')
+        onChange(merged)
       }
-      if (transcript) onChange([baseValue, transcript].filter(Boolean).join(' '))
+
+      if (voiceModeRef.current === 'stream' && mode === 'auto' && cleanFinal && onVoiceSubmit) {
+        clearAutoSubmitTimer()
+        autoSubmitTimerRef.current = window.setTimeout(() => {
+          submitVoiceText(finalTextRef.current)
+        }, 1200)
+      }
     }
     recognition.onerror = () => {
+      clearAutoSubmitTimer()
       recognitionRef.current = null
+      startingRef.current = false
       setListening(false)
     }
     recognition.onend = () => {
+      const hasFinalText = Boolean(finalTextRef.current)
+      clearAutoSubmitTimer()
       recognitionRef.current = null
+      startingRef.current = false
       setListening(false)
+      if (
+        voiceModeRef.current === 'stream'
+        && mode === 'auto'
+        && hasFinalText
+        && !manualStopRef.current
+        && !disabledRef.current
+        && !submittingRef.current
+      ) {
+        window.setTimeout(() => submitVoiceText(finalTextRef.current), 0)
+        return
+      }
+      if (
+        voiceModeRef.current === 'stream'
+        && (mode === 'auto' || mode === 'dictation')
+        && (autoListenRef.current || mode === 'dictation')
+        && !manualStopRef.current
+        && !disabledRef.current
+        && !submittingRef.current
+      ) {
+        window.setTimeout(() => startVoiceInput(mode), 260)
+      }
     }
     recognitionRef.current = recognition
     setListening(true)
     try {
       recognition.start()
+      startingRef.current = false
     } catch {
       recognitionRef.current = null
+      startingRef.current = false
       setListening(false)
     }
-  }, [disabled, listening, onChange, onVoiceSubmit, value, voiceMode])
+  }, [clearAutoSubmitTimer, onChange, onVoiceSubmit, submitVoiceText])
 
   const stopVoiceInput = useCallback(() => {
-    recognitionRef.current?.stop()
-    recognitionRef.current = null
-    setListening(false)
-  }, [])
+    stopRecognition(true)
+  }, [stopRecognition])
 
   useEffect(() => {
     if (!autoListen || disabled) {
       if (listening) stopVoiceInput()
       return
     }
-    if (!listening && !value.trim()) startVoiceInput()
-  }, [autoListen, disabled, listening, startVoiceInput, stopVoiceInput, value])
+    if (!listening && !value.trim() && !submittingRef.current && captureMode === 'auto') startVoiceInput('auto')
+  }, [autoListen, captureMode, disabled, listening, startVoiceInput, stopVoiceInput, value])
 
   function toggleVoiceInput() {
     if (disabled && !listening) return
     if (listening) {
-      stopVoiceInput()
+      if (captureMode === 'dictation') {
+        const content = finalTextRef.current || value
+        submitVoiceText(content)
+      } else {
+        stopVoiceInput()
+      }
       return
     }
-    startVoiceInput()
+    startVoiceInput('auto')
+  }
+
+  function toggleLongVoiceInput() {
+    if (disabled && !listening) return
+    if (listening && captureMode === 'dictation') {
+      const content = finalTextRef.current || value
+      submitVoiceText(content)
+      setCaptureMode('auto')
+      return
+    }
+    if (listening) stopVoiceInput()
+    startVoiceInput('dictation')
   }
 
   function handlePrimaryClick() {
-    if (buttonKind === 'voice' && !value.trim()) {
-      toggleVoiceInput()
+    if (buttonKind === 'voice') {
+      if (voiceOnly || listening || !value.trim()) {
+        toggleVoiceInput()
+        return
+      }
+      onSubmit()
       return
     }
     onSubmit()
@@ -3738,7 +3854,7 @@ function ChatComposer({
     const content = value.trim()
     if (!content || disabled) return
     stopVoiceInput()
-    onSubmit()
+    onVoiceSubmit?.(content)
   }
 
   const primaryDisabled = disabled || (buttonKind !== 'voice' && !value.trim())
@@ -3802,6 +3918,16 @@ function ChatComposer({
               }}
             >
               结束面试
+            </button>
+          ) : null}
+          {voiceOnly ? (
+            <button
+              className={captureMode === 'dictation' && listening ? 'immersive-long-voice active' : 'immersive-long-voice'}
+              type="button"
+              onClick={toggleLongVoiceInput}
+              disabled={disabled && !(captureMode === 'dictation' && listening)}
+            >
+              {captureMode === 'dictation' && listening ? '完成长回答' : '长文本输入'}
             </button>
           ) : null}
           {voiceOnly ? (
@@ -4398,8 +4524,10 @@ async function responseErrorMessage(response: Response) {
     if (typeof data.detail === 'string') return data.detail
     if (Array.isArray(data.detail)) return data.detail.map((item) => item?.msg || JSON.stringify(item)).join('；')
   } catch {
+    if (response.status >= 500) return `后端内部错误 ${response.status}`
     return text || response.statusText
   }
+  if (response.status >= 500) return `后端内部错误 ${response.status}`
   return text || response.statusText
 }
 
@@ -4617,6 +4745,19 @@ function ttsRateLabel(mode: TtsRateMode) {
   if (mode === 'slow') return '慢'
   if (mode === 'fast') return '快'
   return '中'
+}
+
+function normalizeVoiceAnswer(value: string) {
+  const text = value
+    .replace(/\s+/g, ' ')
+    .replace(/([，。！？、,.!?])\1+/g, '$1')
+    .trim()
+  if (!text) return ''
+  const chunks = text.split(' ')
+  if (chunks.length >= 2 && chunks[chunks.length - 1] === chunks[chunks.length - 2]) {
+    return chunks.slice(0, -1).join(' ')
+  }
+  return text
 }
 
 function formatTime(value: number) {

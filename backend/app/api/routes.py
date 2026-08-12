@@ -6,8 +6,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
-from backend.app.db import get_session
-from backend.app.models import AgentMemory, InterviewSession, KnowledgeFolder, KnowledgeResource, PracticeRecord, UserProfile
+from backend.app.db import SessionLocal, get_session
+from backend.app.models import AgentMemory, AgentMemoryEvent, InterviewSession, KnowledgeFolder, KnowledgeResource, PracticeRecord, UserProfile
 from backend.app.schemas import (
     AccountIn,
     AgentActionIn,
@@ -24,7 +24,7 @@ from backend.app.schemas import (
 )
 from backend.app.services.agent import PeachAgent
 from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
-from backend.app.services.memory import build_memory_context, remember_interaction, retrieve_relevant_memories, upsert_memory
+from backend.app.services.memory import PeachMemoryService, build_memory_context, remember_interaction, remember_interaction_isolated, retrieve_relevant_memories, upsert_memory
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
@@ -93,6 +93,43 @@ async def get_or_create_profile(session: AsyncSession, username: str | None = No
     return profile
 
 
+async def remember_interaction_safely(
+    session: AsyncSession,
+    agent: PeachAgent,
+    profile: UserProfile,
+    *,
+    source: str,
+    user_message: str,
+    assistant_reply: str,
+    context: dict,
+) -> list[AgentMemory]:
+    return await remember_interaction_isolated(
+        agent,
+        user_id=profile.id,
+        username=profile.username,
+        profile_snapshot=profile_snapshot(profile),
+        source=source,
+        user_message=user_message,
+        assistant_reply=assistant_reply,
+        context=context,
+    )
+
+
+def profile_snapshot(profile: UserProfile) -> dict:
+    return {
+        "name": profile.name,
+        "target_role": profile.target_role,
+        "target_company": profile.target_company,
+        "target_city": profile.target_city,
+        "stage": profile.stage,
+        "resume_text": profile.resume_text,
+        "communication_style": profile.communication_style,
+        "strengths": list(profile.strengths or []),
+        "weak_points": list(profile.weak_points or []),
+        "plan": list(profile.plan or []),
+    }
+
+
 @router.post("/accounts/login")
 async def login_account(payload: AccountIn, session: AsyncSession = Depends(get_session)) -> dict:
     username = require_username(payload.username)
@@ -119,6 +156,7 @@ async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
     await session.execute(delete(InterviewSession).where(InterviewSession.user_id == profile.id))
     await session.execute(delete(KnowledgeResource).where(KnowledgeResource.user_id == profile.id))
     await session.execute(delete(KnowledgeFolder).where(KnowledgeFolder.user_id == profile.id))
+    await session.execute(delete(AgentMemoryEvent).where(AgentMemoryEvent.user_id == profile.id))
     await session.execute(delete(AgentMemory).where(AgentMemory.user_id == profile.id))
     profile.name = "同学"
     profile.target_role = "产品经理"
@@ -157,7 +195,7 @@ async def deep_health(session: AsyncSession = Depends(get_session)) -> dict:
         "provider": "deepseek-openai-compatible",
         "model": settings.deepseek_model,
         "base_url": settings.deepseek_base_url,
-        "detail": "api key configured" if settings.deepseek_api_key else "api key missing, deterministic fallback enabled",
+        "detail": "api key configured" if settings.deepseek_api_key else "api key missing, LLM chat unavailable",
     }
     checks["file_parser"] = {
         "ok": True,
@@ -277,10 +315,9 @@ async def list_memories(session: AsyncSession = Depends(get_session)) -> dict:
 @router.delete("/memories/{memory_id}")
 async def delete_memory(memory_id: str, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    memory = await session.get(AgentMemory, memory_id)
-    if not memory or memory.user_id != profile.id:
+    deleted = await PeachMemoryService(session).delete(memory_id, user_id=profile.id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="memory not found")
-    await session.delete(memory)
     await session.commit()
     return {"deleted": True, "id": memory_id}
 
@@ -301,7 +338,9 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
     profile.weak_points = merge_points(profile.weak_points, feedback.get("improvements", []))
     profile.strengths = merge_points(profile.strengths, feedback.get("highlights", []))
     session.add(record)
-    await remember_interaction(
+    await session.commit()
+    await session.refresh(record)
+    memory_writes = await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -310,8 +349,6 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
         assistant_reply=str(feedback),
         context={"memory_context_used": memory_context, "tags": payload.tags},
     )
-    await session.commit()
-    await session.refresh(record)
     return {"record": serialize_practice(record), "feedback": feedback}
 
 
@@ -346,7 +383,9 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
         {"role": "interviewer", "content": opening["question"]},
     ]
     session.add(interview)
-    await remember_interaction(
+    await session.commit()
+    await session.refresh(interview)
+    await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -355,8 +394,6 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
         assistant_reply="\n".join([opening["opening"], opening["question"]]),
         context={"interviewer_style": payload.interviewer_style, "question_bank": payload.question_bank[:1200]},
     )
-    await session.commit()
-    await session.refresh(interview)
     return {"interview": serialize_interview(interview), "opening": opening, "progress": build_interview_progress(interview)}
 
 
@@ -392,7 +429,9 @@ async def answer_interview(
         interview.report = await agent.interview_report(profile, interview, memory_context)
         progress = build_interview_progress(interview)
 
-    await remember_interaction(
+    await session.commit()
+    await session.refresh(interview)
+    await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -406,8 +445,6 @@ async def answer_interview(
             "progress": progress,
         },
     )
-    await session.commit()
-    await session.refresh(interview)
     return {"interview": serialize_interview(interview), "next": next_turn, "report": interview.report, "progress": progress}
 
 
@@ -421,7 +458,9 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
     memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{interview.transcript[-8:]}")
     interview.status = "completed"
     interview.report = await agent.interview_report(profile, interview, memory_context)
-    await remember_interaction(
+    await session.commit()
+    await session.refresh(interview)
+    await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -430,8 +469,6 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
         assistant_reply=str(interview.report),
         context={"transcript_tail": interview.transcript[-8:]},
     )
-    await session.commit()
-    await session.refresh(interview)
     return {"interview": serialize_interview(interview), "report": interview.report, "progress": build_interview_progress(interview)}
 
 
@@ -450,7 +487,9 @@ async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)
     )
     profile.weak_points = merge_points(profile.weak_points, feedback.get("to_improve", []))
     session.add(record)
-    await remember_interaction(
+    await session.commit()
+    await session.refresh(record)
+    await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -459,8 +498,6 @@ async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)
         assistant_reply=str(feedback),
         context={},
     )
-    await session.commit()
-    await session.refresh(record)
     return {"review": feedback, "record": serialize_practice(record)}
 
 
@@ -468,8 +505,11 @@ async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)
 async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
     memory_context = await relevant_memory_context(session, profile, payload.message)
-    reply = await agent.chat(profile, payload.message, memory_context)
-    await remember_interaction(
+    try:
+        reply = await agent.chat(profile, payload.message, memory_context)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="LLM 暂时没有返回结果，请稍后重试。") from exc
+    await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -478,8 +518,11 @@ async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) ->
         assistant_reply=reply,
         context={"memory_context_used": memory_context},
     )
-    await session.commit()
-    return {"reply": reply}
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+    return {"reply": reply, "memory_writes": [serialize_memory(item) for item in memory_writes]}
 
 
 @router.post("/agent/actions")
@@ -488,12 +531,9 @@ async def agent_actions(payload: AgentActionIn, session: AsyncSession = Depends(
     memory_context = await relevant_memory_context(session, profile, payload.message)
     try:
         planned = await agent.plan_actions(profile, payload.message, payload.context, memory_context)
-    except Exception:
-        planned = {
-            "reply": "我在。刚刚有点卡，我们先继续聊，你可以直接说想练面试、改简历，还是补充档案。",
-            "actions": [],
-        }
-    await remember_interaction(
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="LLM 暂时没有返回结果，请稍后重试。") from exc
+    memory_writes = await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -502,10 +542,14 @@ async def agent_actions(payload: AgentActionIn, session: AsyncSession = Depends(
         assistant_reply=str(planned.get("reply", "")),
         context={**payload.context, "memory_context_used": memory_context},
     )
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
     return {
         "reply": planned.get("reply", ""),
-        "actions": [normalize_tool_action(action, index) for index, action in enumerate(planned.get("actions", []))],
+        "actions": normalize_tool_actions_safely(planned.get("actions", [])),
+        "memory_writes": [serialize_memory(item) for item in memory_writes],
     }
 
 
@@ -548,7 +592,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
                 setattr(profile, key, str(value))
         await session.commit()
         await session.refresh(profile)
-        await remember_approved_action(session, profile, payload.tool, data, "个人信息已更新。")
+        await remember_approved_action(profile, payload.tool, data, "个人信息已更新。")
         return {"message": "个人信息已更新。", "profile": serialize_profile(profile)}
 
     if payload.tool == "update_resume":
@@ -559,7 +603,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         profile.resume_text = content if mode == "replace" else "\n\n".join([item for item in [profile.resume_text, content] if item])
         await session.commit()
         await session.refresh(profile)
-        await remember_approved_action(session, profile, payload.tool, data, "简历已更新。")
+        await remember_approved_action(profile, payload.tool, data, "简历已更新。")
         return {"message": "简历已更新。", "profile": serialize_profile(profile)}
 
     if payload.tool == "append_profile_note":
@@ -570,7 +614,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         profile.resume_text = "\n\n".join([item for item in [profile.resume_text, f"【{title}】\n{content}"] if item])
         await session.commit()
         await session.refresh(profile)
-        await remember_approved_action(session, profile, payload.tool, data, f"已补充到{title}。")
+        await remember_approved_action(profile, payload.tool, data, f"已补充到{title}。")
         return {"message": f"已补充到{title}。", "profile": serialize_profile(profile)}
 
     if payload.tool == "add_knowledge_item":
@@ -587,7 +631,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         await session.commit()
         await session.refresh(resource)
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
-        await remember_approved_action(session, profile, payload.tool, data, "已添加到个人知识库。")
+        await remember_approved_action(profile, payload.tool, data, "已添加到个人知识库。")
         return {"message": "已添加到个人知识库。", "knowledge": serialize_knowledge(resource)}
 
     if payload.tool == "update_knowledge_item":
@@ -899,7 +943,6 @@ async def relevant_memory_context(session: AsyncSession, profile: UserProfile, q
 
 
 async def remember_approved_action(
-    session: AsyncSession,
     profile: UserProfile,
     tool: str,
     payload: dict,
@@ -908,17 +951,22 @@ async def remember_approved_action(
     summary = action_memory_summary(tool, payload, message)
     if not summary:
         return
-    await upsert_memory(
-        session,
-        profile.id,
-        {
-            "kind": "episodic_summary",
-            "content": summary,
-            "source": f"approved_action:{tool}",
-            "confidence": 75,
-            "tags": ["approved_action", tool],
-        },
-    )
+    async with SessionLocal() as memory_session:
+        try:
+            await upsert_memory(
+                memory_session,
+                profile.id,
+                {
+                    "kind": "episodic_summary",
+                    "content": summary,
+                    "source": f"approved_action:{tool}",
+                    "confidence": 75,
+                    "tags": ["approved_action", tool],
+                },
+            )
+            await memory_session.commit()
+        except Exception:
+            await memory_session.rollback()
 
 
 def action_memory_summary(tool: str, payload: dict, message: str) -> str:
@@ -1049,6 +1097,20 @@ def normalize_tool_action(action: dict, index: int) -> dict:
         "payload": payload,
         "approval_required": bool(action.get("approval_required", True)),
     }
+
+
+def normalize_tool_actions_safely(actions: object) -> list[dict]:
+    if not isinstance(actions, list):
+        return []
+    normalized: list[dict] = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        try:
+            normalized.append(normalize_tool_action(action, index))
+        except Exception:
+            continue
+    return normalized
 
 
 def normalize_action_payload(tool: str, payload: dict) -> dict:
