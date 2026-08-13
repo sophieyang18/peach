@@ -15,6 +15,7 @@ httpx
 socksio
 pypdf
 python-docx
+olefile
 beautifulsoup4
 pytest
 pytest-asyncio

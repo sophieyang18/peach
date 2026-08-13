@@ -34,6 +34,28 @@ class UserProfile(Base):
     practices: Mapped[list["PracticeRecord"]] = relationship(back_populates="user")
     interviews: Mapped[list["InterviewSession"]] = relationship(back_populates="user")
     memories: Mapped[list["AgentMemory"]] = relationship(back_populates="user")
+    resume_versions: Mapped[list["ResumeVersion"]] = relationship(back_populates="user")
+
+
+class ResumeVersion(Base):
+    __tablename__ = "resume_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    title: Mapped[str] = mapped_column(String(180), default="完整简历")
+    filename: Mapped[str] = mapped_column(String(260), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(60), default="manual")
+    target_role: Mapped[str] = mapped_column(String(120), default="")
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    optimized: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    user: Mapped[UserProfile] = relationship(back_populates="resume_versions")
 
 
 class PracticeRecord(Base):

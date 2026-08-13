@@ -73,6 +73,7 @@ type Profile = {
 
 type Dashboard = {
   profile: Profile
+  resume_versions?: ResumeVersion[]
   checkin: {
     message: string
     task: { title: string; question: string; duration: string; focus: string }
@@ -240,6 +241,26 @@ type ParsedUpload = {
   warning?: string
 }
 
+type ProfileUploadResult = {
+  file: ParsedUpload
+  profile?: Profile
+  resume_versions?: ResumeVersion[]
+}
+
+type ResumeVersion = {
+  id: string
+  title: string
+  filename: string
+  content: string
+  summary: string
+  source: string
+  target_role: string
+  version_no: number
+  optimized: boolean
+  created_at?: string
+  updated_at?: string
+}
+
 type KnowledgeDraft = {
   title: string
   summary: string
@@ -381,6 +402,60 @@ const initialConversations: Conversation[] = [
   },
 ]
 
+const CONVERSATION_STORAGE_PREFIX = 'peach:conversations:'
+
+function cloneInitialConversations(): Conversation[] {
+  return initialConversations.map((conversation) => ({ ...conversation, messages: [...conversation.messages] }))
+}
+
+function conversationStorageKey(username: string) {
+  return `${CONVERSATION_STORAGE_PREFIX}${encodeURIComponent(username)}`
+}
+
+function loadStoredConversations(username: string): { conversations: Conversation[]; activeConversationId: string } {
+  try {
+    const raw = window.localStorage.getItem(conversationStorageKey(username))
+    if (!raw) {
+      const conversations = cloneInitialConversations()
+      return { conversations, activeConversationId: conversations[0].id }
+    }
+    const parsed = JSON.parse(raw) as { conversations?: Conversation[]; activeConversationId?: string }
+    const conversations = Array.isArray(parsed.conversations) && parsed.conversations.length
+      ? parsed.conversations.filter(isConversationLike)
+      : cloneInitialConversations()
+    const fallback = conversations[0]?.id ?? initialConversations[0].id
+    return {
+      conversations: conversations.length ? conversations : cloneInitialConversations(),
+      activeConversationId: parsed.activeConversationId && conversations.some((item) => item.id === parsed.activeConversationId)
+        ? parsed.activeConversationId
+        : fallback,
+    }
+  } catch {
+    const conversations = cloneInitialConversations()
+    return { conversations, activeConversationId: conversations[0].id }
+  }
+}
+
+function saveStoredConversations(username: string, conversations: Conversation[], activeConversationId: string) {
+  const safeConversations = conversations.slice(0, 80).map((conversation) => ({
+    ...conversation,
+    messages: conversation.messages.slice(-120),
+  }))
+  window.localStorage.setItem(
+    conversationStorageKey(username),
+    JSON.stringify({ conversations: safeConversations, activeConversationId }),
+  )
+}
+
+function clearStoredConversations(username: string) {
+  window.localStorage.removeItem(conversationStorageKey(username))
+}
+
+function isConversationLike(value: unknown): value is Conversation {
+  const item = value as Conversation
+  return Boolean(item?.id && item?.title && Array.isArray(item.messages))
+}
+
 function App() {
   const [account, setAccount] = useState<Account | null>(null)
   const [accountInput, setAccountInput] = useState(() => window.localStorage.getItem('peach:last-username') ?? '')
@@ -398,6 +473,7 @@ function App() {
   const [profileActionResult, setProfileActionResult] = useState('')
   const [profileMessages, setProfileMessages] = useState<ChatMessage[]>([])
   const [resumeFiles, setResumeFiles] = useState<ParsedUpload[]>([])
+  const [resumeVersions, setResumeVersions] = useState<ResumeVersion[]>([])
   const [knowledgeQuestion, setKnowledgeQuestion] = useState('')
   const [knowledgeMessages, setKnowledgeMessages] = useState<ChatMessage[]>([])
   const [personalKnowledge, setPersonalKnowledge] = useState<KnowledgeItem[]>([])
@@ -413,7 +489,7 @@ function App() {
   const [knowledgeActionResult, setKnowledgeActionResult] = useState('')
   const [knowledgeActionMode, setKnowledgeActionMode] = useState('')
   const [isCreatingKnowledge, setIsCreatingKnowledge] = useState(false)
-  const [conversations, setConversations] = useState<Conversation[]>(initialConversations)
+  const [conversations, setConversations] = useState<Conversation[]>(() => cloneInitialConversations())
   const [activeConversationId, setActiveConversationId] = useState(initialConversations[0].id)
   const [settings, setSettings] = useState<InterviewSettings>({
     resume: '完整简历',
@@ -458,6 +534,7 @@ function App() {
   const lastInterviewAnswerRef = useRef<{ text: string; at: number }>({ text: '', at: 0 })
   const profileHydratedRef = useRef(false)
   const knowledgeHydratedRef = useRef(false)
+  const conversationsHydratedRef = useRef(false)
 
   const profile = dashboard?.profile ?? defaultProfile
   const activeConversation = conversations.find((item) => item.id === activeConversationId) ?? conversations[0]
@@ -496,6 +573,23 @@ function App() {
     })
     if (!response.ok) throw new Error(await responseErrorMessage(response))
     return response.json()
+  }, [account?.username])
+
+  const downloadApiFile = useCallback(async (path: string, filename: string) => {
+    setError('')
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: account?.username ? { 'X-Peach-User': account.username } : undefined,
+    })
+    if (!response.ok) throw new Error(await responseErrorMessage(response))
+    const blob = await response.blob()
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(url)
   }, [account?.username])
 
   const begin = useCallback((key: BusyKey, message: string) => {
@@ -599,7 +693,7 @@ function App() {
   }, [module, peachPanel, stopTts])
 
   const resetClientWorkspace = useCallback(() => {
-    const freshConversations = initialConversations.map((conversation) => ({ ...conversation, messages: [...conversation.messages] }))
+    const freshConversations = cloneInitialConversations()
     setModule('peach')
     setPeachPanel('new-chat')
     setDashboard(null)
@@ -612,6 +706,7 @@ function App() {
     setProfileActionResult('')
     setProfileMessages([])
     setResumeFiles([])
+    setResumeVersions([])
     setKnowledgeQuestion('')
     setKnowledgeMessages([])
     setPersonalKnowledge([])
@@ -665,6 +760,7 @@ function App() {
     setSavedKnowledge(['pm-method'])
     profileHydratedRef.current = false
     knowledgeHydratedRef.current = false
+    conversationsHydratedRef.current = false
   }, [mediaStream])
 
   const accountRequest = useCallback(async (path: string, username?: string) => {
@@ -736,6 +832,7 @@ function App() {
     begin('account', '正在重置账号')
     try {
       const data = await api<{ account: Account; profile: Profile }>('/api/accounts/reset', { method: 'POST' })
+      clearStoredConversations(account.username)
       resetClientWorkspace()
       setAccount(data.account)
       setAccountInput(data.account.username)
@@ -753,6 +850,7 @@ function App() {
       begin('refresh', '正在同步个人档案')
       const data = await api<Dashboard>('/api/dashboard')
       setDashboard(data)
+      setResumeVersions(data.resume_versions ?? [])
       setNotice('个人档案已同步。')
     } catch (err) {
       setError('后端暂时没有连上。确认 FastAPI 在 8000 端口运行后再刷新。')
@@ -779,9 +877,26 @@ function App() {
   }, [account, refreshDashboard])
 
   useEffect(() => {
+    if (!account?.username) return
+    conversationsHydratedRef.current = false
+    const stored = loadStoredConversations(account.username)
+    setConversations(stored.conversations)
+    setActiveConversationId(stored.activeConversationId)
+    window.setTimeout(() => {
+      conversationsHydratedRef.current = true
+    }, 0)
+  }, [account?.username])
+
+  useEffect(() => {
+    if (!account?.username || !conversationsHydratedRef.current) return
+    saveStoredConversations(account.username, conversations, activeConversationId)
+  }, [account?.username, activeConversationId, conversations])
+
+  useEffect(() => {
     if (!dashboard || profileHydratedRef.current) return
     profileHydratedRef.current = true
     setProfileSections(buildInitialProfileSections(dashboard.profile, dashboard))
+    setResumeVersions(dashboard.resume_versions ?? [])
     setSettings((current) => ({
       ...current,
       targetRole: current.targetRole || dashboard.profile.target_role,
@@ -998,6 +1113,41 @@ function App() {
     await deleteInterviewById(interview.id)
   }
 
+  async function downloadProfileExport() {
+    try {
+      await downloadApiFile('/api/profile/export?format=md', `peach-profile-${account?.username ?? 'demo'}.md`)
+      setNotice('个人档案已导出。')
+    } catch (err) {
+      setError('个人档案导出失败。')
+      console.error(err)
+    }
+  }
+
+  async function downloadResumeVersion(resume: ResumeVersion) {
+    try {
+      await downloadApiFile(`/api/profile/resumes/${resume.id}/export?format=md`, `peach-resume-v${resume.version_no}.md`)
+      setNotice('简历版本已导出。')
+    } catch (err) {
+      setError('简历版本导出失败。')
+      console.error(err)
+    }
+  }
+
+  async function restoreResumeVersion(resume: ResumeVersion) {
+    begin('profile', '正在切换简历版本')
+    try {
+      const data = await api<{ profile: Profile; resume_version: ResumeVersion }>(`/api/profile/resumes/${resume.id}/restore`, { method: 'POST' })
+      setDashboard((current) => (current ? { ...current, profile: data.profile } : current))
+      updateProfileSection('full', data.profile.resume_text || resume.content)
+      setNotice(`已切换到第 ${resume.version_no} 版简历。`)
+    } catch (err) {
+      setError('简历版本切换失败。')
+      console.error(err)
+    } finally {
+      end('profile')
+    }
+  }
+
   async function sendPrompt(prompt: string, extraContext: Record<string, unknown> = {}, visibleContent = prompt) {
     if (!prompt.trim()) return
     stopTts()
@@ -1077,6 +1227,8 @@ function App() {
         report?: InterviewReport
         knowledge?: KnowledgeItem
         deleted_knowledge_id?: string
+        resume_versions?: ResumeVersion[]
+        resume_version?: ResumeVersion | null
       }>('/api/agent/actions/execute', {
         method: 'POST',
         body: JSON.stringify({ tool: action.tool, payload: action.payload }),
@@ -1114,6 +1266,8 @@ function App() {
       report?: InterviewReport
       knowledge?: KnowledgeItem
       deleted_knowledge_id?: string
+      resume_versions?: ResumeVersion[]
+      resume_version?: ResumeVersion | null
     },
   ) {
     if (data.profile) {
@@ -1130,6 +1284,9 @@ function App() {
     if (data.deleted_knowledge_id) {
       setPersonalKnowledge((current) => current.filter((item) => item.id !== data.deleted_knowledge_id))
       setKnowledgeTab('personal')
+    }
+    if (data.resume_versions) {
+      setResumeVersions(data.resume_versions)
     }
     if (action.tool === 'start_interview' && data.interview) {
       setSettings((current) => ({
@@ -1433,7 +1590,7 @@ function App() {
   async function saveProfileSections(nextSections = profileSections) {
     begin('profile', '正在保存个人档案')
     try {
-      const data = await api<{ profile: Profile; greeting?: string }>('/api/profile', {
+      const data = await api<{ profile: Profile; greeting?: string; resume_versions?: ResumeVersion[]; resume_version?: ResumeVersion | null }>('/api/profile', {
         method: 'POST',
         body: JSON.stringify({
           name: profile.name,
@@ -1446,6 +1603,7 @@ function App() {
         }),
       })
       setDashboard((current) => (current ? { ...current, profile: data.profile } : current))
+      if (data.resume_versions) setResumeVersions(data.resume_versions)
       setNotice('个人档案已保存。')
     } catch (err) {
       setError('个人档案保存失败，稍后再试一次。')
@@ -1837,7 +1995,9 @@ function App() {
   async function uploadProfileFile(file: File) {
     begin('upload', '正在解析并补充档案')
     try {
-      const data = await uploadApi<{ file: ParsedUpload }>('/api/files/parse', file)
+      const data: ProfileUploadResult = activeProfileSection === 'full'
+        ? await uploadApi<ProfileUploadResult>('/api/profile/resumes/upload', file)
+        : await uploadApi<ProfileUploadResult>('/api/files/parse', file)
       const content = `【${data.file.title}】\n${data.file.content}`
       updateProfileSection(
         activeProfileSection,
@@ -1845,6 +2005,8 @@ function App() {
       )
       if (activeProfileSection === 'full') {
         setResumeFiles((current) => [data.file, ...current.filter((item) => item.filename !== data.file.filename)])
+        if (data.resume_versions) setResumeVersions(data.resume_versions)
+        if (data.profile) setDashboard((current) => (current ? { ...current, profile: data.profile as Profile } : current))
       }
       setNotice(data.file.warning || `已补充到${profileSectionMeta[activeProfileSection].title}。`)
     } catch (err) {
@@ -2202,6 +2364,7 @@ function App() {
             actionResult={profileActionResult}
             messages={profileMessages}
             resumeFiles={resumeFiles}
+            resumeVersions={resumeVersions}
             isSaving={Boolean(busy.profile)}
             value={profileInput}
             onSelectSection={selectProfileSection}
@@ -2212,6 +2375,9 @@ function App() {
             onAction={(action) => void runProfileAction(action)}
             onAcceptResult={acceptProfileActionResult}
             onUploadFile={(file) => void uploadProfileFile(file)}
+            onDownloadProfile={() => void downloadProfileExport()}
+            onDownloadResumeVersion={(resume) => void downloadResumeVersion(resume)}
+            onRestoreResumeVersion={(resume) => void restoreResumeVersion(resume)}
             onApproveAction={(action) => void approveAgentAction(action)}
             onDismissAction={dismissAgentAction}
             onStartTraining={startGrowthTraining}
@@ -2984,6 +3150,7 @@ function ProfileWorkspace({
   actionResult,
   messages,
   resumeFiles,
+  resumeVersions,
   isSaving,
   value,
   onSelectSection,
@@ -2994,6 +3161,9 @@ function ProfileWorkspace({
   onAction,
   onAcceptResult,
   onUploadFile,
+  onDownloadProfile,
+  onDownloadResumeVersion,
+  onRestoreResumeVersion,
   onApproveAction,
   onDismissAction,
   onStartTraining,
@@ -3010,6 +3180,7 @@ function ProfileWorkspace({
   actionResult: string
   messages: ChatMessage[]
   resumeFiles: ParsedUpload[]
+  resumeVersions: ResumeVersion[]
   isSaving: boolean
   value: string
   onSelectSection: (id: ProfileSectionId) => void
@@ -3020,6 +3191,9 @@ function ProfileWorkspace({
   onAction: (action: string) => void
   onAcceptResult: () => void
   onUploadFile: (file: File) => void
+  onDownloadProfile: () => void
+  onDownloadResumeVersion: (resume: ResumeVersion) => void
+  onRestoreResumeVersion: (resume: ResumeVersion) => void
   onApproveAction: (action: AgentToolProposal) => void
   onDismissAction: (action: AgentToolProposal) => void
   onStartTraining: (prompt: string) => void
@@ -3033,7 +3207,20 @@ function ProfileWorkspace({
   const [resumeListCollapsed, setResumeListCollapsed] = useState(false)
   const [resumeSortMode, setResumeSortMode] = useState<'time' | 'role'>('time')
   const [selectedReportId, setSelectedReportId] = useState('')
+  const [profileChatCollapsed, setProfileChatCollapsed] = useState(false)
+  const previousProfileMessageCountRef = useRef(messages.length)
   const selectedReport = interviews.find((item) => item.id === selectedReportId) ?? interviews[0]
+
+  useEffect(() => {
+    setProfileChatCollapsed(true)
+  }, [activeSection])
+
+  useEffect(() => {
+    if (messages.length > previousProfileMessageCountRef.current) {
+      setProfileChatCollapsed(false)
+    }
+    previousProfileMessageCountRef.current = messages.length
+  }, [messages.length])
 
   return (
     <section className="profile-workspace">
@@ -3146,15 +3333,29 @@ function ProfileWorkspace({
                     <option value="time">按上传时间</option>
                     <option value="role">按对应岗位</option>
                   </select>
+                  <button type="button" onClick={onDownloadProfile}>导出档案</button>
                 </div>
                 <div className="resume-file-items">
-                  {!resumeListCollapsed && resumeFiles.length ? sortResumeFiles(resumeFiles, resumeSortMode).map((file) => (
+                  {!resumeListCollapsed && resumeVersions.length ? sortResumeVersions(resumeVersions, resumeSortMode).map((resume) => (
+                    <article className="resume-version-card" key={resume.id}>
+                      <button type="button" onClick={() => onSectionContent(resume.content)}>
+                        <strong>{resume.title || resume.filename || `第 ${resume.version_no} 版简历`}</strong>
+                        <span>{resume.summary || '已保存为历史版本'}</span>
+                      </button>
+                      <div>
+                        <small>v{resume.version_no}{resume.optimized ? ' · 已优化' : ''}</small>
+                        <button type="button" onClick={() => onDownloadResumeVersion(resume)}>导出</button>
+                        <button type="button" onClick={() => onRestoreResumeVersion(resume)}>设为当前</button>
+                      </div>
+                    </article>
+                  )) : null}
+                  {!resumeListCollapsed && !resumeVersions.length && resumeFiles.length ? sortResumeFiles(resumeFiles, resumeSortMode).map((file) => (
                     <button type="button" key={file.filename} onClick={() => onSectionContent([sectionContent, `【${file.title}】\n${file.content}`].filter(Boolean).join('\n\n'))}>
                       <strong>{file.filename}</strong>
                       <span>{file.summary || '已解析'}</span>
                     </button>
                   )) : null}
-                  {!resumeListCollapsed && !resumeFiles.length ? <p>还没有上传简历文件。</p> : null}
+                  {!resumeListCollapsed && !resumeVersions.length && !resumeFiles.length ? <p>还没有上传简历文件。</p> : null}
                 </div>
               </div>
             </div>
@@ -3191,18 +3392,31 @@ function ProfileWorkspace({
           )}
 
           {messages.length ? (
-            <section className="profile-chat-thread" aria-label="个人档案对话">
-              {messages.map((message, index) => (
-                <Message
-                  key={`${message.role}-${index}`}
-                  role={message.role}
-                  actions={message.actions}
-                  onApproveAction={onApproveAction}
-                  onDismissAction={onDismissAction}
-                >
-                  {message.content}
-                </Message>
-              ))}
+            <section className={`profile-chat-thread${profileChatCollapsed ? ' collapsed' : ''}`} aria-label="个人档案对话">
+              <div className="profile-chat-head">
+                <div>
+                  <strong>档案对话</strong>
+                  <span>{messages.length} 条记录</span>
+                </div>
+                <button type="button" onClick={() => setProfileChatCollapsed((collapsed) => !collapsed)}>
+                  {profileChatCollapsed ? '展开' : '收起'}
+                </button>
+              </div>
+              {!profileChatCollapsed ? (
+                <div className="profile-chat-messages">
+                  {messages.map((message, index) => (
+                    <Message
+                      key={`${message.role}-${index}`}
+                      role={message.role}
+                      actions={message.actions}
+                      onApproveAction={onApproveAction}
+                      onDismissAction={onDismissAction}
+                    >
+                      {message.content}
+                    </Message>
+                  ))}
+                </div>
+              ) : null}
             </section>
           ) : null}
         </section>
@@ -5266,10 +5480,14 @@ function summarizeSection(id: ProfileSectionId, content: string) {
 
 function buildResumeNavSummary(profile: Profile, dashboard: Dashboard | null, sections: Record<ProfileSectionId, string>) {
   const hasMainResume = Boolean((sections.full || profile.resume_text || '').trim())
-  const resumeCount = hasMainResume ? 1 : 0
-  const optimizedCount = countOptimizedResumeSignals(profile, dashboard, sections)
+  const versions = dashboard?.resume_versions ?? []
+  const resumeCount = versions.length || (hasMainResume ? 1 : 0)
+  const optimizedCount = versions.length
+    ? versions.filter((item) => item.optimized).length
+    : countOptimizedResumeSignals(profile, dashboard, sections)
   const roles = uniqueStrings([
     profile.target_role,
+    ...versions.map((item) => item.target_role).filter(Boolean),
     ...((dashboard?.recent_interviews ?? []).map((item) => item.role).filter(Boolean)),
   ]).slice(0, 2)
   const roleText = roles.length ? roles.join('、') : '目标'
@@ -5325,6 +5543,14 @@ function sortResumeFiles(files: ParsedUpload[], mode: 'time' | 'role') {
   const values = [...files]
   if (mode === 'role') return values.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'))
   return values
+}
+
+function sortResumeVersions(resumes: ResumeVersion[], mode: 'time' | 'role') {
+  const values = [...resumes]
+  if (mode === 'role') {
+    return values.sort((a, b) => (a.target_role || a.title).localeCompare(b.target_role || b.title, 'zh-CN'))
+  }
+  return values.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
 }
 
 function extractExperienceNames(content: string) {

@@ -13,6 +13,11 @@ from bs4 import BeautifulSoup
 from docx import Document
 from pypdf import PdfReader
 
+try:
+    import olefile
+except ImportError:  # pragma: no cover - optional parser enhancement
+    olefile = None
+
 
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".md", ".markdown", ".html", ".htm"}
 MAX_LINK_BYTES = 2 * 1024 * 1024
@@ -80,17 +85,19 @@ def parse_docx(content: bytes) -> str:
 def parse_doc_binary_best_effort(content: bytes) -> str:
     if zipfile.is_zipfile(io.BytesIO(content)):
         return parse_docx(content)
-    decoded = content.decode("utf-8", errors="ignore")
-    if len(decoded.strip()) < 40:
-        decoded = content.decode("gb18030", errors="ignore")
-    strings = re.findall(r"[\u4e00-\u9fffA-Za-z0-9，。！？；：、,.!?;:()\[\]《》“”\"'\s]{3,}", decoded)
-    return "\n".join(item.strip() for item in strings if item.strip())
+
+    streams = doc_stream_candidates(content)
+    candidates = [extract_readable_text(stream) for stream in streams]
+    candidates.append(extract_readable_text(content))
+    best = max(candidates, key=text_quality_score, default="")
+    best = normalize_text(best)
+    if text_quality_score(best) < 18 or is_probably_garbled(best):
+        raise ValueError("老版 .doc 文本抽取失败。建议将文件另存为 .docx 后重新上传。")
+    return best
 
 
 def parse_html(content: bytes) -> str:
-    raw = content.decode("utf-8", errors="ignore")
-    if not raw.strip():
-        raw = content.decode("gb18030", errors="ignore")
+    raw = decode_text_best_effort(content)
     soup = BeautifulSoup(raw, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
@@ -132,9 +139,7 @@ async def parse_link(url: str) -> ParsedFile:
 
 
 def parse_markdown(content: bytes) -> str:
-    raw = content.decode("utf-8", errors="ignore")
-    if not raw.strip():
-        raw = content.decode("gb18030", errors="ignore")
+    raw = decode_text_best_effort(content)
     raw = re.sub(r"```[\s\S]*?```", " ", raw)
     raw = re.sub(r"`([^`]+)`", r"\1", raw)
     raw = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", raw)
@@ -142,6 +147,89 @@ def parse_markdown(content: bytes) -> str:
     raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"^\s*[-*+]\s+", "", raw, flags=re.MULTILINE)
     return raw
+
+
+def doc_stream_candidates(content: bytes) -> list[bytes]:
+    """Read likely text-bearing streams from a legacy Word OLE document."""
+    if olefile is None or not olefile.isOleFile(io.BytesIO(content)):
+        return []
+    streams: list[bytes] = []
+    try:
+        with olefile.OleFileIO(io.BytesIO(content)) as ole:
+            preferred = [["WordDocument"], ["1Table"], ["0Table"]]
+            for stream_name in preferred:
+                if ole.exists(stream_name):
+                    streams.append(ole.openstream(stream_name).read())
+            for stream_name in ole.listdir(streams=True):
+                lowered = "/".join(stream_name).lower()
+                if any(part in lowered for part in ["worddocument", "table", "summaryinformation"]):
+                    blob = ole.openstream(stream_name).read()
+                    if blob not in streams:
+                        streams.append(blob)
+    except Exception:
+        return streams
+    return streams
+
+
+def decode_text_best_effort(content: bytes) -> str:
+    candidates: list[str] = []
+    for encoding in ["utf-8-sig", "utf-8", "gb18030", "utf-16le", "utf-16be", "big5"]:
+        try:
+            candidates.append(content.decode(encoding, errors="ignore"))
+        except Exception:
+            continue
+    return max(candidates, key=text_quality_score, default="")
+
+
+def extract_readable_text(content: bytes) -> str:
+    decoded = decode_text_best_effort(content)
+    decoded = decoded.replace("\x00", "\n")
+    decoded = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", decoded)
+    chunks = re.findall(
+        r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9，。！？；：、,.!?;:()\[\]《》“”\"'/@%+\-_\s]{1,}",
+        decoded,
+    )
+    lines = []
+    for chunk in chunks:
+        line = re.sub(r"\s+", " ", chunk).strip(" \t\r\n-_")
+        if len(line) >= 2 and text_quality_score(line) >= 1:
+            lines.append(line)
+    return "\n".join(dedupe_keep_order(lines))
+
+
+def dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = value[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def text_quality_score(value: str) -> int:
+    if not value:
+        return 0
+    chinese = len(re.findall(r"[\u4e00-\u9fff]", value))
+    letters = len(re.findall(r"[A-Za-z]", value))
+    digits = len(re.findall(r"\d", value))
+    punctuation = len(re.findall(r"[，。！？；：、,.!?;:()\[\]《》“”\"']", value))
+    controls = len(re.findall(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", value))
+    replacements = value.count("\ufffd")
+    return chinese * 3 + letters + digits + punctuation - controls * 3 - replacements * 8
+
+
+def is_probably_garbled(value: str) -> bool:
+    clean = value.strip()
+    if not clean:
+        return True
+    readable = len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", clean))
+    odd = len(re.findall(r"[^\u4e00-\u9fffA-Za-z0-9，。！？；：、,.!?;:()\[\]《》“”\"'/@%+\-_\s]", clean))
+    if readable < 20:
+        return True
+    return odd / max(len(clean), 1) > 0.18
 
 
 def normalize_text(value: str) -> str:

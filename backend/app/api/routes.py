@@ -1,7 +1,8 @@
+import re
 from contextvars import ContextVar
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import delete, desc, select, text
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from sqlalchemy import delete, desc, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +20,7 @@ from backend.app.models import (
     KnowledgeFolder,
     KnowledgeResource,
     PracticeRecord,
+    ResumeVersion,
     UserAbilityScore,
     UserProfile,
 )
@@ -185,6 +187,7 @@ async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
     await session.execute(delete(InterviewSession).where(InterviewSession.user_id == profile.id))
     await session.execute(delete(KnowledgeResource).where(KnowledgeResource.user_id == profile.id))
     await session.execute(delete(KnowledgeFolder).where(KnowledgeFolder.user_id == profile.id))
+    await session.execute(delete(ResumeVersion).where(ResumeVersion.user_id == profile.id))
     await session.execute(delete(ActionState).where(ActionState.user_id == profile.id))
     await session.execute(delete(AbilityScoreHistory).where(AbilityScoreHistory.user_id == profile.id))
     await session.execute(delete(UserAbilityScore).where(UserAbilityScore.user_id == profile.id))
@@ -294,10 +297,77 @@ async def read_profile(session: AsyncSession = Depends(get_session)) -> dict:
     return serialize_profile(profile)
 
 
+@router.get("/profile/export")
+async def export_profile(format: str = "md", session: AsyncSession = Depends(get_session)) -> Response:
+    profile = await get_or_create_profile(session)
+    content = profile_export_content(profile)
+    return downloadable_text_response(content, f"peach-profile-{profile.username}", format)
+
+
+@router.get("/profile/resumes")
+async def list_resume_versions(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return {"items": await serialized_resume_versions(session, profile.id)}
+
+
+@router.post("/profile/resumes/upload")
+async def upload_resume_version(file: UploadFile = File(...), session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    parsed = await parse_uploaded_file(file)
+    was_resume_empty = not (profile.resume_text or "").strip()
+    version = await create_resume_version(
+        session,
+        profile,
+        parsed["content"],
+        title=parsed["title"] or parsed["filename"],
+        filename=parsed["filename"],
+        source="upload",
+        optimized=0,
+    )
+    if was_resume_empty:
+        profile.resume_text = parsed["content"]
+    await refresh_recommendations_safely(
+        session,
+        profile,
+        trigger_reason="resume",
+        source_type="resume",
+        source_id=version.id if version else profile.id,
+        force=was_resume_empty,
+    )
+    await session.commit()
+    await session.refresh(profile)
+    return {
+        "file": parsed,
+        "resume_version": serialize_resume_version(version) if version else None,
+        "resume_versions": await serialized_resume_versions(session, profile.id),
+        "profile": serialize_profile(profile),
+    }
+
+
+@router.get("/profile/resumes/{resume_id}/export")
+async def export_resume_version(resume_id: str, format: str = "md", session: AsyncSession = Depends(get_session)) -> Response:
+    profile = await get_or_create_profile(session)
+    resume = await owned_resume_version(session, profile.id, resume_id)
+    title = resume.title or resume.filename or "完整简历"
+    content = f"# {title}\n\n{resume.content.strip()}\n"
+    return downloadable_text_response(content, f"peach-resume-v{resume.version_no}", format)
+
+
+@router.post("/profile/resumes/{resume_id}/restore")
+async def restore_resume_version(resume_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    resume = await owned_resume_version(session, profile.id, resume_id)
+    profile.resume_text = resume.content
+    await session.commit()
+    await session.refresh(profile)
+    return {"profile": serialize_profile(profile), "resume_version": serialize_resume_version(resume)}
+
+
 @router.post("/profile")
 async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
     had_recommendation_signal = has_profile_recommendation_signal(profile)
+    previous_resume_text = profile.resume_text or ""
     for key, value in payload.model_dump().items():
         setattr(profile, key, value)
 
@@ -316,9 +386,24 @@ async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get
         source_id=profile.id,
         force=force_recommendations,
     )
+    resume_version = None
+    if (profile.resume_text or "").strip() and normalize_for_compare(previous_resume_text) != normalize_for_compare(profile.resume_text):
+        resume_version = await create_resume_version(
+            session,
+            profile,
+            profile.resume_text,
+            title="手动保存完整简历",
+            source="profile_save",
+            optimized=1 if "优化" in profile.resume_text else 0,
+        )
     await session.commit()
     await session.refresh(profile)
-    return {"profile": serialize_profile(profile), "greeting": "个人档案已保存。"}
+    return {
+        "profile": serialize_profile(profile),
+        "greeting": "个人档案已保存。",
+        "resume_version": serialize_resume_version(resume_version) if resume_version else None,
+        "resume_versions": await serialized_resume_versions(session, profile.id),
+    }
 
 
 @router.get("/dashboard")
@@ -346,6 +431,7 @@ async def dashboard(session: AsyncSession = Depends(get_session)) -> dict:
 
     return {
         "profile": serialize_profile(profile),
+        "resume_versions": await serialized_resume_versions(session, profile.id),
         "checkin": checkin,
         "recent_practices": [serialize_practice(item) for item in records],
         "recent_interviews": [serialize_interview(item) for item in interviews],
@@ -640,7 +726,7 @@ async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) ->
         reply = await agent.chat(profile, payload.message, memory_context)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="LLM 暂时没有返回结果，请稍后重试。") from exc
-    await remember_interaction_safely(
+    memory_writes = await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -758,6 +844,14 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         mode = str(data.get("mode") or "append")
         was_resume_empty = not (profile.resume_text or "").strip()
         profile.resume_text = content if mode == "replace" else "\n\n".join([item for item in [profile.resume_text, content] if item])
+        resume_version = await create_resume_version(
+            session,
+            profile,
+            profile.resume_text,
+            title=str(data.get("title") or "AI 更新完整简历"),
+            source="agent_update",
+            optimized=1,
+        )
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, "简历已更新。")
@@ -768,7 +862,12 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             source_id=profile.id,
             force=was_resume_empty,
         )
-        return {"message": "简历已更新。", "profile": serialize_profile(profile)}
+        return {
+            "message": "简历已更新。",
+            "profile": serialize_profile(profile),
+            "resume_version": serialize_resume_version(resume_version) if resume_version else None,
+            "resume_versions": await serialized_resume_versions(session, profile.id),
+        }
 
     if payload.tool == "append_profile_note":
         content = str(data.get("content") or "").strip()
@@ -778,6 +877,16 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         had_recommendation_signal = has_profile_recommendation_signal(profile)
         profile.resume_text = "\n\n".join([item for item in [profile.resume_text, f"【{title}】\n{content}"] if item])
         force_recommendations = not had_recommendation_signal and has_profile_recommendation_signal(profile)
+        resume_version = None
+        if "简历" in title or str(data.get("section") or "") == "full":
+            resume_version = await create_resume_version(
+                session,
+                profile,
+                profile.resume_text,
+                title=f"补充{title}",
+                source="profile_note",
+                optimized=0,
+            )
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, f"已补充到{title}。")
@@ -788,7 +897,12 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             source_id=profile.id,
             force=force_recommendations,
         )
-        return {"message": f"已补充到{title}。", "profile": serialize_profile(profile)}
+        return {
+            "message": f"已补充到{title}。",
+            "profile": serialize_profile(profile),
+            "resume_version": serialize_resume_version(resume_version) if resume_version else None,
+            "resume_versions": await serialized_resume_versions(session, profile.id),
+        }
 
     if payload.tool == "add_knowledge_item":
         title = str(data.get("title") or "求职资料").strip()
@@ -1103,6 +1217,24 @@ def serialize_folder(folder: KnowledgeFolder) -> dict:
     }
 
 
+def serialize_resume_version(resume: ResumeVersion | None) -> dict | None:
+    if not resume:
+        return None
+    return {
+        "id": resume.id,
+        "title": resume.title,
+        "filename": resume.filename,
+        "summary": resume.summary,
+        "content": resume.content,
+        "source": resume.source,
+        "target_role": resume.target_role,
+        "version_no": resume.version_no,
+        "optimized": bool(resume.optimized),
+        "created_at": resume.created_at.isoformat() if resume.created_at else None,
+        "updated_at": resume.updated_at.isoformat() if resume.updated_at else None,
+    }
+
+
 def serialize_parsed_file(parsed, url: str = "") -> dict:
     return {
         "filename": parsed.filename,
@@ -1128,6 +1260,116 @@ async def list_recent_memories(session: AsyncSession, user_id: str, limit: int) 
             .limit(limit)
         )
     ).scalars().all())
+
+
+async def serialized_resume_versions(session: AsyncSession, user_id: str, limit: int = 30) -> list[dict]:
+    versions = (
+        await session.execute(
+            select(ResumeVersion)
+            .where(ResumeVersion.user_id == user_id)
+            .order_by(desc(ResumeVersion.created_at))
+            .limit(limit)
+        )
+    ).scalars().all()
+    return [item for item in (serialize_resume_version(version) for version in versions) if item]
+
+
+async def create_resume_version(
+    session: AsyncSession,
+    profile: UserProfile,
+    content: str,
+    *,
+    title: str = "完整简历",
+    filename: str = "",
+    source: str = "manual",
+    optimized: int = 0,
+) -> ResumeVersion | None:
+    clean = normalize_resume_content(content)
+    if not clean:
+        return None
+    latest = (
+        await session.execute(
+            select(ResumeVersion)
+            .where(ResumeVersion.user_id == profile.id)
+            .order_by(desc(ResumeVersion.created_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest and normalize_for_compare(latest.content) == normalize_for_compare(clean):
+        return latest
+    count = await session.scalar(select(func.count(ResumeVersion.id)).where(ResumeVersion.user_id == profile.id))
+    resume = ResumeVersion(
+        user_id=profile.id,
+        title=(title or filename or "完整简历")[:180],
+        filename=(filename or "")[:260],
+        content=clean,
+        summary=resume_summary(clean),
+        source=source[:60],
+        target_role=(profile.target_role or "")[:120],
+        version_no=int(count or 0) + 1,
+        optimized=1 if optimized else 0,
+    )
+    session.add(resume)
+    await session.flush()
+    return resume
+
+
+async def owned_resume_version(session: AsyncSession, user_id: str, resume_id: str) -> ResumeVersion:
+    resume = await session.get(ResumeVersion, resume_id)
+    if not resume or resume.user_id != user_id:
+        raise HTTPException(status_code=404, detail="resume version not found")
+    return resume
+
+
+def normalize_resume_content(content: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", str(content or "").replace("\r\n", "\n")).strip()
+
+
+def normalize_for_compare(content: str) -> str:
+    return re.sub(r"\s+", "", str(content or ""))
+
+
+def resume_summary(content: str, limit: int = 180) -> str:
+    clean = re.sub(r"\s+", " ", content).strip()
+    if not clean:
+        return "暂无摘要"
+    return clean[:limit] + ("..." if len(clean) > limit else "")
+
+
+def profile_export_content(profile: UserProfile) -> str:
+    lines = [
+        f"# 桃子个人档案 - {profile.username}",
+        "",
+        f"- 姓名：{profile.name}",
+        f"- 目标岗位：{profile.target_role}",
+        f"- 目标公司：{profile.target_company or '未填写'}",
+        f"- 求职阶段：{profile.stage}",
+        f"- 沟通偏好：{profile.communication_style}",
+        "",
+        "## 完整简历",
+        "",
+        profile.resume_text or "暂无完整简历内容。",
+        "",
+        "## 优势",
+        "",
+        "\n".join(f"- {item}" for item in (profile.strengths or [])) or "暂无",
+        "",
+        "## 待提升",
+        "",
+        "\n".join(f"- {item}" for item in (profile.weak_points or [])) or "暂无",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+def downloadable_text_response(content: str, filename: str, format: str) -> Response:
+    ext = "txt" if format.lower() == "txt" else "md"
+    media_type = "text/plain; charset=utf-8" if ext == "txt" else "text/markdown; charset=utf-8"
+    safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "-", filename).strip("-") or "peach-export"
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}.{ext}"'},
+    )
 
 
 async def relevant_memory_context(session: AsyncSession, profile: UserProfile, query: str, task_type: str = "chat") -> str:
