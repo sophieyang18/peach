@@ -37,12 +37,36 @@ services:
       timeout: 5s
       retries: 12
 
+  asr:
+    build:
+      context: .
+      dockerfile: asr/Dockerfile
+    cpus: "4.0"
+    mem_limit: 8g
+    environment:
+      ASR_PORT: 8080
+      FUNASR_PORT: 10095
+      FUNASR_DECODER_THREADS: 3
+      FUNASR_IO_THREADS: 1
+      FUNASR_MODEL_THREADS: 1
+      OMP_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      NUMEXPR_NUM_THREADS: 1
+    ports:
+      - "10096:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
   frontend:
     build:
       context: .
       dockerfile: frontend/Dockerfile
       args:
         VITE_API_BASE_URL: /api
+        VITE_ASR_WS_URL: ${VITE_ASR_WS_URL:-}
     depends_on:
       backend:
         condition: service_healthy

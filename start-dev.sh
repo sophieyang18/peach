@@ -7,6 +7,7 @@ FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 HOST="${HOST:-127.0.0.1}"
 LOCAL_API_BASE_URL="${LOCAL_API_BASE_URL:-}"
 LOCAL_API_TARGET="${LOCAL_API_TARGET:-http://${HOST}:${BACKEND_PORT}}"
+LOCAL_ASR_WS_URL="${LOCAL_ASR_WS_URL:-${VITE_ASR_WS_URL:-}}"
 CONDA_ENV="${CONDA_ENV:-peach}"
 FORCE_RESTART=false
 BACKEND_LOG="${ROOT_DIR}/.local/backend.log"
@@ -33,6 +34,7 @@ Environment variables:
   BACKEND_PORT=${BACKEND_PORT}
   FRONTEND_PORT=${FRONTEND_PORT}
   CONDA_ENV=${CONDA_ENV}
+  LOCAL_ASR_WS_URL=${LOCAL_ASR_WS_URL:-disabled}
   DATABASE_URL=${DATABASE_URL:-read from .env or SQLite fallback}
 EOF
 }
@@ -129,6 +131,9 @@ print_links() {
   echo "  API Docs: http://${HOST}:${BACKEND_PORT}/docs"
   echo "  Backend log: ${BACKEND_LOG}"
   echo "  Frontend log: ${FRONTEND_LOG}"
+  if [[ -n "${LOCAL_ASR_WS_URL}" ]]; then
+    echo "  ASR WS:    ${LOCAL_ASR_WS_URL}"
+  fi
   echo
 }
 
@@ -319,6 +324,7 @@ else
   (
     cd "${ROOT_DIR}/frontend"
     export VITE_API_BASE_URL="${LOCAL_API_BASE_URL}"
+    export VITE_ASR_WS_URL="${LOCAL_ASR_WS_URL}"
     export VITE_DEV_API_TARGET="${LOCAL_API_TARGET}"
     "${PNPM_CMD[@]}" dev --host "${HOST}" --port "${FRONTEND_PORT}" --strictPort
   ) > "${FRONTEND_LOG}" 2>&1 &

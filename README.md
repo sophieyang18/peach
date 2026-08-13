@@ -5,7 +5,7 @@
 ## 核心能力
 
 - 问问桃子：对话式求职助手，支持文件上传解析、工具动作审批、历史对话、复制和多轮上下文。
-- 沉浸式语音面试：浏览器 Web Speech 实时识别，浏览器 TTS 朗读面试官问题，支持静音、打断、重播、语速调节、手动结束和文字面试切换。
+- 沉浸式语音面试：优先使用独立 FunASR Runtime 2-pass Streaming ASR 实时识别，浏览器 Web Speech 兜底；浏览器 TTS 朗读面试官问题，支持静音、打断、重播、语速调节、手动结束和文字面试切换。
 - 模拟面试流程：从自我介绍开始，逐步进入经历深挖、岗位理解、证据质量、压力追问和收尾准备，后端用 checklist 控制面试完成度。
 - 面试复盘报告：面试结束后生成岗位、综合分、等级、同类百分位、多维评价、建议和问题回顾，并归档到个人档案。
 - 个人档案：沉淀完整简历、实习经历、项目经历、教育背景、个人技能、竞赛经历和历史面试复盘。
@@ -20,7 +20,7 @@
 - 数据库：SQLite demo fallback；生产可切 PostgreSQL
 - LLM：DeepSeek OpenAI-compatible API，默认模型 `deepseek-v4-flash`
 - 文件解析：PDF、DOC/DOCX、Markdown、HTML
-- 语音：浏览器 Web Speech Recognition + SpeechSynthesis
+- 语音：FunASR Runtime 2-pass Streaming ASR + 浏览器 Web Speech fallback + SpeechSynthesis
 
 ## 目录结构
 
@@ -32,6 +32,7 @@ backend/                 FastAPI 后端
   app/services/memory.py 长期记忆检索、提取、去重和裁剪
   app/services/file_parser.py 文件和链接解析
 frontend/                React 前端
+asr/                     FunASR 2-pass Streaming ASR 独立服务
 scripts/                 提交和开发辅助脚本
 docker-compose.yml       容器化一键启动
 ```
@@ -47,6 +48,7 @@ DEEPSEEK_API_KEY=your_deepseek_api_key_here
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
+LOCAL_ASR_WS_URL=        # 可选，本地 FunASR 网关地址，如 ws://127.0.0.1:10096/asr
 ```
 
 本地 demo 默认可以直接使用 SQLite，不需要先安装 PostgreSQL。生产部署如需持久化和并发能力，可改为：
@@ -81,6 +83,15 @@ cd /Users/shihuiyang/work/0802/peach
 - Agent 能力说明：http://localhost:8000/api/capabilities
 - MCP 本地地址：http://localhost:8000/mcp/
 
+如需启用本地 FunASR 2-pass ASR，先启动独立 ASR 容器：
+
+```bash
+docker compose up --build asr
+LOCAL_ASR_WS_URL=ws://127.0.0.1:10096/asr ./start-dev.sh --restart
+```
+
+未配置或连接失败时，前端会自动回退到浏览器 Web Speech。
+
 ## Docker 启动
 
 适合评测方快速验证交付性：
@@ -94,6 +105,13 @@ DEEPSEEK_API_KEY=your_key docker compose up --build
 
 - 前端：http://localhost:8080
 - 后端：http://localhost:8000/api/health
+- ASR：http://localhost:10096/health
+
+FunASR 服务按 4 vCPU / 8GB 资源上限配置，默认参数为 `FUNASR_DECODER_THREADS=3`、`FUNASR_IO_THREADS=1`、`FUNASR_MODEL_THREADS=1`、`OMP_NUM_THREADS=1`。云端部署建议将 `peach-asr` 作为独立 CloudBase Run 服务，端口 `8080`，最小实例数设为 `1`，前端构建变量配置为：
+
+```bash
+VITE_ASR_WS_URL=wss://<your-peach-asr-domain>/asr
+```
 
 如果没有配置 `DEEPSEEK_API_KEY`，系统仍会用确定性 fallback 跑通主流程，但动态评测 AI 能力建议提供有效 key。
 
@@ -185,4 +203,4 @@ dist-submission/peach-agent-submission.zip
 
 - 当前 demo 账号只有用户名，没有密码和正式鉴权；正式上线前需要接入登录态和权限校验。
 - 本地默认 SQLite 方便评测快速启动；正式上线建议使用 PostgreSQL 或腾讯云托管数据库。
-- 语音识别和 TTS 使用浏览器能力，效果取决于浏览器支持度；后续可替换云端流式 ASR/TTS。
+- 语音识别优先走独立 FunASR 2-pass ASR，连接失败时回退浏览器 Web Speech；TTS 仍使用浏览器 SpeechSynthesis，效果取决于浏览器支持度。

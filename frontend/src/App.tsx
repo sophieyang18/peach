@@ -3,6 +3,7 @@ import type { ReactNode, RefObject } from 'react'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
+const ASR_WS_URL = String(import.meta.env.VITE_ASR_WS_URL ?? '').trim()
 const PEACH_PORTRAIT = '/peach-assets/peach-portrait.png'
 const PEACH_ICON = '/peach-assets/peach-icon.png'
 const LIZI_PORTRAIT = '/peach-assets/lizi-portrait.png'
@@ -20,6 +21,7 @@ type PeachPanel = 'new-chat' | 'interview-setup' | 'question-bank-setup' | 'live
 type InterviewMode = 'voice'
 type TtsRateMode = 'slow' | 'medium' | 'fast'
 type VoiceCaptureMode = 'auto' | 'dictation'
+type VoiceProvider = 'idle' | 'funasr' | 'browser'
 type ProfileSectionId = 'reviews' | 'full' | 'internship' | 'project' | 'education' | 'skills' | 'competition'
 type AgentToolName =
   | 'start_interview'
@@ -274,6 +276,15 @@ type SpeechRecognitionWindow = Window & {
   SpeechRecognition?: new () => BrowserSpeechRecognition
   webkitSpeechRecognition?: new () => BrowserSpeechRecognition
 }
+type FunAsrSession = {
+  socket: WebSocket
+  mediaStream: MediaStream
+  audioContext: AudioContext
+  processor: ScriptProcessorNode
+  source: MediaStreamAudioSourceNode
+  sendEnd: () => void
+  close: () => void
+}
 
 const profileSectionMeta: Record<ProfileSectionId, { title: string; summary: string; helper: string }> = {
   reviews: {
@@ -518,13 +529,14 @@ function App() {
       return
     }
 
-    window.speechSynthesis.cancel()
+    const synth = window.speechSynthesis
+    synth.cancel()
     const utterance = new SpeechSynthesisUtterance(text)
     utterance.lang = 'zh-CN'
     utterance.rate = ttsRateValue(ttsRateMode)
     utterance.pitch = settings.gender === '男性' ? 0.88 : 1
     utterance.volume = 1
-    const voices = window.speechSynthesis.getVoices()
+    const voices = synth.getVoices()
     const zhVoices = voices.filter((voice) => voice.lang.toLowerCase().startsWith('zh'))
     const maleVoice = zhVoices.find((voice) => /male|man|男|yunxi|yunjian|xiaogang|kangkang/i.test(`${voice.name} ${voice.voiceURI}`))
     const femaleVoice = zhVoices.find((voice) => /female|woman|女|xiaoxiao|xiaoyi|tingting|huihui/i.test(`${voice.name} ${voice.voiceURI}`))
@@ -541,7 +553,29 @@ function App() {
     }
     ttsUtteranceRef.current = utterance
     setTtsSpeaking(true)
-    window.speechSynthesis.speak(utterance)
+    const speakNow = () => {
+      if (ttsUtteranceRef.current !== utterance) return
+      try {
+        synth.resume()
+        synth.speak(utterance)
+      } catch {
+        if (ttsUtteranceRef.current === utterance) ttsUtteranceRef.current = null
+        setTtsSpeaking(false)
+      }
+    }
+    if (!voices.length) {
+      const onVoicesChanged = () => {
+        synth.removeEventListener('voiceschanged', onVoicesChanged)
+        window.setTimeout(speakNow, 20)
+      }
+      synth.addEventListener('voiceschanged', onVoicesChanged)
+      window.setTimeout(() => {
+        synth.removeEventListener('voiceschanged', onVoicesChanged)
+        if (!synth.speaking) speakNow()
+      }, 220)
+      return
+    }
+    window.setTimeout(speakNow, 35)
   }, [settings.gender, ttsMuted, ttsRateMode])
 
   const toggleTtsMuted = useCallback(() => {
@@ -3999,6 +4033,7 @@ function ChatComposer({
   onUpload?: (file: File) => void
 }) {
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null)
+  const funAsrRef = useRef<FunAsrSession | null>(null)
   const valueRef = useRef(value)
   const disabledRef = useRef(disabled)
   const autoListenRef = useRef(autoListen)
@@ -4011,6 +4046,7 @@ function ChatComposer({
   const submittingRef = useRef(false)
   const [captureMode, setCaptureMode] = useState<VoiceCaptureMode>('auto')
   const [listening, setListening] = useState(false)
+  const [voiceProvider, setVoiceProvider] = useState<VoiceProvider>('idle')
 
   useEffect(() => { valueRef.current = value }, [value])
   useEffect(() => { disabledRef.current = disabled }, [disabled])
@@ -4024,9 +4060,22 @@ function ChatComposer({
     }
   }, [])
 
+  const stopFunAsr = useCallback((manual = false) => {
+    if (manual) manualStopRef.current = true
+    const session = funAsrRef.current
+    funAsrRef.current = null
+    startingRef.current = false
+    if (session) {
+      session.close()
+    }
+    setListening(false)
+    setVoiceProvider('idle')
+  }, [])
+
   const stopRecognition = useCallback((manual = false) => {
     if (manual) manualStopRef.current = true
     clearAutoSubmitTimer()
+    stopFunAsr(false)
     const recognition = recognitionRef.current
     recognitionRef.current = null
     startingRef.current = false
@@ -4041,7 +4090,8 @@ function ChatComposer({
       }
     }
     setListening(false)
-  }, [clearAutoSubmitTimer])
+    setVoiceProvider('idle')
+  }, [clearAutoSubmitTimer, stopFunAsr])
 
   const submitVoiceText = useCallback((text: string) => {
     const content = normalizeVoiceAnswer(text)
@@ -4061,9 +4111,7 @@ function ChatComposer({
     stopRecognition(true)
   }, [stopRecognition])
 
-  const startVoiceInput = useCallback((mode: VoiceCaptureMode = 'auto') => {
-    if (disabledRef.current || startingRef.current || recognitionRef.current) return
-
+  const startBrowserSpeechInput = useCallback((mode: VoiceCaptureMode = 'auto') => {
     const recognitionConstructor = (window as SpeechRecognitionWindow).SpeechRecognition ?? (window as SpeechRecognitionWindow).webkitSpeechRecognition
     if (!recognitionConstructor) {
       window.alert('当前浏览器暂不支持语音输入，可以直接打字。')
@@ -4107,6 +4155,7 @@ function ChatComposer({
       recognitionRef.current = null
       startingRef.current = false
       setListening(false)
+      setVoiceProvider('idle')
     }
     recognition.onend = () => {
       const hasFinalText = Boolean(finalTextRef.current)
@@ -4114,6 +4163,7 @@ function ChatComposer({
       recognitionRef.current = null
       startingRef.current = false
       setListening(false)
+      setVoiceProvider('idle')
       if (
         voiceModeRef.current === 'stream'
         && mode === 'auto'
@@ -4133,11 +4183,12 @@ function ChatComposer({
         && !disabledRef.current
         && !submittingRef.current
       ) {
-        window.setTimeout(() => startVoiceInput(mode), 260)
+        window.setTimeout(() => startBrowserSpeechInput(mode), 260)
       }
     }
     recognitionRef.current = recognition
     setListening(true)
+    setVoiceProvider('browser')
     try {
       recognition.start()
       startingRef.current = false
@@ -4147,6 +4198,164 @@ function ChatComposer({
       setListening(false)
     }
   }, [clearAutoSubmitTimer, onChange, onVoiceSubmit, submitVoiceText])
+
+  const startFunAsrInput = useCallback(async (mode: VoiceCaptureMode = 'auto') => {
+    if (!ASR_WS_URL || voiceModeRef.current !== 'stream') return false
+    startingRef.current = true
+    manualStopRef.current = false
+    finalTextRef.current = ''
+    baseValueRef.current = valueRef.current.trim()
+    setCaptureMode(mode)
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
+      if (manualStopRef.current || disabledRef.current) {
+        mediaStream.getTracks().forEach((track) => track.stop())
+        startingRef.current = false
+        return false
+      }
+
+      const AudioContextConstructor = window.AudioContext
+      const audioContext = new AudioContextConstructor()
+      const source = audioContext.createMediaStreamSource(mediaStream)
+      const processor = audioContext.createScriptProcessor(4096, 1, 1)
+      const socket = new WebSocket(ASR_WS_URL)
+      socket.binaryType = 'arraybuffer'
+      let socketReady = false
+      let closed = false
+      let lastSubmitAt = 0
+      let shouldFallbackOnClose = false
+
+      const sendEnd = () => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ is_speaking: false }))
+        }
+      }
+      const close = () => {
+        if (closed) return
+        closed = true
+        clearAutoSubmitTimer()
+        try {
+          sendEnd()
+        } catch {
+          // WebSocket may already be closing.
+        }
+        try {
+          processor.disconnect()
+          source.disconnect()
+        } catch {
+          // Audio graph may already be disconnected.
+        }
+        mediaStream.getTracks().forEach((track) => track.stop())
+        void audioContext.close().catch(() => undefined)
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close()
+      }
+
+      socket.onopen = () => {
+        socketReady = true
+        socket.send(JSON.stringify({
+          mode: '2pass',
+          wav_name: `peach-${Date.now()}`,
+          wav_format: 'pcm',
+          is_speaking: true,
+          chunk_size: [5, 10, 5],
+          chunk_interval: 10,
+          audio_fs: 16000,
+          itn: true,
+          hotwords: JSON.stringify(buildFunAsrHotwords()),
+        }))
+        startingRef.current = false
+        setListening(true)
+        setVoiceProvider('funasr')
+      }
+
+      socket.onmessage = (event) => {
+        if (manualStopRef.current || typeof event.data !== 'string') return
+        const result = parseFunAsrMessage(event.data)
+        if (!result.text) return
+        if (result.isFinal) {
+          finalTextRef.current = appendVoiceSegment(finalTextRef.current, result.text)
+          const merged = [baseValueRef.current, finalTextRef.current].filter(Boolean).join(' ')
+          onChange(merged)
+          if (mode === 'auto' && onVoiceSubmit && Date.now() - lastSubmitAt > 900) {
+            lastSubmitAt = Date.now()
+            clearAutoSubmitTimer()
+            autoSubmitTimerRef.current = window.setTimeout(() => {
+              submitVoiceText(finalTextRef.current)
+            }, 260)
+          }
+          return
+        }
+        const merged = [baseValueRef.current, finalTextRef.current, result.text].filter(Boolean).join(' ')
+        onChange(merged)
+      }
+
+      socket.onerror = () => {
+        if (!socketReady) {
+          shouldFallbackOnClose = true
+          close()
+          funAsrRef.current = null
+          startingRef.current = false
+          setListening(false)
+          setVoiceProvider('idle')
+        }
+      }
+
+      socket.onclose = () => {
+        close()
+        if (funAsrRef.current?.socket === socket) funAsrRef.current = null
+        startingRef.current = false
+        setListening(false)
+        setVoiceProvider('idle')
+        if (shouldFallbackOnClose && !manualStopRef.current && !disabledRef.current) {
+          window.setTimeout(() => startBrowserSpeechInput(mode), 180)
+          return
+        }
+        if (
+          voiceModeRef.current === 'stream'
+          && mode === 'dictation'
+          && !manualStopRef.current
+          && !disabledRef.current
+          && !submittingRef.current
+        ) {
+          window.setTimeout(() => startBrowserSpeechInput(mode), 260)
+        }
+      }
+
+      processor.onaudioprocess = (event) => {
+        if (!socketReady || socket.readyState !== WebSocket.OPEN || manualStopRef.current) return
+        const input = event.inputBuffer.getChannelData(0)
+        const output = event.outputBuffer.getChannelData(0)
+        output.fill(0)
+        const pcm = floatTo16kPcm(input, audioContext.sampleRate)
+        if (pcm.byteLength) socket.send(pcm)
+      }
+      source.connect(processor)
+      processor.connect(audioContext.destination)
+      funAsrRef.current = { socket, mediaStream, audioContext, processor, source, sendEnd, close }
+      return true
+    } catch {
+      stopFunAsr(false)
+      return false
+    }
+  }, [clearAutoSubmitTimer, onChange, onVoiceSubmit, startBrowserSpeechInput, stopFunAsr, submitVoiceText])
+
+  const startVoiceInput = useCallback((mode: VoiceCaptureMode = 'auto') => {
+    if (disabledRef.current || startingRef.current || recognitionRef.current || funAsrRef.current) return
+    if (ASR_WS_URL && voiceModeRef.current === 'stream') {
+      void startFunAsrInput(mode).then((started) => {
+        if (!started && !manualStopRef.current && !disabledRef.current) startBrowserSpeechInput(mode)
+      })
+      return
+    }
+    startBrowserSpeechInput(mode)
+  }, [startBrowserSpeechInput, startFunAsrInput])
 
   const stopVoiceInput = useCallback(() => {
     stopRecognition(true)
@@ -4211,6 +4420,13 @@ function ChatComposer({
     buttonKind === 'voice' ? 'voice-send-button' : '',
     listening ? 'listening' : '',
   ].filter(Boolean).join(' ')
+  const immersiveVoiceStatus = listening
+    ? voiceProvider === 'funasr'
+      ? 'FunASR 2-pass 已开'
+      : voiceProvider === 'browser' && ASR_WS_URL
+        ? '浏览器识别兜底'
+        : (listeningText || '麦克风已开')
+    : '麦克风已关'
 
   return (
     <section className={voiceOnly ? 'bottom-composer immersive-composer' : 'bottom-composer'}>
@@ -4233,7 +4449,7 @@ function ChatComposer({
       </div>
       <div className="composer-tool-row">
         <div className="composer-left-tools">
-          {voiceOnly ? <span className={listening ? 'immersive-listening active' : 'immersive-listening'}>{listening ? (listeningText || '麦克风已开') : '麦克风已关'}</span> : null}
+          {voiceOnly ? <span className={listening ? 'immersive-listening active' : 'immersive-listening'}>{immersiveVoiceStatus}</span> : null}
           {!voiceOnly && onUpload ? (
             <label className={uploadDisabled ? 'composer-upload-button disabled' : 'composer-upload-button'} title="上传文件" aria-label="上传文件">
               <input
@@ -5179,6 +5395,59 @@ function normalizeVoiceAnswer(value: string) {
     return chunks.slice(0, -1).join(' ')
   }
   return text
+}
+
+function appendVoiceSegment(current: string, next: string) {
+  const clean = normalizeVoiceAnswer(next)
+  if (!clean) return current
+  if (!current) return clean
+  if (current.endsWith(clean) || current.includes(clean)) return current
+  return `${current} ${clean}`.trim()
+}
+
+function parseFunAsrMessage(raw: string) {
+  try {
+    const data = JSON.parse(raw) as { text?: string; mode?: string; is_final?: boolean; isFinal?: boolean }
+    const text = normalizeVoiceAnswer(String(data.text || ''))
+    const mode = String(data.mode || '').toLowerCase()
+    return {
+      text,
+      isFinal: Boolean(data.is_final || data.isFinal || mode.includes('offline')),
+    }
+  } catch {
+    return { text: '', isFinal: false }
+  }
+}
+
+function floatTo16kPcm(input: Float32Array, sampleRate: number) {
+  const targetRate = 16000
+  const ratio = sampleRate / targetRate
+  const outputLength = Math.max(0, Math.floor(input.length / ratio))
+  const buffer = new ArrayBuffer(outputLength * 2)
+  const view = new DataView(buffer)
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourceIndex = Math.min(input.length - 1, Math.floor(index * ratio))
+    const sample = Math.max(-1, Math.min(1, input[sourceIndex] || 0))
+    view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+  }
+  return buffer
+}
+
+function buildFunAsrHotwords() {
+  return {
+    产品经理: 20,
+    模拟面试: 20,
+    自我介绍: 15,
+    项目经历: 15,
+    实习经历: 15,
+    AIGC: 20,
+    AI产品经理: 20,
+    字节跳动: 20,
+    腾讯: 15,
+    阿里: 15,
+    快手: 15,
+    小红书: 15,
+  }
 }
 
 function formatTime(value: number) {
