@@ -594,6 +594,10 @@ function App() {
     if (lastTtsText) speakInterviewText(lastTtsText, true)
   }, [lastTtsText, speakInterviewText])
 
+  useEffect(() => {
+    if (peachPanel !== 'live-interview') stopTts()
+  }, [module, peachPanel, stopTts])
+
   const resetClientWorkspace = useCallback(() => {
     const freshConversations = initialConversations.map((conversation) => ({ ...conversation, messages: [...conversation.messages] }))
     setModule('peach')
@@ -874,6 +878,7 @@ function App() {
       warnInterviewNavigationLocked()
       return
     }
+    stopTts()
     setModule(nextModule)
     if (nextModule === 'peach') setPeachPanel('new-chat')
     if (nextModule === 'knowledge') {
@@ -892,6 +897,7 @@ function App() {
       warnInterviewNavigationLocked()
       return
     }
+    stopTts()
     const active = conversations.find((conversation) => conversation.id === activeConversationId)
     if (active && active.messages.length === 0) {
       setPeachPanel('new-chat')
@@ -913,6 +919,7 @@ function App() {
       warnInterviewNavigationLocked()
       return
     }
+    stopTts()
     setActiveConversationId(id)
     setPeachPanel('new-chat')
     setNotice('已切回历史对话。')
@@ -923,6 +930,7 @@ function App() {
       warnInterviewNavigationLocked()
       return
     }
+    stopTts()
     const conversation = conversations.find((item) => item.id === id)
     if (!conversation) return
     const nextTitle = window.prompt('重命名对话', conversation.title)?.trim()
@@ -938,6 +946,7 @@ function App() {
       warnInterviewNavigationLocked()
       return
     }
+    stopTts()
     const conversation = conversations.find((item) => item.id === id)
     if (!conversation) return
     const linkedInterview = findConversationLinkedInterview(conversation, dashboard?.recent_interviews ?? [])
@@ -991,6 +1000,7 @@ function App() {
 
   async function sendPrompt(prompt: string, extraContext: Record<string, unknown> = {}, visibleContent = prompt) {
     if (!prompt.trim()) return
+    stopTts()
     const snapshot = prompt.trim()
     const visibleSnapshot = visibleContent.trim()
     setInput('')
@@ -1153,12 +1163,12 @@ function App() {
       if (data.report?.summary) {
         const summaryText = `这场面试我已经收尾了。${data.report.summary}`
         appendMessage({ role: 'peach', content: summaryText })
-        speakInterviewText(summaryText)
       }
     }
   }
 
   function runComposerAction(action: string) {
+    stopTts()
     if (action === '模拟面试') {
       setPeachPanel('interview-setup')
       return
@@ -1299,7 +1309,6 @@ function App() {
         setPeachPanel('new-chat')
         const reportText = formatInterviewReportMessage(data.report || data.interview.report)
         appendMessage({ role: 'peach', content: reportText })
-        speakInterviewText(reportText)
       } else if (data.next.should_finish && nextProgress.can_llm_finish && !finishSuggestionShown) {
         appendMessage({
           role: 'peach',
@@ -1353,7 +1362,6 @@ function App() {
       setPeachPanel('new-chat')
       const reportText = formatInterviewReportMessage(data.report || data.interview.report)
       appendMessage({ role: 'peach', content: reportText })
-      speakInterviewText(reportText)
       setNotice('面试已结束，报告已生成。')
       void refreshDashboard()
     } catch (err) {
