@@ -5,6 +5,9 @@ import './App.css'
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 const PEACH_PORTRAIT = '/peach-assets/peach-portrait.png'
 const PEACH_ICON = '/peach-assets/peach-icon.png'
+const LIZI_PORTRAIT = '/peach-assets/lizi-portrait.png'
+const INTERVIEW_STAGES = ['投递期', '业务一面', '业务二面', '业务三面', 'hr面']
+const INTERVIEW_DURATIONS = ['不限', '10分钟', '20分钟', '30分钟', '40分钟']
 const NAV_ICONS: Record<PrimaryModule, string> = {
   peach: '/peach-assets/nav-peach.jpg',
   profile: '/peach-assets/nav-profile.jpg',
@@ -14,7 +17,7 @@ const NAV_ICONS: Record<PrimaryModule, string> = {
 
 type PrimaryModule = 'peach' | 'profile' | 'knowledge' | 'growth'
 type PeachPanel = 'new-chat' | 'interview-setup' | 'question-bank-setup' | 'live-interview'
-type InterviewMode = 'voice' | 'video'
+type InterviewMode = 'voice'
 type TtsRateMode = 'slow' | 'medium' | 'fast'
 type VoiceCaptureMode = 'auto' | 'dictation'
 type ProfileSectionId = 'reviews' | 'full' | 'internship' | 'project' | 'education' | 'skills' | 'competition'
@@ -48,7 +51,7 @@ type AgentToolProposal = {
 type MemoryWrite = { id: string; kind: string; content: string }
 type ChatMessage = { role: 'peach' | 'user' | 'system'; content: string; actions?: AgentToolProposal[] }
 type Conversation = { id: string; title: string; updatedAt: string; messages: ChatMessage[] }
-type BusyKey = 'account' | 'refresh' | 'recommend' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload'
+type BusyKey = 'account' | 'refresh' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload'
 type Account = { username: string; display_name?: string }
 
 type Profile = {
@@ -113,6 +116,7 @@ type Dashboard = {
 type HomeContext = {
   peach_view_of_user: Array<{ label: string; value: string }>
   personalized_prompts: string[]
+  personalized_recommendations?: Array<{ id: string; text: string; reason?: string; source_type?: string }>
   pending_actions: GrowthAction[]
 }
 
@@ -190,6 +194,10 @@ type InterviewSettings = {
   style: string
   mode: InterviewMode
   questionBank: string
+  targetRole: string
+  targetCompany: string
+  stage: string
+  duration: string
 }
 
 type InterviewProgress = {
@@ -365,7 +373,7 @@ const initialConversations: Conversation[] = [
 function App() {
   const [account, setAccount] = useState<Account | null>(null)
   const [accountInput, setAccountInput] = useState(() => window.localStorage.getItem('peach:last-username') ?? '')
-  const [accountMessage, setAccountMessage] = useState('输入用户名登录，或直接创建一个 demo 账号。')
+  const [accountMessage, setAccountMessage] = useState('Demo 版本只需要用户名，对于每个用户名都有独立的数据存储。')
   const [module, setModule] = useState<PrimaryModule>('peach')
   const [peachPanel, setPeachPanel] = useState<PeachPanel>('new-chat')
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
@@ -396,14 +404,17 @@ function App() {
   const [isCreatingKnowledge, setIsCreatingKnowledge] = useState(false)
   const [conversations, setConversations] = useState<Conversation[]>(initialConversations)
   const [activeConversationId, setActiveConversationId] = useState(initialConversations[0].id)
-  const [recommendations, setRecommendations] = useState<string[]>([])
   const [settings, setSettings] = useState<InterviewSettings>({
     resume: '完整简历',
     jd: '',
-    gender: '女性',
-    style: '温和型',
+    gender: '不限',
+    style: '不限',
     mode: 'voice',
     questionBank: '产品经理通用题库',
+    targetRole: '',
+    targetCompany: '',
+    stage: '投递期',
+    duration: '不限',
   })
   const [liveKind, setLiveKind] = useState<'interview' | 'question-bank'>('interview')
   const [activeInterviewId, setActiveInterviewId] = useState('')
@@ -432,20 +443,17 @@ function App() {
   const [savedKnowledge, setSavedKnowledge] = useState<string[]>(['pm-method'])
 
   const chatScrollRef = useRef<HTMLElement | null>(null)
-  const videoRef = useRef<HTMLVideoElement | null>(null)
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const lastInterviewAnswerRef = useRef<{ text: string; at: number }>({ text: '', at: 0 })
-  const recommendationsHydratedRef = useRef(false)
   const profileHydratedRef = useRef(false)
   const knowledgeHydratedRef = useRef(false)
 
   const profile = dashboard?.profile ?? defaultProfile
   const activeConversation = conversations.find((item) => item.id === activeConversationId) ?? conversations[0]
   const busyText = Object.values(busy)[0]
-  const fallbackRecommendations = useMemo(() => buildRecommendations(profile, dashboard), [profile, dashboard])
   const visibleRecommendations = useMemo(
-    () => safeRecommendations([...(dashboard?.home_context?.personalized_prompts ?? []), ...recommendations], fallbackRecommendations),
-    [dashboard?.home_context?.personalized_prompts, fallbackRecommendations, recommendations],
+    () => safeRecommendations(dashboard?.home_context?.personalized_prompts ?? []),
+    [dashboard?.home_context?.personalized_prompts],
   )
   const resumeFolders = useMemo(() => buildResumeFolders(profile, dashboard, profileSections), [profile, dashboard, profileSections])
   const knowledgeItems = useMemo(
@@ -514,10 +522,13 @@ function App() {
     const utterance = new SpeechSynthesisUtterance(text)
     utterance.lang = 'zh-CN'
     utterance.rate = ttsRateValue(ttsRateMode)
-    utterance.pitch = 1
+    utterance.pitch = settings.gender === '男性' ? 0.88 : 1
     utterance.volume = 1
     const voices = window.speechSynthesis.getVoices()
-    const zhVoice = voices.find((voice) => voice.lang.toLowerCase().startsWith('zh')) ?? voices[0]
+    const zhVoices = voices.filter((voice) => voice.lang.toLowerCase().startsWith('zh'))
+    const maleVoice = zhVoices.find((voice) => /male|man|男|yunxi|yunjian|xiaogang|kangkang/i.test(`${voice.name} ${voice.voiceURI}`))
+    const femaleVoice = zhVoices.find((voice) => /female|woman|女|xiaoxiao|xiaoyi|tingting|huihui/i.test(`${voice.name} ${voice.voiceURI}`))
+    const zhVoice = settings.gender === '男性' ? (maleVoice ?? zhVoices[0] ?? voices[0]) : (femaleVoice ?? zhVoices[0] ?? voices[0])
     if (zhVoice) utterance.voice = zhVoice
     utterance.onstart = () => setTtsSpeaking(true)
     utterance.onend = () => {
@@ -531,7 +542,7 @@ function App() {
     ttsUtteranceRef.current = utterance
     setTtsSpeaking(true)
     window.speechSynthesis.speak(utterance)
-  }, [ttsMuted, ttsRateMode])
+  }, [settings.gender, ttsMuted, ttsRateMode])
 
   const toggleTtsMuted = useCallback(() => {
     setTtsMuted((current) => {
@@ -575,14 +586,17 @@ function App() {
     setIsCreatingKnowledge(false)
     setConversations(freshConversations)
     setActiveConversationId(freshConversations[0].id)
-    setRecommendations([])
     setSettings({
       resume: '完整简历',
       jd: '',
-      gender: '女性',
-      style: '温和型',
+      gender: '不限',
+      style: '不限',
       mode: 'voice',
       questionBank: '产品经理通用题库',
+      targetRole: '',
+      targetCompany: '',
+      stage: '投递期',
+      duration: '不限',
     })
     setLiveKind('interview')
     setActiveInterviewId('')
@@ -611,7 +625,6 @@ function App() {
     })
     setActiveKnowledgeFolderId('personal-default')
     setSavedKnowledge(['pm-method'])
-    recommendationsHydratedRef.current = false
     profileHydratedRef.current = false
     knowledgeHydratedRef.current = false
   }, [mediaStream])
@@ -731,6 +744,12 @@ function App() {
     if (!dashboard || profileHydratedRef.current) return
     profileHydratedRef.current = true
     setProfileSections(buildInitialProfileSections(dashboard.profile, dashboard))
+    setSettings((current) => ({
+      ...current,
+      targetRole: current.targetRole || dashboard.profile.target_role,
+      targetCompany: current.targetCompany || dashboard.profile.target_company,
+      stage: current.stage || dashboard.profile.stage || '投递期',
+    }))
   }, [dashboard])
 
   useEffect(() => {
@@ -755,50 +774,12 @@ function App() {
   }, [api, dashboard, refreshKnowledgeFolders])
 
   useEffect(() => {
-    if (!dashboard || recommendationsHydratedRef.current) return
-    recommendationsHydratedRef.current = true
-    const currentDashboard = dashboard
-
-    async function hydrateRecommendations() {
-      begin('recommend', '正在生成个性化推荐')
-      try {
-        const history = conversations
-          .flatMap((conversation) => conversation.messages)
-          .filter((message) => message.role !== 'system')
-          .slice(-8)
-          .map((message) => `${message.role}: ${message.content}`)
-          .join('\n')
-        const data = await api<{ reply: string }>('/api/chat', {
-          method: 'POST',
-          body: JSON.stringify({
-            message: `请基于我的个人档案、历史对话和面试记录，生成 4 条我会感兴趣且能提升求职能力的短建议。每条 18 字以内，只输出清单本身。\n历史对话：${history || '暂无'}\n面试记录：${JSON.stringify(currentDashboard.recent_interviews.slice(0, 3))}`,
-          }),
-        })
-        const parsed = parseRecommendationReply(data.reply)
-        if (parsed.length) setRecommendations(parsed)
-      } catch (err) {
-        console.error(err)
-      } finally {
-        end('recommend')
-      }
-    }
-
-    void hydrateRecommendations()
-  }, [api, begin, conversations, dashboard, end])
-
-  useEffect(() => {
     const node = chatScrollRef.current
     if (!node) return
     requestAnimationFrame(() => {
       node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' })
     })
   }, [activeConversation.messages, peachPanel])
-
-  useEffect(() => {
-    if (videoRef.current && mediaStream) {
-      videoRef.current.srcObject = mediaStream
-    }
-  }, [mediaStream])
 
   useEffect(() => {
     if (peachPanel !== 'live-interview' || paused) return undefined
@@ -918,15 +899,23 @@ function App() {
     setNotice('对话已重命名。')
   }
 
-  function deleteConversation(id: string) {
+  async function deleteConversation(id: string) {
     if (peachPanel === 'live-interview') {
       warnInterviewNavigationLocked()
       return
     }
     const conversation = conversations.find((item) => item.id === id)
     if (!conversation) return
-    const confirmed = window.confirm(`确定删除「${conversation.title}」吗？这会移除当前浏览器里的这条对话记录。`)
+    const linkedInterview = findConversationLinkedInterview(conversation, dashboard?.recent_interviews ?? [])
+    const consequence = linkedInterview
+      ? `\n\n这条对话看起来是模拟面试会话。删除后会同时删除个人档案中的对应面试复盘，并清理 Agent 里由这场面试生成的记忆。`
+      : ''
+    const confirmed = window.confirm(`确定删除「${conversation.title}」吗？这会移除当前浏览器里的这条对话记录。${consequence}`)
     if (!confirmed) return
+    if (linkedInterview) {
+      const deleted = await deleteInterviewById(linkedInterview.id)
+      if (!deleted) return
+    }
 
     const rest = conversations.filter((item) => item.id !== id)
     const fallback: Conversation = { id: `chat-${Date.now()}`, title: '新建对话', updatedAt: '刚刚', messages: [] }
@@ -937,6 +926,33 @@ function App() {
       setPeachPanel('new-chat')
     }
     setNotice('对话已删除。')
+  }
+
+  async function deleteInterviewById(interviewId: string) {
+    begin('profile', '正在删除面试复盘')
+    try {
+      await api<{ deleted: boolean; id: string }>(`/api/interviews/${interviewId}`, { method: 'DELETE' })
+      setDashboard((current) => current ? {
+        ...current,
+        recent_interviews: current.recent_interviews.filter((item) => item.id !== interviewId),
+      } : current)
+      setNotice('面试复盘及相关记忆已删除。')
+      return true
+    } catch (err) {
+      setError('面试复盘删除失败，暂未删除会话。')
+      console.error(err)
+      return false
+    } finally {
+      end('profile')
+    }
+  }
+
+  async function deleteInterviewReport(interview: Dashboard['recent_interviews'][number]) {
+    const confirmed = window.confirm(
+      `确定删除「${formatInterviewReportTitle(interview, profile)}」吗？\n\n删除后，这份面试复盘、对应面试记录、由这场面试产生的 Agent 记忆、成长问题和推荐都会一起删除。这个操作不可恢复。`,
+    )
+    if (!confirmed) return
+    await deleteInterviewById(interview.id)
   }
 
   async function sendPrompt(prompt: string, extraContext: Record<string, unknown> = {}, visibleContent = prompt) {
@@ -991,6 +1007,8 @@ function App() {
       setSettings((current) => ({
         ...current,
         style: String(action.payload.interviewer_style ?? current.style),
+        targetRole: String(action.payload.role ?? current.targetRole),
+        targetCompany: String(action.payload.company ?? current.targetCompany),
         jd: String(action.payload.jd ?? current.jd),
         questionBank: String(action.payload.question_bank ?? current.questionBank),
       }))
@@ -1073,6 +1091,8 @@ function App() {
       setSettings((current) => ({
         ...current,
         style: data.interview?.interviewer_style || current.style,
+        targetRole: data.interview?.role || current.targetRole,
+        targetCompany: data.interview?.company || current.targetCompany,
         resume: '完整简历',
         jd: String(action.payload.jd ?? current.jd),
         questionBank: String(action.payload.question_bank ?? current.questionBank),
@@ -1127,6 +1147,8 @@ function App() {
     setSettings((current) => ({
       ...current,
       style: current.style || '温和型',
+      targetRole: current.targetRole || profile.target_role,
+      targetCompany: current.targetCompany || profile.target_company,
       questionBank: `${focus}：围绕为什么做、如何决策、指标结果和业务价值连续追问 3-5 题。`,
     }))
     setNotice('已为你预填专项训练配置。')
@@ -1134,11 +1156,11 @@ function App() {
 
   async function startLiveInterview(kind: 'interview' | 'question-bank') {
     setError('')
-    begin('interviewStart', settings.mode === 'video' ? '正在申请麦克风和摄像头权限' : '正在申请麦克风权限')
+    begin('interviewStart', '正在申请麦克风权限')
     try {
       const stream = await navigator.mediaDevices?.getUserMedia({
         audio: true,
-        video: settings.mode === 'video',
+        video: false,
       })
       if (stream) {
         mediaStream?.getTracks().forEach((track) => track.stop())
@@ -1162,9 +1184,9 @@ function App() {
         body: JSON.stringify({
           interview_type: kind === 'question-bank' ? '题库练习' : '模拟面试',
           interviewer_style: `${settings.gender} / ${settings.style}`,
-          company: profile.target_company,
-          role: profile.target_role,
-          jd: settings.jd,
+          company: settings.targetCompany || profile.target_company,
+          role: settings.targetRole || profile.target_role,
+          jd: [`当前阶段：${settings.stage || profile.stage}`, `面试时长：${settings.duration}`, settings.jd].filter(Boolean).join('\n\n'),
           question_bank: kind === 'question-bank' ? settings.questionBank : '',
         }),
       })
@@ -1179,7 +1201,7 @@ function App() {
       setNotice('实时面试已开始。')
     } catch (err) {
       setMediaReady(false)
-      setError(settings.mode === 'video' ? '摄像头或麦克风权限未开启，无法进入视频面试。' : '麦克风权限未开启，无法进入语音面试。')
+      setError('麦克风权限未开启，无法进入语音面试。')
       console.error(err)
     } finally {
       end('interviewStart')
@@ -2087,7 +2109,6 @@ function App() {
             seconds={seconds}
             paused={paused}
             mediaReady={mediaReady}
-            mediaStream={mediaStream}
             ttsMuted={ttsMuted}
             ttsSpeaking={ttsSpeaking}
             lastTtsText={lastTtsText}
@@ -2095,7 +2116,6 @@ function App() {
             immersiveInterview={immersiveInterview}
             subtitleCollapsed={subtitleCollapsed}
             timerCollapsed={timerCollapsed}
-            videoRef={videoRef}
             chatScrollRef={chatScrollRef}
             busy={busy}
             onInput={setInput}
@@ -2154,6 +2174,8 @@ function App() {
             onDismissAction={dismissAgentAction}
             onStartTraining={startGrowthTraining}
             onOpenGrowth={() => openModule('growth')}
+            onStopReportSpeech={stopTts}
+            onDeleteInterviewReport={(interview) => void deleteInterviewReport(interview)}
           />
         ) : null}
 
@@ -2233,8 +2255,8 @@ function AccountGate({
         </div>
         <div className="account-copy">
           <p>桃子账号</p>
-          <h1>先告诉桃子你是谁</h1>
-          <span>Demo 版本只需要用户名。每个用户名都有独立的档案、知识库、面试和练习记录。</span>
+          <h1>我是桃子，一个越用越懂你、越用越会教你的求职搭子</h1>
+          <span>先告诉桃子你叫什么</span>
         </div>
       </section>
 
@@ -2457,7 +2479,6 @@ function PeachWorkspace(props: {
   seconds: number
   paused: boolean
   mediaReady: boolean
-  mediaStream: MediaStream | null
   ttsMuted: boolean
   ttsSpeaking: boolean
   lastTtsText: string
@@ -2465,7 +2486,6 @@ function PeachWorkspace(props: {
   immersiveInterview: boolean
   subtitleCollapsed: boolean
   timerCollapsed: boolean
-  videoRef: RefObject<HTMLVideoElement | null>
   chatScrollRef: RefObject<HTMLElement | null>
   busy: Partial<Record<BusyKey, string>>
   onInput: (value: string) => void
@@ -2507,7 +2527,6 @@ function PeachWorkspace(props: {
 
   const isBlankConversation = props.conversation.messages.length === 0
   const bubbleItems = uniqueStrings([...fixedBubbles, ...props.recommendations]).slice(0, 8)
-  const peachView = props.homeContext?.peach_view_of_user ?? []
   const personalized = props.homeContext?.personalized_prompts ?? []
 
   return (
@@ -2521,7 +2540,6 @@ function PeachWorkspace(props: {
           <p>我是专属于你的求职搭子</p>
         </div>
         <div className="bubble-group">
-          <PeachViewOfUser items={peachView} onProfile={props.onOpenProfile} />
           <div className="bubble-grid fixed-bubbles">
             {bubbleItems.map((item) => (
               <button
@@ -2595,18 +2613,20 @@ function InterviewSetup({
   const title = isBank ? '面试题库练习' : '模拟面试'
   const targetedTraining = isBank && /(专项训练|继续|练一下|练练|深挖|决策|归因|业务价值)/.test(settings.questionBank)
   const trainingFocus = targetedTraining ? settings.questionBank.split(/[：:]/)[0] : ''
+  const interviewerPortrait = settings.gender === '男性' ? LIZI_PORTRAIT : PEACH_PORTRAIT
+  const interviewerName = settings.gender === '男性' ? '李子' : '桃子'
 
   return (
     <section className="setup-panel">
       <div className="setup-header">
         <div>
           <h2>{title}</h2>
-          <p>{isBank ? '选择题库、简历和面试形式，桃子会按题目连续追问。' : '配置简历、岗位和面试官风格，进入实时对话模式。'}</p>
+          <p>{isBank ? '选择题库、简历和面试官风格，桃子会按题目连续追问。' : '配置简历、岗位和面试官风格，进入实时语音对话。'}</p>
         </div>
         <div className="setup-peach-card" aria-label="桃子陪练官">
-          <img src={PEACH_PORTRAIT} alt="桃子" />
+          <img src={interviewerPortrait} alt={interviewerName} />
           <div>
-            <strong>桃子在场</strong>
+            <strong>{interviewerName}在场</strong>
             <span>{settings.style}陪练官</span>
           </div>
         </div>
@@ -2626,6 +2646,30 @@ function InterviewSetup({
       ) : null}
 
       <div className="setup-grid">
+        <Field label="目标岗位">
+          <input
+            value={settings.targetRole}
+            onChange={(event) => onSettingsChange({ ...settings, targetRole: event.target.value })}
+            placeholder={profile.target_role || '如 AI 产品经理'}
+          />
+        </Field>
+        <Field label="目标公司">
+          <input
+            value={settings.targetCompany}
+            onChange={(event) => onSettingsChange({ ...settings, targetCompany: event.target.value })}
+            placeholder={profile.target_company || '如 字节跳动'}
+          />
+        </Field>
+        <Field label="当前阶段">
+          <select value={settings.stage} onChange={(event) => onSettingsChange({ ...settings, stage: event.target.value })}>
+            {INTERVIEW_STAGES.map((stage) => <option key={stage}>{stage}</option>)}
+          </select>
+        </Field>
+        <Field label="面试时长">
+          <select value={settings.duration} onChange={(event) => onSettingsChange({ ...settings, duration: event.target.value })}>
+            {INTERVIEW_DURATIONS.map((duration) => <option key={duration}>{duration}</option>)}
+          </select>
+        </Field>
         {isBank ? (
           <Field label="面试题库">
             <select value={settings.questionBank} onChange={(event) => onSettingsChange({ ...settings, questionBank: event.target.value })}>
@@ -2659,13 +2703,10 @@ function InterviewSetup({
           />
         </Field>
         <Field label="面试官">
-          <Segmented value={settings.gender} options={['女性', '男性', '不指定']} onChange={(gender) => onSettingsChange({ ...settings, gender })} />
+          <Segmented value={settings.gender} options={['不限', '女性', '男性']} onChange={(gender) => onSettingsChange({ ...settings, gender })} />
         </Field>
         <Field label="面试官风格">
-          <Segmented value={settings.style} options={['温和型', '专业型', '压力型']} onChange={(style) => onSettingsChange({ ...settings, style })} />
-        </Field>
-        <Field label="面试形式">
-          <Segmented value={settings.mode} options={['voice', 'video']} labels={{ voice: '语音面试', video: '视频面试' }} onChange={(mode) => onSettingsChange({ ...settings, mode: mode as InterviewMode })} />
+          <Segmented value={settings.style} options={['不限', '温和型', '专业型', '压力型']} onChange={(style) => onSettingsChange({ ...settings, style })} />
         </Field>
       </div>
 
@@ -2678,15 +2719,15 @@ function InterviewSetup({
       <div className="setup-summary">
         <div>
           <span>目标岗位</span>
-          <strong>{profile.target_role}</strong>
+          <strong>{settings.targetRole || profile.target_role}</strong>
         </div>
         <div>
           <span>目标公司</span>
-          <strong>{profile.target_company || '未填写'}</strong>
+          <strong>{settings.targetCompany || profile.target_company || '未填写'}</strong>
         </div>
         <div>
           <span>当前阶段</span>
-          <strong>{profile.stage}</strong>
+          <strong>{settings.stage || profile.stage}</strong>
         </div>
       </div>
     </section>
@@ -2703,7 +2744,6 @@ function LiveInterview({
   seconds,
   paused,
   mediaReady,
-  mediaStream,
   ttsMuted,
   ttsSpeaking,
   lastTtsText,
@@ -2711,7 +2751,6 @@ function LiveInterview({
   immersiveInterview,
   subtitleCollapsed,
   timerCollapsed,
-  videoRef,
   chatScrollRef,
   busy,
   onInput,
@@ -2732,11 +2771,10 @@ function LiveInterview({
   onDismissAction,
 }: Parameters<typeof PeachWorkspace>[0]) {
   const liveTitle = liveKind === 'question-bank' ? '题库练习进行中' : '模拟面试进行中'
-  const contextItems = [
-    { label: '岗位', value: settings.resume },
-    { label: '风格', value: settings.style },
-    { label: '形式', value: settings.mode === 'video' ? '视频' : '语音' },
-  ]
+  const interviewerPortrait = settings.gender === '男性' ? LIZI_PORTRAIT : PEACH_PORTRAIT
+  const interviewerName = settings.gender === '男性' ? '李子' : '桃子'
+  const durationLimit = interviewDurationSeconds(settings.duration)
+  const durationProgress = durationLimit ? Math.min(100, Math.round((seconds / durationLimit) * 100)) : 0
   const transcriptPreview = conversation.messages
     .filter((message) => message.role !== 'system')
     .slice(-4)
@@ -2759,19 +2797,11 @@ function LiveInterview({
         <div className="avatar-stage" aria-label="桃子的半身形象">
           <div className={paused ? 'peach-avatar paused' : 'peach-avatar'}>
             <div className="avatar-aura" />
-            <img className="peach-live-portrait" src={PEACH_PORTRAIT} alt="桃子面试官形象" />
+            <img className="peach-live-portrait" src={interviewerPortrait} alt={`${interviewerName}面试官形象`} />
             <div className="avatar-body">
               <strong>{liveTitle}</strong>
-              <span>{settings.mode === 'video' ? '视频面试' : '语音面试'} / {settings.style}</span>
+              <span>语音面试 / {settings.style}</span>
             </div>
-          </div>
-          <div className="interview-context-grid">
-            {contextItems.map((item) => (
-              <div key={item.label}>
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
-              </div>
-            ))}
           </div>
           <div className="live-controls">
             <button type="button" onClick={onPauseToggle}>{paused ? '继续面试' : '暂停面试'}</button>
@@ -2800,7 +2830,7 @@ function LiveInterview({
         <ChatComposer
           value={input}
           placeholder={immersiveInterview ? (paused ? '面试暂停中' : ttsSpeaking ? '桃子正在说话' : '沉浸式已开启，说完后桃子会自动追问') : (paused ? '面试暂停中，点击继续后再回答' : '输入你的回答，或点击麦克风实时转写')}
-          actions={immersiveInterview ? ['结束面试'] : [paused ? '继续面试' : '暂停面试', '结束面试']}
+          actions={immersiveInterview ? [] : [paused ? '继续面试' : '暂停面试', '结束面试']}
           disabled={paused || Boolean(busy.chat) || (immersiveInterview && ttsSpeaking)}
           button={busy.chat ? '发送中' : '语音输入'}
           buttonKind="voice"
@@ -2826,11 +2856,6 @@ function LiveInterview({
             <span>当前面试</span>
             <strong>{activeInterviewId ? '已同步' : '本地模式'}</strong>
           </div>
-          <p>{settings.jd.trim() ? summarizeClientText(settings.jd, 120) : '未填写 JD。桃子会先按目标岗位和简历追问。'}</p>
-          <p className="interview-progress-note">
-            已回答 {interviewProgress.answer_count} 轮，完成度 {interviewProgress.completion}%。
-            桃子至少完成 {interviewProgress.min_answers_for_llm_finish} 轮，并覆盖主要考察项后才会建议结束。
-          </p>
           <div className="interview-checklist">
             {(interviewProgress.checklist ?? []).map((item) => (
               <span className={item.done ? 'done' : ''} key={item.key}>{item.done ? '✓' : '○'} {item.label}</span>
@@ -2865,16 +2890,6 @@ function LiveInterview({
           </label>
         </section>
 
-        {settings.mode === 'video' ? (
-          <section className="side-widget video-widget">
-            <div className="widget-head">
-              <span>我的视频</span>
-              <strong>{mediaStream ? '已连接' : '未连接'}</strong>
-            </div>
-            {mediaStream ? <video ref={videoRef} autoPlay muted playsInline /> : <div className="video-placeholder">等待摄像头权限</div>}
-          </section>
-        ) : null}
-
         <section className={subtitleCollapsed ? 'side-widget collapsed' : 'side-widget'}>
           <div className="widget-head">
             <span>实时字幕</span>
@@ -2903,45 +2918,16 @@ function LiveInterview({
             <div className="timer-readout">
               <strong>{formatTime(seconds)}</strong>
               <span>{paused ? '暂停中' : '进行中'}</span>
+              {durationLimit ? (
+                <div className="timer-progress" aria-label="面试时长进度">
+                  <i style={{ width: `${durationProgress}%` }} />
+                  <small>{durationProgress}% / {settings.duration}</small>
+                </div>
+              ) : <small>不限时</small>}
             </div>
           ) : null}
         </section>
       </aside>
-    </section>
-  )
-}
-
-function PeachViewOfUser({
-  items,
-  onProfile,
-}: {
-  items: Array<{ label: string; value: string }>
-  onProfile: () => void
-}) {
-  if (!items.length) {
-    return (
-      <section className="peach-view-card empty">
-        <strong>桃子还在认识你</strong>
-        <p>和我聊聊你的求职目标、上传简历，或者完成一次模拟面试后，这里会逐渐形成属于你的求职画像。</p>
-        <button type="button" onClick={onProfile}>完善个人档案</button>
-      </section>
-    )
-  }
-
-  return (
-    <section className="peach-view-card">
-      <div className="peach-view-head">
-        <strong>桃子眼中的你</strong>
-        <span>我会随着我们的对话和练习越来越了解你</span>
-      </div>
-      <div className="peach-view-list">
-        {items.slice(0, 6).map((item) => (
-          <article key={`${item.label}-${item.value}`}>
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-          </article>
-        ))}
-      </div>
     </section>
   )
 }
@@ -2970,6 +2956,8 @@ function ProfileWorkspace({
   onDismissAction,
   onStartTraining,
   onOpenGrowth,
+  onStopReportSpeech,
+  onDeleteInterviewReport,
 }: {
   profile: Profile
   folders: ResumeFolder[]
@@ -2994,6 +2982,8 @@ function ProfileWorkspace({
   onDismissAction: (action: AgentToolProposal) => void
   onStartTraining: (prompt: string) => void
   onOpenGrowth: () => void
+  onStopReportSpeech: () => void
+  onDeleteInterviewReport: (interview: Dashboard['recent_interviews'][number]) => void
 }) {
   const current = profileSectionMeta[activeSection]
   const sectionItems = flattenResumeFolders(folders)
@@ -3080,6 +3070,8 @@ function ProfileWorkspace({
                   interview={selectedReport}
                   profile={profile}
                   onDownload={() => downloadInterviewReport(selectedReport, profile)}
+                  onStopSpeech={onStopReportSpeech}
+                  onDelete={() => onDeleteInterviewReport(selectedReport)}
                   onStartTraining={onStartTraining}
                   onOpenGrowth={onOpenGrowth}
                 />
@@ -3194,12 +3186,16 @@ function InterviewReportPanel({
   interview,
   profile,
   onDownload,
+  onStopSpeech,
+  onDelete,
   onStartTraining,
   onOpenGrowth,
 }: {
   interview: Dashboard['recent_interviews'][number]
   profile: Profile
   onDownload: () => void
+  onStopSpeech: () => void
+  onDelete: () => void
   onStartTraining: (prompt: string) => void
   onOpenGrowth: () => void
 }) {
@@ -3208,7 +3204,11 @@ function InterviewReportPanel({
     <article className="interview-report-panel">
       <div className="profile-card-head">
         <strong>{report.position}</strong>
-        <button type="button" onClick={onDownload}>下载 PDF</button>
+        <div className="report-head-actions">
+          <button type="button" onClick={onStopSpeech}>停止朗读</button>
+          <button type="button" onClick={onDownload}>下载 PDF</button>
+          <button type="button" className="secondary-danger" onClick={onDelete}>删除报告</button>
+        </div>
       </div>
       <div className="report-score-row">
         <div>
@@ -4187,14 +4187,15 @@ function ChatComposer({
   }
 
   function handlePrimaryClick() {
-    if (buttonKind === 'voice') {
-      if (voiceOnly || listening || !value.trim()) {
-        toggleVoiceInput()
-        return
-      }
-      onSubmit()
+    if (buttonKind === 'voice' || voiceOnly) {
+      toggleVoiceInput()
       return
     }
+    onSubmit()
+  }
+
+  function handleSendClick() {
+    if (disabled || !value.trim()) return
     onSubmit()
   }
 
@@ -4205,7 +4206,7 @@ function ChatComposer({
     onVoiceSubmit?.(content)
   }
 
-  const primaryDisabled = disabled || (buttonKind !== 'voice' && !value.trim())
+  const primaryDisabled = disabled && !listening
   const primaryClass = [
     buttonKind === 'voice' ? 'voice-send-button' : '',
     listening ? 'listening' : '',
@@ -4221,6 +4222,7 @@ function ChatComposer({
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
             if (voiceOnly) return
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
               onSubmit()
@@ -4256,18 +4258,6 @@ function ChatComposer({
           ) : null}
         </div>
         <div className="composer-send-group">
-          {voiceOnly && actions.includes('结束面试') ? (
-            <button
-              className="immersive-end-button"
-              type="button"
-              onClick={() => {
-                stopVoiceInput()
-                onAction('结束面试')
-              }}
-            >
-              结束面试
-            </button>
-          ) : null}
           {voiceOnly ? (
             <button
               className={captureMode === 'dictation' && listening ? 'immersive-long-voice active' : 'immersive-long-voice'}
@@ -4285,12 +4275,24 @@ function ChatComposer({
               onClick={handleForceSubmit}
               disabled={disabled || !value.trim()}
             >
-              发送转写
+              确认本句
             </button>
           ) : null}
           <button className={primaryClass} type="button" onClick={handlePrimaryClick} disabled={primaryDisabled} aria-label={listening ? '停止语音输入' : button}>
             {buttonKind === 'voice' ? <span className="mic-icon" aria-hidden="true" /> : button}
           </button>
+          {!voiceOnly && buttonKind === 'voice' ? (
+            <button
+              className="composer-send-button"
+              type="button"
+              onClick={handleSendClick}
+              disabled={disabled || !value.trim()}
+              aria-label="发送"
+              title="发送"
+            >
+              <span aria-hidden="true">➤</span>
+            </button>
+          ) : null}
         </div>
       </div>
     </section>
@@ -4893,6 +4895,16 @@ function formatInterviewReportTitle(interview: Dashboard['recent_interviews'][nu
   return `${date}${interview.company || profile.target_company || '目标公司'}${interview.role || profile.target_role}`
 }
 
+function findConversationLinkedInterview(conversation: Conversation, interviews: Dashboard['recent_interviews']) {
+  const text = [conversation.title, ...conversation.messages.map((message) => message.content)].join('\n')
+  if (!/(模拟面试|面试已结束|复盘报告|报告已归档|结束并生成报告)/.test(text)) return undefined
+  return interviews.find((interview) => {
+    const company = interview.company || ''
+    const role = interview.role || ''
+    return (company && text.includes(company)) || (role && text.includes(role)) || text.includes('面试已结束')
+  }) ?? interviews[0]
+}
+
 function buildInterviewHistorySummary(interviews: Dashboard['recent_interviews'], profile: Profile) {
   const completed = interviews.filter((item) => item.status === 'completed' || item.report?.summary)
   if (!completed.length) return `还没有面试报告。完成一次${profile.target_role}模拟面试后，报告会自动归档到这里。`
@@ -4972,27 +4984,6 @@ function fileUploadErrorMessage(err: unknown) {
   return `文件上传失败：${detail}`
 }
 
-function buildRecommendations(profile: Profile, dashboard: Dashboard | null) {
-  const company = profile.target_company || '字节跳动'
-  const role = profile.target_role || '产品经理'
-  const weakPoint = dashboard?.growth.weak_points?.[0] ?? profile.weak_points?.[0] ?? '简历深挖题'
-  return [
-    `再练练${weakPoint}`,
-    `${role}方法论是什么`,
-    `我这个 bg 什么时候投秋招最好`,
-    `模拟面试${company} AIGC 策略产品经理岗位`,
-  ]
-}
-
-function parseRecommendationReply(value: string) {
-  return cleanAssistantText(value)
-    .split('\n')
-    .map((line) => line.replace(/^\s*(\d+[.)、]|•|-)\s*/, '').trim())
-    .map(cleanRecommendationText)
-    .filter(Boolean)
-    .slice(0, 4)
-}
-
 function cleanRecommendationText(value: string) {
   const cleaned = value
     .replace(/^["“”'「」]+|["“”'「」]+$/g, '')
@@ -5005,10 +4996,9 @@ function cleanRecommendationText(value: string) {
   return cleaned
 }
 
-function safeRecommendations(source: string[], fallback: string[]) {
+function safeRecommendations(source: string[]) {
   const cleaned = uniqueStrings(source.map(cleanRecommendationText).filter(Boolean))
-  if (cleaned.length >= 3) return cleaned.slice(0, 4)
-  return uniqueStrings([...cleaned, ...fallback.map(cleanRecommendationText).filter(Boolean)]).slice(0, 4)
+  return cleaned.slice(0, 4)
 }
 
 function uniqueStrings(values: string[]) {
@@ -5050,6 +5040,27 @@ function summarizeSection(id: ProfileSectionId, content: string) {
   return clean.length > 82 ? `${clean.slice(0, 82)}...` : clean
 }
 
+function buildResumeNavSummary(profile: Profile, dashboard: Dashboard | null, sections: Record<ProfileSectionId, string>) {
+  const hasMainResume = Boolean((sections.full || profile.resume_text || '').trim())
+  const resumeCount = hasMainResume ? 1 : 0
+  const optimizedCount = countOptimizedResumeSignals(profile, dashboard, sections)
+  const roles = uniqueStrings([
+    profile.target_role,
+    ...((dashboard?.recent_interviews ?? []).map((item) => item.role).filter(Boolean)),
+  ]).slice(0, 2)
+  const roleText = roles.length ? roles.join('、') : '目标'
+  return `共 ${resumeCount} 份简历，已优化 ${optimizedCount} 份，适合投 ${roleText} 岗位`
+}
+
+function countOptimizedResumeSignals(profile: Profile, dashboard: Dashboard | null, sections: Record<ProfileSectionId, string>) {
+  const text = [
+    profile.resume_text,
+    sections.full,
+    ...((dashboard?.recent_practices ?? []).map((item) => [item.question, item.feedback?.summary, item.feedback?.archive].join(' '))),
+  ].join('\n')
+  return /优化|改写|匹配度|量化|证据链/.test(text) ? 1 : 0
+}
+
 function buildResumeFolders(profile: Profile, dashboard: Dashboard | null, sections: Record<ProfileSectionId, string>): ResumeFolder[] {
   const reviewSummary = dashboard?.recent_practices.find((item) => item.tags.includes('面试复盘'))?.feedback?.archive
   return [
@@ -5062,9 +5073,9 @@ function buildResumeFolders(profile: Profile, dashboard: Dashboard | null, secti
     {
       id: 'resume',
       title: '个人简历',
-      summary: profile.resume_text ? profile.resume_text.slice(0, 72) : '还没有完整简历内容，可以先补充经历摘要。',
+      summary: buildResumeNavSummary(profile, dashboard, sections),
       children: [
-        { id: 'full', title: '完整简历', summary: summarizeSection('full', sections.full || profile.resume_text || '') },
+        { id: 'full', title: '完整简历', summary: buildResumeNavSummary(profile, dashboard, sections) },
         { id: 'internship', title: '实习经历', summary: summarizeSection('internship', sections.internship) },
         { id: 'project', title: '项目经历', summary: summarizeSection('project', sections.project) },
         { id: 'education', title: '教育背景', summary: summarizeSection('education', sections.education) },
@@ -5174,6 +5185,11 @@ function formatTime(value: number) {
   const minutes = Math.floor(value / 60).toString().padStart(2, '0')
   const seconds = (value % 60).toString().padStart(2, '0')
   return `${minutes}:${seconds}`
+}
+
+function interviewDurationSeconds(value: string) {
+  const minutes = Number(value.match(/\d+/)?.[0] ?? 0)
+  return minutes > 0 ? minutes * 60 : 0
 }
 
 function cleanAssistantText(value: string) {

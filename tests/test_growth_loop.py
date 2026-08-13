@@ -6,11 +6,14 @@ from backend.app.models import (
     ActionState,
     AgentMemory,
     GrowthIssue,
+    HomeRecommendation,
     InterviewSession,
     UserAbilityScore,
     UserProfile,
 )
 from backend.app.services.growth import apply_interview_growth_update, build_growth_center, build_home_context
+from backend.app.services.recommendations import refresh_home_recommendations, should_refresh_recommendations
+from backend.app.api.routes import has_profile_recommendation_signal
 
 
 @pytest.mark.asyncio
@@ -119,7 +122,93 @@ async def test_home_context_and_growth_center_use_growth_state(db_session) -> No
     growth = await build_growth_center(db_session, profile)
 
     assert home["peach_view_of_user"]
-    assert home["personalized_prompts"]
+    assert home["personalized_prompts"] == []
     assert growth["readiness_score"] > 0
     assert growth["stats"]["tracked_issue_count"] >= 1
     assert growth["recommendation"]["title"]
+
+
+@pytest.mark.asyncio
+async def test_home_recommendations_are_cached_and_user_scoped(db_session) -> None:
+    profile = UserProfile(
+        id="u-recommend-a",
+        username="Apple01",
+        name="Apple01",
+        target_role="AI 产品经理",
+        target_company="字节跳动",
+        resume_text="负责 AIGC 素材工具，从需求调研到指标设计都有参与，沉淀了项目复盘。",
+    )
+    other_profile = UserProfile(id="u-recommend-b", username="Banana052", name="Banana052")
+    db_session.add_all([profile, other_profile])
+    db_session.add(
+        GrowthIssue(
+            user_id=profile.id,
+            issue_key="project_decision_reasoning",
+            title="项目决策依据不足",
+            description="需要把为什么做、怎么取舍和指标证据说清楚。",
+            ability_dimension="project_deep_dive",
+            status="new",
+        )
+    )
+    await db_session.commit()
+
+    empty_home = await build_home_context(db_session, other_profile)
+    assert empty_home["personalized_prompts"] == []
+
+    refreshed = await refresh_home_recommendations(
+        db_session,
+        profile,
+        trigger_reason="interview_finish",
+        source_type="interview",
+        source_id="iv-recommend-a",
+        force=True,
+    )
+    await db_session.commit()
+
+    home = await build_home_context(db_session, profile)
+    stored = (
+        await db_session.execute(select(HomeRecommendation).where(HomeRecommendation.user_id == profile.id))
+    ).scalars().all()
+    other_stored = (
+        await db_session.execute(select(HomeRecommendation).where(HomeRecommendation.user_id == other_profile.id))
+    ).scalars().all()
+
+    assert refreshed
+    assert home["personalized_prompts"] == [item["text"] for item in refreshed]
+    assert any("项目决策依据不足" in item["text"] for item in refreshed)
+    assert stored
+    assert other_stored == []
+
+
+def test_recommendation_probability_gate() -> None:
+    assert should_refresh_recommendations("u-a", "memory", "m-a", probability=0) is False
+    assert should_refresh_recommendations("u-a", "memory", "m-a", probability=1) is True
+
+
+@pytest.mark.asyncio
+async def test_profile_zero_to_one_signal_forces_home_recommendations(db_session) -> None:
+    profile = UserProfile(id="u-zero-one", username="Cherry07", name="同学", target_role="产品经理", resume_text="")
+    db_session.add(profile)
+    await db_session.commit()
+
+    assert has_profile_recommendation_signal(profile) is False
+    empty_home = await build_home_context(db_session, profile)
+    assert empty_home["personalized_prompts"] == []
+
+    profile.resume_text = (
+        "负责 AIGC 广告素材二创工具，从需求调研到上线复盘都有参与，"
+        "完成创作者访谈、需求优先级排序、指标设计和灰度复盘，"
+        "沉淀了用户痛点、方案取舍、上线结果和可追问项目细节。"
+    )
+    assert has_profile_recommendation_signal(profile) is True
+    refreshed = await refresh_home_recommendations(
+        db_session,
+        profile,
+        trigger_reason="profile",
+        source_type="profile",
+        source_id=profile.id,
+        force=True,
+    )
+
+    assert refreshed
+    assert any(item["source_type"] == "resume" for item in refreshed)

@@ -18,6 +18,7 @@ from backend.app.models import (
     UserProfile,
 )
 from backend.app.services.memory import upsert_memory
+from backend.app.services.recommendations import get_home_recommendations
 
 
 ABILITY_DIMENSIONS = [
@@ -317,10 +318,11 @@ async def build_home_context(session: AsyncSession, profile: UserProfile) -> dic
     ).scalars().all()
     actions = await pending_actions(session, profile.id, limit=4)
     view = build_peach_view_of_user(profile, list(memories), list(issues), list(insights))
-    prompts = build_personalized_prompts(profile, list(issues), list(insights), actions)
+    recommendations = await get_home_recommendations(session, profile.id)
     return {
         "peach_view_of_user": view,
-        "personalized_prompts": prompts,
+        "personalized_prompts": [item["text"] for item in recommendations],
+        "personalized_recommendations": recommendations,
         "pending_actions": [serialize_action(action) for action in actions],
     }
 

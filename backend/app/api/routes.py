@@ -14,6 +14,7 @@ from backend.app.models import (
     AgentMemoryEvent,
     GrowthInsight,
     GrowthIssue,
+    HomeRecommendation,
     InterviewSession,
     KnowledgeFolder,
     KnowledgeResource,
@@ -39,6 +40,7 @@ from backend.app.services.agent import PeachAgent
 from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
 from backend.app.services.growth import apply_interview_growth_update, build_growth_center, build_home_context
 from backend.app.services.memory import PeachMemoryService, build_memory_context, remember_interaction, remember_interaction_isolated, retrieve_relevant_memories, upsert_memory
+from backend.app.services.recommendations import refresh_home_recommendations
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
@@ -69,6 +71,19 @@ def require_username(value: str | None) -> str:
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
     return username
+
+
+def has_profile_recommendation_signal(profile: UserProfile) -> bool:
+    """Whether the profile has user-provided material worth refreshing home prompts for."""
+    return any(
+        [
+            bool((profile.resume_text or "").strip()),
+            bool((profile.target_company or "").strip()),
+            bool((profile.target_city or "").strip()),
+            bool((profile.name or "").strip() and profile.name != "同学"),
+            bool((profile.target_role or "").strip() and profile.target_role != "产品经理"),
+        ]
+    )
 
 
 async def get_existing_profile(session: AsyncSession, username: str) -> UserProfile | None:
@@ -175,6 +190,7 @@ async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
     await session.execute(delete(UserAbilityScore).where(UserAbilityScore.user_id == profile.id))
     await session.execute(delete(GrowthInsight).where(GrowthInsight.user_id == profile.id))
     await session.execute(delete(GrowthIssue).where(GrowthIssue.user_id == profile.id))
+    await session.execute(delete(HomeRecommendation).where(HomeRecommendation.user_id == profile.id))
     await session.execute(delete(AgentMemoryEvent).where(AgentMemoryEvent.user_id == profile.id))
     await session.execute(delete(AgentMemory).where(AgentMemory.user_id == profile.id))
     profile.name = "同学"
@@ -281,16 +297,28 @@ async def read_profile(session: AsyncSession = Depends(get_session)) -> dict:
 @router.post("/profile")
 async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
+    had_recommendation_signal = has_profile_recommendation_signal(profile)
     for key, value in payload.model_dump().items():
         setattr(profile, key, value)
 
-    init = await agent.initialize_profile(profile)
-    profile.strengths = init.get("strengths", [])
-    profile.weak_points = init.get("weak_points", [])
-    profile.plan = init.get("plan", [])
+    has_recommendation_signal = has_profile_recommendation_signal(profile)
+    force_recommendations = not had_recommendation_signal and has_recommendation_signal
+    if (profile.resume_text or "").strip():
+        profile.strengths = merge_points(profile.strengths, ["已有可用于面试和简历生成的材料"])
+        profile.weak_points = merge_points(profile.weak_points, ["简历亮点需要继续量化和证据化"])
+    if not profile.plan:
+        profile.plan = default_plan()
+    await refresh_recommendations_safely(
+        session,
+        profile,
+        trigger_reason="profile",
+        source_type="profile",
+        source_id=profile.id,
+        force=force_recommendations,
+    )
     await session.commit()
     await session.refresh(profile)
-    return {"profile": serialize_profile(profile), "greeting": init.get("greeting", "")}
+    return {"profile": serialize_profile(profile), "greeting": "个人档案已保存。"}
 
 
 @router.get("/dashboard")
@@ -373,9 +401,11 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
     profile.weak_points = merge_points(profile.weak_points, feedback.get("improvements", []))
     profile.strengths = merge_points(profile.strengths, feedback.get("highlights", []))
     session.add(record)
+    await session.flush()
+    await refresh_recommendations_safely(session, profile, trigger_reason="practice", source_type="practice", source_id=record.id)
     await session.commit()
     await session.refresh(record)
-    memory_writes = await remember_interaction_safely(
+    await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -432,7 +462,13 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
         source="interview_start",
         user_message=f"开始{payload.interview_type}：{payload.company} {payload.role}\nJD：{payload.jd[:1200]}",
         assistant_reply="\n".join([opening["opening"], opening["question"]]),
-        context={"interviewer_style": payload.interviewer_style, "question_bank": payload.question_bank[:1200]},
+        context={
+            "interview_id": interview.id,
+            "company": interview.company,
+            "role": interview.role,
+            "interviewer_style": payload.interviewer_style,
+            "question_bank": payload.question_bank[:1200],
+        },
     )
     return {"interview": serialize_interview(interview), "opening": opening, "progress": build_interview_progress(interview)}
 
@@ -469,6 +505,14 @@ async def answer_interview(
         interview.status = "completed"
         interview.report = await agent.interview_report(profile, interview, memory_context)
         growth_update = await apply_interview_growth_update(session, profile, interview)
+        await refresh_recommendations_safely(
+            session,
+            profile,
+            trigger_reason="interview_finish",
+            source_type="interview",
+            source_id=interview.id,
+            force=True,
+        )
         progress = build_interview_progress(interview)
 
     await session.commit()
@@ -481,6 +525,7 @@ async def answer_interview(
         user_message=payload.answer,
         assistant_reply="\n".join([str(next_turn.get("micro_feedback") or ""), str(next_turn.get("next_question") or "")]),
         context={
+            "interview_id": interview.id,
             "company": interview.company,
             "role": interview.role,
             "interviewer_style": interview.interviewer_style,
@@ -509,6 +554,14 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
     interview.status = "completed"
     interview.report = await agent.interview_report(profile, interview, memory_context)
     growth_update = await apply_interview_growth_update(session, profile, interview)
+    await refresh_recommendations_safely(
+        session,
+        profile,
+        trigger_reason="interview_finish",
+        source_type="interview",
+        source_id=interview.id,
+        force=True,
+    )
     await session.commit()
     await session.refresh(interview)
     await remember_interaction_safely(
@@ -518,7 +571,12 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
         source="interview_report",
         user_message=f"结束面试：{interview.company} {interview.role}",
         assistant_reply=str(interview.report),
-        context={"transcript_tail": interview.transcript[-8:]},
+        context={
+            "interview_id": interview.id,
+            "company": interview.company,
+            "role": interview.role,
+            "transcript_tail": interview.transcript[-8:],
+        },
     )
     return {
         "interview": serialize_interview(interview),
@@ -528,6 +586,19 @@ async def finish_interview(interview_id: str, session: AsyncSession = Depends(ge
         "memory_updates": growth_update.memory_updates,
         "next_actions": growth_update.actions,
     }
+
+
+@router.delete("/interviews/{interview_id}")
+async def delete_interview(interview_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    interview = await session.get(InterviewSession, interview_id)
+    if not interview or interview.user_id != profile.id:
+        raise HTTPException(status_code=404, detail="interview not found")
+
+    await cleanup_interview_related_data(session, profile.id, interview)
+    await session.delete(interview)
+    await session.commit()
+    return {"deleted": True, "id": interview_id}
 
 
 @router.post("/review")
@@ -545,9 +616,11 @@ async def review(payload: ReviewIn, session: AsyncSession = Depends(get_session)
     )
     profile.weak_points = merge_points(profile.weak_points, feedback.get("to_improve", []))
     session.add(record)
+    await session.flush()
+    await refresh_recommendations_safely(session, profile, trigger_reason="review", source_type="practice", source_id=record.id)
     await session.commit()
     await session.refresh(record)
-    await remember_interaction_safely(
+    memory_writes = await remember_interaction_safely(
         session,
         agent,
         profile,
@@ -577,6 +650,14 @@ async def chat(payload: ChatIn, session: AsyncSession = Depends(get_session)) ->
         context={"memory_context_used": memory_context},
     )
     try:
+        if memory_writes:
+            await refresh_recommendations_safely(
+                session,
+                profile,
+                trigger_reason="memory",
+                source_type="chat",
+                source_id=memory_writes[0].id,
+            )
         await session.commit()
     except Exception:
         await session.rollback()
@@ -601,6 +682,14 @@ async def agent_actions(payload: AgentActionIn, session: AsyncSession = Depends(
         context={**payload.context, "memory_context_used": memory_context},
     )
     try:
+        if memory_writes:
+            await refresh_recommendations_safely(
+                session,
+                profile,
+                trigger_reason="memory",
+                source_type="agent_actions",
+                source_id=memory_writes[0].id,
+            )
         await session.commit()
     except Exception:
         await session.rollback()
@@ -619,7 +708,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
     if payload.tool == "start_interview":
         interview_payload = InterviewStartIn(
             interview_type=str(data.get("interview_type") or "模拟面试"),
-            interviewer_style=str(data.get("interviewer_style") or "温和型"),
+            interviewer_style=str(data.get("interviewer_style") or "不限"),
             company=str(data.get("company") or profile.target_company or ""),
             role=str(data.get("role") or profile.target_role),
             jd=str(data.get("jd") or ""),
@@ -644,13 +733,22 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         fields = data.get("fields", data)
         if not isinstance(fields, dict):
             raise HTTPException(status_code=400, detail="fields must be an object")
+        had_recommendation_signal = has_profile_recommendation_signal(profile)
         allowed = {"name", "target_role", "target_company", "target_city", "stage", "communication_style"}
         for key, value in fields.items():
             if key in allowed:
                 setattr(profile, key, str(value))
+        force_recommendations = not had_recommendation_signal and has_profile_recommendation_signal(profile)
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, "个人信息已更新。")
+        await refresh_recommendations_after_commit(
+            profile,
+            trigger_reason="profile",
+            source_type="profile",
+            source_id=profile.id,
+            force=force_recommendations,
+        )
         return {"message": "个人信息已更新。", "profile": serialize_profile(profile)}
 
     if payload.tool == "update_resume":
@@ -658,10 +756,18 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         if not content:
             raise HTTPException(status_code=400, detail="content is required")
         mode = str(data.get("mode") or "append")
+        was_resume_empty = not (profile.resume_text or "").strip()
         profile.resume_text = content if mode == "replace" else "\n\n".join([item for item in [profile.resume_text, content] if item])
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, "简历已更新。")
+        await refresh_recommendations_after_commit(
+            profile,
+            trigger_reason="resume",
+            source_type="resume",
+            source_id=profile.id,
+            force=was_resume_empty,
+        )
         return {"message": "简历已更新。", "profile": serialize_profile(profile)}
 
     if payload.tool == "append_profile_note":
@@ -669,10 +775,19 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         title = str(data.get("title") or "个人档案")
         if not content:
             raise HTTPException(status_code=400, detail="content is required")
+        had_recommendation_signal = has_profile_recommendation_signal(profile)
         profile.resume_text = "\n\n".join([item for item in [profile.resume_text, f"【{title}】\n{content}"] if item])
+        force_recommendations = not had_recommendation_signal and has_profile_recommendation_signal(profile)
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, f"已补充到{title}。")
+        await refresh_recommendations_after_commit(
+            profile,
+            trigger_reason="profile",
+            source_type="profile",
+            source_id=profile.id,
+            force=force_recommendations,
+        )
         return {"message": f"已补充到{title}。", "profile": serialize_profile(profile)}
 
     if payload.tool == "add_knowledge_item":
@@ -690,6 +805,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         await session.refresh(resource)
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
         await remember_approved_action(profile, payload.tool, data, "已添加到个人知识库。")
+        await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
         return {"message": "已添加到个人知识库。", "knowledge": serialize_knowledge(resource)}
 
     if payload.tool == "update_knowledge_item":
@@ -699,6 +815,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
                 setattr(resource, key, str(data.get(key) or ""))
         await session.commit()
         await session.refresh(resource)
+        await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
         return {"message": "知识库资料已更新。", "knowledge": serialize_knowledge(resource)}
 
     if payload.tool == "delete_knowledge_item":
@@ -707,6 +824,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         await session.delete(resource)
         await remove_item_from_folders(session, profile.id, item_id)
         await session.commit()
+        await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=item_id)
         return {"message": "知识库资料已删除。", "deleted_knowledge_id": item_id}
 
     raise HTTPException(status_code=400, detail=f"unsupported tool: {payload.tool}")
@@ -793,6 +911,7 @@ async def create_knowledge(payload: KnowledgeIn, session: AsyncSession = Depends
         await add_item_to_folder(session, profile.id, payload.folder_id, resource.id)
     else:
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource)}
 
 
@@ -818,6 +937,7 @@ async def create_knowledge_from_link(payload: KnowledgeLinkIn, session: AsyncSes
         await add_item_to_folder(session, profile.id, payload.folder_id, resource.id)
     else:
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource), "file": serialize_parsed_file(parsed, payload.url)}
 
 
@@ -832,6 +952,7 @@ async def update_knowledge(item_id: str, payload: KnowledgeIn, session: AsyncSes
     resource.url = payload.url
     await session.commit()
     await session.refresh(resource)
+    await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource)}
 
 
@@ -842,6 +963,7 @@ async def delete_knowledge(item_id: str, session: AsyncSession = Depends(get_ses
     await session.delete(resource)
     await remove_item_from_folders(session, profile.id, item_id)
     await session.commit()
+    await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=item_id)
     return {"deleted": True, "id": item_id}
 
 
@@ -874,6 +996,7 @@ async def upload_knowledge(
         await add_item_to_folder(session, profile.id, folder_id, resource.id)
     else:
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource), "file": parsed}
 
 
@@ -1037,6 +1160,105 @@ async def remember_approved_action(
             await memory_session.commit()
         except Exception:
             await memory_session.rollback()
+
+
+async def refresh_recommendations_safely(
+    session: AsyncSession,
+    profile: UserProfile,
+    *,
+    trigger_reason: str,
+    source_type: str = "",
+    source_id: str = "",
+    force: bool = False,
+) -> None:
+    try:
+        await refresh_home_recommendations(
+            session,
+            profile,
+            trigger_reason=trigger_reason,
+            source_type=source_type,
+            source_id=source_id,
+            force=force,
+        )
+    except Exception:
+        # 推荐刷新是体验增强，不能阻塞聊天、档案写入或面试报告生成。
+        pass
+
+
+async def refresh_recommendations_after_commit(
+    profile: UserProfile,
+    *,
+    trigger_reason: str,
+    source_type: str = "",
+    source_id: str = "",
+    force: bool = False,
+) -> None:
+    async with SessionLocal() as recommendation_session:
+        try:
+            current_profile = await recommendation_session.get(UserProfile, profile.id)
+            if not current_profile:
+                return
+            await refresh_home_recommendations(
+                recommendation_session,
+                current_profile,
+                trigger_reason=trigger_reason,
+                source_type=source_type,
+                source_id=source_id,
+                force=force,
+            )
+            await recommendation_session.commit()
+        except Exception:
+            await recommendation_session.rollback()
+
+
+async def cleanup_interview_related_data(session: AsyncSession, user_id: str, interview: InterviewSession) -> None:
+    interview_id = interview.id
+    title_bits = [interview.company or "", interview.role or ""]
+    title_text = " ".join(item for item in title_bits if item).strip()
+    memory_ids = (
+        await session.execute(
+            select(AgentMemory.id).where(
+                AgentMemory.user_id == user_id,
+                AgentMemory.source.in_(["interview_start", "interview_answer", "interview_report"]),
+            )
+        )
+    ).scalars().all()
+    removable_memory_ids: list[str] = []
+    if memory_ids:
+        memories = (await session.execute(select(AgentMemory).where(AgentMemory.id.in_(memory_ids)))).scalars().all()
+        for memory in memories:
+            metadata = memory.memory_metadata or {}
+            content = memory.content or ""
+            if (
+                metadata.get("interview_id") == interview_id
+                or interview_id in content
+                or (title_text and title_text in content)
+            ):
+                removable_memory_ids.append(memory.id)
+
+    await session.execute(delete(HomeRecommendation).where(HomeRecommendation.user_id == user_id, HomeRecommendation.source_id == interview_id))
+    await session.execute(delete(AbilityScoreHistory).where(AbilityScoreHistory.user_id == user_id, AbilityScoreHistory.source_id == interview_id))
+    issues = (await session.execute(select(GrowthIssue).where(GrowthIssue.user_id == user_id))).scalars().all()
+    for issue in issues:
+        if interview_id in (issue.evidence_ids or []):
+            await session.delete(issue)
+    insights = (await session.execute(select(GrowthInsight).where(GrowthInsight.user_id == user_id))).scalars().all()
+    for insight in insights:
+        if interview_id in (insight.evidence_ids or []):
+            await session.delete(insight)
+    actions = (await session.execute(select(ActionState).where(ActionState.user_id == user_id))).scalars().all()
+    for action in actions:
+        if interview_id in (action.related_experience_ids or []):
+            await session.delete(action)
+
+    if removable_memory_ids:
+        await session.execute(delete(AgentMemory).where(AgentMemory.id.in_(removable_memory_ids)))
+        await session.execute(
+            delete(AgentMemoryEvent).where(
+                AgentMemoryEvent.user_id == user_id,
+                AgentMemoryEvent.memory_id.in_(removable_memory_ids),
+            )
+        )
 
 
 def action_memory_summary(tool: str, payload: dict, message: str) -> str:

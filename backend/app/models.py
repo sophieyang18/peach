@@ -213,3 +213,19 @@ class GrowthInsight(Base):
     evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     confidence: Mapped[int] = mapped_column(Integer, default=70)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class HomeRecommendation(Base):
+    __tablename__ = "home_recommendations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_pk)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"), index=True)
+    text: Mapped[str] = mapped_column(String(160))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    source_type: Mapped[str] = mapped_column(String(80), default="", index=True)
+    source_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    action_type: Mapped[str] = mapped_column(String(80), default="chat")
+    priority: Mapped[int] = mapped_column(Integer, default=3)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    trigger_reason: Mapped[str] = mapped_column(String(120), default="", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

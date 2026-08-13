@@ -625,7 +625,7 @@ def infer_interviewer_style(text: str) -> str:
         return "专业深挖型"
     if any(word in text for word in ["温和", "友好", "基础"]):
         return "温和型"
-    return "温和型"
+    return "不限"
 
 
 def infer_company(text: str, fallback: str) -> str:
