@@ -44,6 +44,23 @@ def ensure_demo_columns(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE user_profiles ADD COLUMN username VARCHAR(80)"))
     sync_conn.execute(text("UPDATE user_profiles SET username = 'demo' WHERE username IS NULL OR username = ''"))
 
+    if "knowledge_resources" in tables:
+        columns = {column["name"] for column in inspector.get_columns("knowledge_resources")}
+        if "summary_status" not in columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_resources ADD COLUMN summary_status VARCHAR(24)"))
+        if "pinned" not in columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_resources ADD COLUMN pinned INTEGER"))
+        sync_conn.execute(text("UPDATE knowledge_resources SET summary_status = 'ready' WHERE summary_status IS NULL OR summary_status = ''"))
+        sync_conn.execute(text("UPDATE knowledge_resources SET pinned = 0 WHERE pinned IS NULL"))
+
+    if "knowledge_folders" in tables:
+        columns = {column["name"] for column in inspector.get_columns("knowledge_folders")}
+        if "cover" not in columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_folders ADD COLUMN cover TEXT"))
+        if "description" not in columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_folders ADD COLUMN description TEXT"))
+        if "recommended_questions" not in columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_folders ADD COLUMN recommended_questions JSON"))
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

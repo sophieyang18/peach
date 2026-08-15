@@ -54,6 +54,9 @@ class KnowledgeFolderIn(BaseModel):
     name: str
     scope: str = "personal"
     item_ids: list[str] = Field(default_factory=list)
+    cover: str = ""
+    description: str = ""
+    recommended_questions: list[str] = Field(default_factory=list)
     sort_order: int = 0
 
 

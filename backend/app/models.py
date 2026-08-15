@@ -100,9 +100,11 @@ class KnowledgeResource(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("user_profiles.id"))
     title: Mapped[str] = mapped_column(String(160))
     summary: Mapped[str] = mapped_column(Text, default="")
+    summary_status: Mapped[str] = mapped_column(String(24), default="ready", nullable=True)
     content: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(40), default="personal")
     url: Mapped[str] = mapped_column(Text, default="")
+    pinned: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -114,6 +116,9 @@ class KnowledgeFolder(Base):
     name: Mapped[str] = mapped_column(String(120))
     scope: Mapped[str] = mapped_column(String(40), default="personal")
     item_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    cover: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    recommended_questions: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

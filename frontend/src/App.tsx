@@ -13,7 +13,7 @@ const NAV_ICONS: Record<PrimaryModule, string> = {
   peach: '/peach-assets/nav-peach.jpg',
   profile: '/peach-assets/nav-profile.jpg',
   knowledge: '/peach-assets/nav-knowledge.jpg',
-  growth: '/peach-assets/peach-icon.png',
+  growth: '/peach-assets/nav-growth.png',
 }
 
 type PrimaryModule = 'peach' | 'profile' | 'knowledge' | 'growth'
@@ -226,10 +226,12 @@ type KnowledgeItem = {
   id: string
   title: string
   summary: string
+  summary_status?: string
   content?: string
   url?: string
   source: string
   saved?: boolean
+  pinned?: number
 }
 
 type ParsedUpload = {
@@ -238,6 +240,7 @@ type ParsedUpload = {
   title: string
   summary: string
   content: string
+  size?: number
   warning?: string
 }
 
@@ -253,6 +256,7 @@ type ResumeVersion = {
   filename: string
   content: string
   summary: string
+  size?: number
   source: string
   target_role: string
   version_no: number
@@ -268,12 +272,16 @@ type KnowledgeDraft = {
   url: string
 }
 
+type ResumeSortMode = 'updated' | 'created' | 'size'
 type KnowledgeTab = 'personal' | 'saved' | 'discover'
 type KnowledgeFolder = {
   id: string
   name: string
   scope: Exclude<KnowledgeTab, 'discover'>
   item_ids: string[]
+  cover?: string
+  description?: string
+  recommended_questions?: string[]
   sort_order?: number
   created_at?: string
   updated_at?: string
@@ -535,6 +543,7 @@ function App() {
   const profileHydratedRef = useRef(false)
   const knowledgeHydratedRef = useRef(false)
   const conversationsHydratedRef = useRef(false)
+  const summarizingKnowledgeRef = useRef<Set<string>>(new Set())
 
   const profile = dashboard?.profile ?? defaultProfile
   const activeConversation = conversations.find((item) => item.id === activeConversationId) ?? conversations[0]
@@ -871,6 +880,12 @@ function App() {
     })
   }, [api])
 
+  const refreshKnowledgeItems = useCallback(async () => {
+    const data = await api<{ items: KnowledgeItem[] }>('/api/knowledge')
+    setPersonalKnowledge(data.items)
+    return data.items
+  }, [api])
+
   useEffect(() => {
     if (!account) return
     void refreshDashboard()
@@ -1111,16 +1126,6 @@ function App() {
     )
     if (!confirmed) return
     await deleteInterviewById(interview.id)
-  }
-
-  async function downloadProfileExport() {
-    try {
-      await downloadApiFile('/api/profile/export?format=md', `peach-profile-${account?.username ?? 'demo'}.md`)
-      setNotice('个人档案已导出。')
-    } catch (err) {
-      setError('个人档案导出失败。')
-      console.error(err)
-    }
   }
 
   async function downloadResumeVersion(resume: ResumeVersion) {
@@ -1688,6 +1693,28 @@ function App() {
     setKnowledgeActionMode('')
     setIsCreatingKnowledge(false)
     setNotice(`正在查看${item.title}。`)
+    void ensureKnowledgeSummary(item)
+  }
+
+  async function ensureKnowledgeSummary(item: KnowledgeItem) {
+    if (item.source !== 'personal' || !needsServerKnowledgeSummary(item) || summarizingKnowledgeRef.current.has(item.id)) return
+    summarizingKnowledgeRef.current.add(item.id)
+    try {
+      const data = await api<{ item: KnowledgeItem }>(`/api/knowledge/${item.id}/summary`, { method: 'POST' })
+      setPersonalKnowledge((current) => current.map((value) => (value.id === data.item.id ? data.item : value)))
+      if (item.id === activeKnowledgeId) setKnowledgeDraft(toKnowledgeDraft(data.item))
+      scheduleKnowledgeSummaryRefresh(data.item)
+    } catch (err) {
+      console.warn('knowledge summary refresh skipped', err)
+    } finally {
+      window.setTimeout(() => summarizingKnowledgeRef.current.delete(item.id), 5000)
+    }
+  }
+
+  function scheduleKnowledgeSummaryRefresh(item?: KnowledgeItem) {
+    if (item?.summary_status !== 'queued' && item?.summary_status !== 'running') return
+    window.setTimeout(() => void refreshKnowledgeItems(), 1600)
+    window.setTimeout(() => void refreshKnowledgeItems(), 4800)
   }
 
   function createKnowledgeDraft() {
@@ -1746,6 +1773,7 @@ function App() {
         setKnowledgeActionMode('')
         setIsCreatingKnowledge(false)
         await refreshKnowledgeFolders()
+        scheduleKnowledgeSummaryRefresh(data.item)
         setNotice('已添加到个人知识库。')
       }
     } catch (err) {
@@ -1794,6 +1822,35 @@ function App() {
       setNotice('文件夹已新建。')
     } catch (err) {
       setError('文件夹新建失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
+  async function updateKnowledgeFolder(scope: Exclude<KnowledgeTab, 'discover'>, folderId: string, patch: Partial<KnowledgeFolder>) {
+    const folder = knowledgeFolders[scope].find((item) => item.id === folderId)
+    if (!folder) return
+    begin('knowledge', '正在保存知识库设置')
+    try {
+      const data = await api<{ folder: KnowledgeFolder }>(`/api/knowledge/folders/${folderId}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          ...folder,
+          ...patch,
+          name: (patch.name ?? folder.name).trim(),
+          cover: patch.cover ?? folder.cover ?? '',
+          description: patch.description ?? folder.description ?? '',
+          recommended_questions: patch.recommended_questions ?? folder.recommended_questions ?? [],
+        }),
+      })
+      setKnowledgeFolders((current) => ({
+        ...current,
+        [scope]: current[scope].map((item) => (item.id === folderId ? data.folder : item)),
+      }))
+      setNotice('知识库设置已保存。')
+    } catch (err) {
+      setError('知识库设置保存失败，稍后再试一次。')
       console.error(err)
     } finally {
       end('knowledge')
@@ -1856,19 +1913,19 @@ function App() {
   function folderKnowledgeItems(folder: KnowledgeFolder, scope: Exclude<KnowledgeTab, 'discover'>) {
     const folderIds = folder.item_ids ?? []
     const keyword = knowledgeQuery.trim().toLowerCase()
-    return sortKnowledgeItems(
-      knowledgeItems
-        .filter((item) => {
-          if (!folderIds.includes(item.id)) return false
-          if (scope === 'personal') return item.source === 'personal'
-          return savedKnowledge.includes(item.id)
-        })
-        .filter((item) => {
-          if (!keyword) return true
-          return [item.title, item.summary, item.content, item.url].some((part) => part?.toLowerCase().includes(keyword))
-        }),
-      knowledgeFileSort,
-    )
+    const order = new Map(folderIds.map((id, index) => [id, index]))
+    const filtered = knowledgeItems
+      .filter((item) => {
+        if (!folderIds.includes(item.id)) return false
+        if (scope === 'personal') return item.source === 'personal'
+        return savedKnowledge.includes(item.id)
+      })
+      .filter((item) => {
+        if (!keyword) return true
+        return [item.title, item.summary, item.content, item.url].some((part) => part?.toLowerCase().includes(keyword))
+      })
+    if (knowledgeFileSort === 'name') return sortKnowledgeItems(filtered, knowledgeFileSort)
+    return [...filtered].sort((a, b) => (order.get(a.id) ?? 9999) - (order.get(b.id) ?? 9999))
   }
 
   async function renameKnowledgeItem(item: KnowledgeItem) {
@@ -1896,6 +1953,61 @@ function App() {
     }
   }
 
+  async function pinKnowledgeItem(item: KnowledgeItem) {
+    const folder = [...knowledgeFolders.personal, ...knowledgeFolders.saved].find((value) => value.id === activeKnowledgeFolderId)
+    if (!folder) return
+    begin('knowledge', '正在置顶资料')
+    try {
+      const itemIds = [item.id, ...(folder.item_ids || []).filter((id) => id !== item.id)]
+      const data = await api<{ folder: KnowledgeFolder }>(`/api/knowledge/folders/${folder.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...folder, item_ids: itemIds }),
+      })
+      setKnowledgeFolders((current) => ({
+        ...current,
+        [folder.scope]: current[folder.scope].map((value) => (value.id === folder.id ? data.folder : value)),
+      }))
+      setNotice('资料已置顶。')
+    } catch (err) {
+      setError('置顶失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
+  async function copyKnowledgeItem(item: KnowledgeItem) {
+    const folder = [...knowledgeFolders.personal, ...knowledgeFolders.saved].find((value) => value.id === activeKnowledgeFolderId)
+    const folderId = folder?.scope === 'personal' ? folder.id : knowledgeFolders.personal[0]?.id
+    begin('knowledge', '正在复制资料')
+    try {
+      const data = await api<{ item: KnowledgeItem }>('/api/knowledge', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: `${item.title} 副本`,
+          summary: item.summary,
+          content: item.content || item.summary,
+          source: 'personal',
+          url: item.url || '',
+          folder_id: folderId ?? '',
+        }),
+      })
+      setPersonalKnowledge((current) => [data.item, ...current])
+      setActiveKnowledgeId(data.item.id)
+      setKnowledgeDraft(toKnowledgeDraft(data.item))
+      setIsCreatingKnowledge(false)
+      setKnowledgeTab('personal')
+      await refreshKnowledgeFolders()
+      scheduleKnowledgeSummaryRefresh(data.item)
+      setNotice('资料副本已创建。')
+    } catch (err) {
+      setError('复制失败，稍后再试一次。')
+      console.error(err)
+    } finally {
+      end('knowledge')
+    }
+  }
+
   async function parseKnowledgeLink() {
     const url = window.prompt('粘贴要加入知识库的链接')
     if (!url?.trim()) return
@@ -1913,6 +2025,7 @@ function App() {
       setIsCreatingKnowledge(false)
       setKnowledgeTab('personal')
       await refreshKnowledgeFolders()
+      scheduleKnowledgeSummaryRefresh(data.item)
       setNotice(data.file?.warning || '链接已解析并加入个人知识库。')
     } catch (err) {
       setError('链接解析失败，稍后再试一次。')
@@ -1934,7 +2047,43 @@ function App() {
       setIsCreatingKnowledge(false)
       setKnowledgeTab('personal')
       await refreshKnowledgeFolders()
+      scheduleKnowledgeSummaryRefresh(data.item)
       setNotice(data.file.warning || '文件已解析并加入知识库。')
+    } catch (err) {
+      setError(fileUploadErrorMessage(err))
+      console.error(err)
+    } finally {
+      end('upload')
+    }
+  }
+
+  async function uploadKnowledgeFiles(files: File[]) {
+    const supportedFiles = files.filter((file) => isSupportedDocumentFile(file.name))
+    if (!supportedFiles.length) {
+      setError('文件夹里没有可解析的文件，请选择 pdf、doc、docx、markdown 或 html。')
+      return
+    }
+    begin('upload', `正在添加 ${supportedFiles.length} 个文件`)
+    try {
+      const uploaded: KnowledgeItem[] = []
+      let warning = ''
+      for (const file of supportedFiles) {
+        const data = await uploadApi<{ item: KnowledgeItem; file: ParsedUpload }>('/api/knowledge/upload', file, { folder_id: activeKnowledgeFolderId })
+        uploaded.push(data.item)
+        warning = warning || data.file.warning || ''
+      }
+      setPersonalKnowledge((current) => [...uploaded, ...current])
+      if (uploaded[0]) {
+        setActiveKnowledgeId(uploaded[0].id)
+        setKnowledgeDraft(toKnowledgeDraft(uploaded[0]))
+      }
+      setKnowledgeActionResult('')
+      setKnowledgeActionMode('')
+      setIsCreatingKnowledge(false)
+      setKnowledgeTab('personal')
+      await refreshKnowledgeFolders()
+      uploaded.forEach(scheduleKnowledgeSummaryRefresh)
+      setNotice(warning || `已从文件夹添加 ${uploaded.length} 个文件。`)
     } catch (err) {
       setError(fileUploadErrorMessage(err))
       console.error(err)
@@ -2020,14 +2169,19 @@ function App() {
   async function uploadInterviewFile(file: File, target: 'resume' | 'questionBank') {
     begin('upload', '正在解析面试材料')
     try {
-      const data = await uploadApi<{ file: ParsedUpload }>('/api/files/parse', file)
       if (target === 'resume') {
+        const data = await uploadApi<ProfileUploadResult>('/api/profile/resumes/upload', file)
         setSettings((current) => ({ ...current, resume: data.file.title }))
         updateProfileSection('full', [profileSections.full, `【${data.file.title}】\n${data.file.content}`].filter(Boolean).join('\n\n'))
+        setResumeFiles((current) => [data.file, ...current.filter((item) => item.filename !== data.file.filename)])
+        if (data.resume_versions) setResumeVersions(data.resume_versions)
+        if (data.profile) setDashboard((current) => (current ? { ...current, profile: data.profile as Profile } : current))
+        setNotice(data.file.warning || '新简历已解析，并同步到个人档案的完整简历。')
       } else {
+        const data = await uploadApi<{ file: ParsedUpload }>('/api/files/parse', file)
         setSettings((current) => ({ ...current, questionBank: data.file.title }))
+        setNotice(data.file.warning || '面试材料已解析。')
       }
-      setNotice(data.file.warning || '面试材料已解析。')
     } catch (err) {
       setError(fileUploadErrorMessage(err))
       console.error(err)
@@ -2375,7 +2529,6 @@ function App() {
             onAction={(action) => void runProfileAction(action)}
             onAcceptResult={acceptProfileActionResult}
             onUploadFile={(file) => void uploadProfileFile(file)}
-            onDownloadProfile={() => void downloadProfileExport()}
             onDownloadResumeVersion={(resume) => void downloadResumeVersion(resume)}
             onRestoreResumeVersion={(resume) => void restoreResumeVersion(resume)}
             onApproveAction={(action) => void approveAgentAction(action)}
@@ -2413,14 +2566,18 @@ function App() {
             onSaveDraft={() => void saveKnowledgeDraft()}
             onDelete={(id) => void deleteKnowledgeItem(id)}
             onUpload={(file) => void uploadKnowledgeFile(file)}
+            onUploadFiles={(files) => void uploadKnowledgeFiles(files)}
             onAsk={sendKnowledgeToPeach}
             onUseInProfile={addKnowledgeToProfile}
             onSelectItem={selectKnowledgeItem}
             onNewItem={createKnowledgeDraft}
             onRenameFolder={(scope, id) => void renameKnowledgeFolder(scope, id)}
             onDeleteFolder={(scope, id) => void deleteKnowledgeFolder(scope, id)}
+            onUpdateFolder={(scope, id, patch) => void updateKnowledgeFolder(scope, id, patch)}
             onRenameItem={(item) => void renameKnowledgeItem(item)}
             onDeleteItem={(id) => void deleteKnowledgeItem(id)}
+            onPinItem={(item) => void pinKnowledgeItem(item)}
+            onCopyItem={(item) => void copyKnowledgeItem(item)}
             onParseLink={() => void parseKnowledgeLink()}
             onBackToAsk={closeKnowledgeDetail}
             onRunItemAction={(action) => void runKnowledgeItemAction(action)}
@@ -2923,21 +3080,6 @@ function InterviewSetup({
           {busy.interviewStart ? '准备中' : '开始面试'}
         </button>
       </div>
-
-      <div className="setup-summary">
-        <div>
-          <span>目标岗位</span>
-          <strong>{settings.targetRole || profile.target_role}</strong>
-        </div>
-        <div>
-          <span>目标公司</span>
-          <strong>{settings.targetCompany || profile.target_company || '未填写'}</strong>
-        </div>
-        <div>
-          <span>当前阶段</span>
-          <strong>{settings.stage || profile.stage}</strong>
-        </div>
-      </div>
     </section>
   )
 }
@@ -3161,7 +3303,6 @@ function ProfileWorkspace({
   onAction,
   onAcceptResult,
   onUploadFile,
-  onDownloadProfile,
   onDownloadResumeVersion,
   onRestoreResumeVersion,
   onApproveAction,
@@ -3191,7 +3332,6 @@ function ProfileWorkspace({
   onAction: (action: string) => void
   onAcceptResult: () => void
   onUploadFile: (file: File) => void
-  onDownloadProfile: () => void
   onDownloadResumeVersion: (resume: ResumeVersion) => void
   onRestoreResumeVersion: (resume: ResumeVersion) => void
   onApproveAction: (action: AgentToolProposal) => void
@@ -3204,12 +3344,17 @@ function ProfileWorkspace({
   const current = profileSectionMeta[activeSection]
   const sectionItems = flattenResumeFolders(folders)
   const [reportsCollapsed, setReportsCollapsed] = useState(false)
-  const [resumeListCollapsed, setResumeListCollapsed] = useState(false)
-  const [resumeSortMode, setResumeSortMode] = useState<'time' | 'role'>('time')
+  const [resumeSearch, setResumeSearch] = useState('')
+  const [resumeSortMode, setResumeSortMode] = useState<ResumeSortMode>('updated')
   const [selectedReportId, setSelectedReportId] = useState('')
   const [profileChatCollapsed, setProfileChatCollapsed] = useState(false)
   const previousProfileMessageCountRef = useRef(messages.length)
+  const resumeUploadInputRef = useRef<HTMLInputElement | null>(null)
   const selectedReport = interviews.find((item) => item.id === selectedReportId) ?? interviews[0]
+  const resumeListItems = useMemo(
+    () => buildResumeListItems(resumeVersions, resumeFiles, resumeSearch, resumeSortMode),
+    [resumeVersions, resumeFiles, resumeSearch, resumeSortMode],
+  )
 
   useEffect(() => {
     setProfileChatCollapsed(true)
@@ -3321,41 +3466,55 @@ function ProfileWorkspace({
 
           {activeSection === 'full' ? (
             <div className="resume-file-strip">
-              <label className="resume-upload-card">
-                <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUploadFile(event.target.files[0])} />
-                <span>+</span>
-                <strong>上传简历附件</strong>
-              </label>
               <div className="resume-file-list">
                 <div className="resume-list-toolbar">
-                  <button type="button" onClick={() => setResumeListCollapsed((value) => !value)}>{resumeListCollapsed ? '展开简历列表' : '收起简历列表'}</button>
-                  <select value={resumeSortMode} onChange={(event) => setResumeSortMode(event.target.value as 'time' | 'role')} aria-label="简历排序">
-                    <option value="time">按上传时间</option>
-                    <option value="role">按对应岗位</option>
-                  </select>
-                  <button type="button" onClick={onDownloadProfile}>导出档案</button>
+                  <strong>简历列表（{resumeVersions.length || resumeFiles.length}）</strong>
+                  <label className="resume-search-box" aria-label="搜索简历">
+                    <span>⌕</span>
+                    <input value={resumeSearch} onChange={(event) => setResumeSearch(event.target.value)} placeholder="输入关键词搜索简历" />
+                  </label>
+                  <label className="resume-sort-control" aria-label="简历排序">
+                    <span>↕</span>
+                    <select value={resumeSortMode} onChange={(event) => setResumeSortMode(event.target.value as ResumeSortMode)}>
+                      <option value="updated">更新时间降序</option>
+                      <option value="created">创建时间降序</option>
+                      <option value="size">大小降序</option>
+                    </select>
+                  </label>
+                  <button className="resume-upload-icon" type="button" aria-label="上传简历附件" onClick={() => resumeUploadInputRef.current?.click()}>
+                    <span>+</span>
+                  </button>
+                  <input
+                    ref={resumeUploadInputRef}
+                    className="resume-upload-hidden"
+                    type="file"
+                    accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm"
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0]
+                      event.currentTarget.value = ''
+                      if (file) onUploadFile(file)
+                    }}
+                  />
                 </div>
                 <div className="resume-file-items">
-                  {!resumeListCollapsed && resumeVersions.length ? sortResumeVersions(resumeVersions, resumeSortMode).map((resume) => (
-                    <article className="resume-version-card" key={resume.id}>
-                      <button type="button" onClick={() => onSectionContent(resume.content)}>
-                        <strong>{resume.title || resume.filename || `第 ${resume.version_no} 版简历`}</strong>
-                        <span>{resume.summary || '已保存为历史版本'}</span>
+                  {resumeListItems.map((item) => item.kind === 'version' ? (
+                    <article className="resume-version-card" key={item.id}>
+                      <button type="button" onClick={() => onSectionContent(item.content)}>
+                        <strong>{item.title}</strong>
+                        <span>{item.updatedLabel}</span>
                       </button>
                       <div>
-                        <small>v{resume.version_no}{resume.optimized ? ' · 已优化' : ''}</small>
-                        <button type="button" onClick={() => onDownloadResumeVersion(resume)}>导出</button>
-                        <button type="button" onClick={() => onRestoreResumeVersion(resume)}>设为当前</button>
+                        <button type="button" onClick={() => onDownloadResumeVersion(item.source)}>导出</button>
+                        <button type="button" onClick={() => onRestoreResumeVersion(item.source)}>设为当前</button>
                       </div>
                     </article>
-                  )) : null}
-                  {!resumeListCollapsed && !resumeVersions.length && resumeFiles.length ? sortResumeFiles(resumeFiles, resumeSortMode).map((file) => (
-                    <button type="button" key={file.filename} onClick={() => onSectionContent([sectionContent, `【${file.title}】\n${file.content}`].filter(Boolean).join('\n\n'))}>
-                      <strong>{file.filename}</strong>
-                      <span>{file.summary || '已解析'}</span>
+                  ) : (
+                    <button type="button" key={item.id} onClick={() => onSectionContent([sectionContent, `【${item.title}】\n${item.content}`].filter(Boolean).join('\n\n'))}>
+                      <strong>{item.title}</strong>
+                      <span>{item.updatedLabel}</span>
                     </button>
-                  )) : null}
-                  {!resumeListCollapsed && !resumeVersions.length && !resumeFiles.length ? <p>还没有上传简历文件。</p> : null}
+                  ))}
+                  {!resumeListItems.length ? <p>{resumeSearch.trim() ? '没有找到匹配的简历。' : '还没有上传简历文件。'}</p> : null}
                 </div>
               </div>
             </div>
@@ -3688,11 +3847,12 @@ function ResumeInsightCard({
   resumeFiles: ParsedUpload[]
 }) {
   const hasContent = Boolean(sectionContent.trim() || resumeFiles.length)
+  const resumeSource = sectionContent || resumeFiles[0]?.content || resumeFiles[0]?.summary || ''
   return (
     <section className="resume-insight-card">
       <div>
         <strong>已有简历总结</strong>
-        <p>{hasContent ? summarizeClientText(sectionContent || resumeFiles[0]?.summary || '', 120) : '暂时还没有完整简历，可以先上传或粘贴一版。'}</p>
+        <p>{hasContent ? buildResumeBackgroundSummary(resumeSource, profile) : '暂时还没有完整简历，可以先上传或粘贴一版。'}</p>
       </div>
       <div>
         <strong>与目标岗位匹配度</strong>
@@ -3748,9 +3908,13 @@ function KnowledgeWorkspace({
   onNewItem,
   onRenameFolder,
   onDeleteFolder,
+  onUpdateFolder,
   onRenameItem,
   onDeleteItem,
+  onPinItem,
+  onCopyItem,
   onParseLink,
+  onUploadFiles,
   onApproveAction,
   onDismissAction,
   onBackToAsk,
@@ -3785,9 +3949,13 @@ function KnowledgeWorkspace({
   onNewItem: () => void
   onRenameFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
   onDeleteFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onUpdateFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string, patch: Partial<KnowledgeFolder>) => void
   onRenameItem: (item: KnowledgeItem) => void
   onDeleteItem: (id: string) => void
+  onPinItem: (item: KnowledgeItem) => void
+  onCopyItem: (item: KnowledgeItem) => void
   onParseLink: () => void
+  onUploadFiles: (files: File[]) => void
   onApproveAction: (action: AgentToolProposal) => void
   onDismissAction: (action: AgentToolProposal) => void
   onBackToAsk: () => void
@@ -3851,10 +4019,14 @@ function KnowledgeWorkspace({
             onNewItem={onNewItem}
             onRenameFolder={onRenameFolder}
             onDeleteFolder={onDeleteFolder}
+            onUpdateFolder={onUpdateFolder}
             onRenameItem={onRenameItem}
             onDeleteItem={onDeleteItem}
+            onPinItem={onPinItem}
+            onCopyItem={onCopyItem}
             onParseLink={onParseLink}
             onUpload={onUpload}
+            onUploadFiles={onUploadFiles}
           />
           <div className="knowledge-reader-shell">
             {activeItem || isCreating ? (
@@ -3880,6 +4052,7 @@ function KnowledgeWorkspace({
             ) : (
               <KnowledgeAskView
                 tab={tab}
+                folder={activeFolder}
                 question={question}
                 messages={messages}
                 busy={busy}
@@ -3908,10 +4081,14 @@ function KnowledgeCollectionPanel({
   onNewItem,
   onRenameFolder,
   onDeleteFolder,
+  onUpdateFolder,
   onRenameItem,
   onDeleteItem,
+  onPinItem,
+  onCopyItem,
   onParseLink,
   onUpload,
+  onUploadFiles,
 }: {
   folder?: KnowledgeFolder
   items: KnowledgeItem[]
@@ -3923,22 +4100,44 @@ function KnowledgeCollectionPanel({
   onNewItem: () => void
   onRenameFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
   onDeleteFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string) => void
+  onUpdateFolder: (scope: Exclude<KnowledgeTab, 'discover'>, id: string, patch: Partial<KnowledgeFolder>) => void
   onRenameItem: (item: KnowledgeItem) => void
   onDeleteItem: (id: string) => void
+  onPinItem: (item: KnowledgeItem) => void
+  onCopyItem: (item: KnowledgeItem) => void
   onParseLink: () => void
   onUpload: (file: File) => void
+  onUploadFiles: (files: File[]) => void
 }) {
   const title = folder?.name || '个人知识库'
-  const scopeLabel = folder?.scope === 'saved' ? '共享资料' : '个人资料'
+  const scopeLabel = folder?.description?.trim() || (folder?.scope === 'saved' ? '收藏资料' : '个人资料')
+  const [folderMenuOpen, setFolderMenuOpen] = useState(false)
+  const [uploadMenuOpen, setUploadMenuOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [itemMenuId, setItemMenuId] = useState('')
 
   return (
     <section className="knowledge-collection-panel">
       <header className="kb-collection-head">
         <div className="kb-collection-cover" aria-hidden="true">
-          <span />
+          <span style={knowledgeCoverStyle(folder?.cover)} />
         </div>
         <div>
-          <h2>{title}</h2>
+          <div className="kb-collection-title-row">
+            <h2>{title}</h2>
+            {folder ? (
+              <div className="kb-menu-wrap">
+                <button className="kb-more-button" type="button" onClick={() => setFolderMenuOpen((value) => !value)} aria-label="知识库更多操作">...</button>
+                {folderMenuOpen ? (
+                  <div className="kb-popover kb-folder-menu">
+                    <button type="button" onClick={() => { setFolderMenuOpen(false); setSettingsOpen(true) }}>资料修改</button>
+                    <button type="button" onClick={() => { setFolderMenuOpen(false); onRenameFolder(folder.scope, folder.id) }}>重命名</button>
+                    <button type="button" onClick={() => { setFolderMenuOpen(false); onDeleteFolder(folder.scope, folder.id) }}>删除知识库</button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
           <p>{scopeLabel}</p>
           <small>{items.length ? `${items.length} 份内容` : '快来填写描述吧'}</small>
         </div>
@@ -3946,12 +4145,6 @@ function KnowledgeCollectionPanel({
 
       <div className="kb-collection-meta">
         <span>{folder?.scope === 'saved' ? '已收藏' : '已设为私密'}</span>
-        {folder ? (
-          <div>
-            <button type="button" onClick={() => onRenameFolder(folder.scope, folder.id)}>重命名</button>
-            <button type="button" onClick={() => onDeleteFolder(folder.scope, folder.id)}>删除</button>
-          </div>
-        ) : null}
       </div>
 
       <div className="kb-content-head">
@@ -3959,10 +4152,43 @@ function KnowledgeCollectionPanel({
         <div>
           <button type="button" onClick={onNewItem} disabled={busy}>新建</button>
           <button type="button" onClick={onParseLink} disabled={busy}>链接</button>
-          <label>
-            <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUpload(event.target.files[0])} disabled={busy} />
-            <span>上传</span>
-          </label>
+          <div className="kb-menu-wrap kb-upload-wrap">
+            <button type="button" onClick={() => setUploadMenuOpen((value) => !value)} disabled={busy}>上传</button>
+            {uploadMenuOpen ? (
+              <div className="kb-popover kb-upload-menu">
+                <label>
+                  <input
+                    type="file"
+                    accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0]
+                      event.currentTarget.value = ''
+                      setUploadMenuOpen(false)
+                      if (file) onUpload(file)
+                    }}
+                    disabled={busy}
+                  />
+                  <span>上传文件</span>
+                </label>
+                <label>
+                  <input
+                    type="file"
+                    multiple
+                    accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm"
+                    {...{ webkitdirectory: 'true', directory: 'true' }}
+                    onChange={(event) => {
+                      const files = Array.from(event.target.files || [])
+                      event.currentTarget.value = ''
+                      setUploadMenuOpen(false)
+                      if (files.length) onUploadFiles(files)
+                    }}
+                    disabled={busy}
+                  />
+                  <span>上传文件夹</span>
+                </label>
+              </div>
+            ) : null}
+          </div>
           <select value={fileSort} onChange={(event) => onFileSort(event.target.value as SortMode)} aria-label="内容排序">
             <option value="updated">最近</option>
             <option value="name">名称</option>
@@ -3977,12 +4203,19 @@ function KnowledgeCollectionPanel({
               <span className="kb-file-mark" aria-hidden="true" />
               <span>
                 <strong>{item.title}</strong>
-                <small>{item.summary || '暂无摘要'}</small>
+                <small>{item.summary_status === 'queued' || item.summary_status === 'running' ? '摘要生成中...' : item.summary || '暂无摘要'}</small>
               </span>
             </button>
-            <div>
-              <button type="button" onClick={() => onRenameItem(item)}>改名</button>
-              {item.source === 'personal' ? <button type="button" onClick={() => onDeleteItem(item.id)}>删除</button> : null}
+            <div className="kb-content-item-actions">
+              <button className="kb-more-button" type="button" onClick={(event) => { event.stopPropagation(); setItemMenuId((value) => (value === item.id ? '' : item.id)) }} aria-label={`${item.title}更多操作`}>...</button>
+              {itemMenuId === item.id ? (
+                <div className="kb-popover kb-item-menu">
+                  <button type="button" onClick={() => { setItemMenuId(''); onPinItem(item) }}>置顶</button>
+                  <button type="button" onClick={() => { setItemMenuId(''); onCopyItem(item) }}>复制</button>
+                  <button type="button" onClick={() => { setItemMenuId(''); onRenameItem(item) }}>重命名</button>
+                  {item.source === 'personal' ? <button type="button" onClick={() => { setItemMenuId(''); onDeleteItem(item.id) }}>删除</button> : null}
+                </div>
+              ) : null}
             </div>
           </article>
         )) : (
@@ -3992,12 +4225,122 @@ function KnowledgeCollectionPanel({
           </div>
         )}
       </div>
+      {folder && settingsOpen ? (
+        <KnowledgeFolderSettingsDialog
+          folder={folder}
+          onClose={() => setSettingsOpen(false)}
+          onSave={(patch) => {
+            setSettingsOpen(false)
+            onUpdateFolder(folder.scope, folder.id, patch)
+          }}
+        />
+      ) : null}
     </section>
+  )
+}
+
+function KnowledgeFolderSettingsDialog({
+  folder,
+  onClose,
+  onSave,
+}: {
+  folder: KnowledgeFolder
+  onClose: () => void
+  onSave: (patch: Partial<KnowledgeFolder>) => void
+}) {
+  const [name, setName] = useState(folder.name)
+  const [cover, setCover] = useState(folder.cover || '')
+  const [description, setDescription] = useState(folder.description || '')
+  const [questions, setQuestions] = useState((folder.recommended_questions?.length ? folder.recommended_questions : ['']).join('\n'))
+  const [coverError, setCoverError] = useState('')
+  const coverOptions = [
+    '',
+    'linear-gradient(180deg, #f6d5e2, #e9a9bf)',
+    'linear-gradient(180deg, #fff1b7, #f78c6b)',
+    'linear-gradient(180deg, #ffe4ef, #ffb2cc)',
+    'linear-gradient(180deg, #fce7f3, #f59e0b)',
+  ]
+  return (
+    <div className="kb-settings-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="kb-settings-dialog" role="dialog" aria-modal="true" aria-label="知识库设置" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <h3>知识库设置</h3>
+          <button type="button" onClick={onClose} aria-label="关闭">×</button>
+        </header>
+        <label className="kb-settings-row">
+          <span>名称</span>
+          <input value={name} onChange={(event) => setName(event.target.value)} maxLength={60} />
+        </label>
+        <div className="kb-settings-row">
+          <span>封面</span>
+          <div>
+            <div className="kb-cover-options">
+              {coverOptions.map((option, index) => (
+                <button
+                  className={cover === option ? 'active' : ''}
+                  type="button"
+                  key={option || 'default'}
+                  onClick={() => { setCover(option); setCoverError('') }}
+                  aria-label={`封面 ${index + 1}`}
+                >
+                  <span style={knowledgeCoverStyle(option)} />
+                </button>
+              ))}
+              <label className="kb-cover-upload">
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0]
+                    event.currentTarget.value = ''
+                    if (!file) return
+                    void readCoverImage(file)
+                      .then((value) => {
+                        setCover(value)
+                        setCoverError('')
+                      })
+                      .catch((err) => {
+                        setCoverError(err instanceof Error ? err.message : '封面读取失败，请换一张图片。')
+                      })
+                  }}
+                />
+                上传图片
+              </label>
+            </div>
+            {coverError ? <small className="kb-settings-error">{coverError}</small> : null}
+          </div>
+        </div>
+        <label className="kb-settings-row">
+          <span>描述</span>
+          <textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="为这个知识库写一句描述" />
+        </label>
+        <label className="kb-settings-row">
+          <span>推荐问题</span>
+          <textarea value={questions} onChange={(event) => setQuestions(event.target.value)} placeholder="每行一个推荐问题" />
+        </label>
+        <footer>
+          <button type="button" onClick={onClose}>取消</button>
+          <button
+            className="primary"
+            type="button"
+            onClick={() => onSave({
+              name: name.trim() || folder.name,
+              cover,
+              description: description.trim(),
+              recommended_questions: questions.split('\n').map((item) => item.trim()).filter(Boolean).slice(0, 8),
+            })}
+          >
+            确定
+          </button>
+        </footer>
+      </section>
+    </div>
   )
 }
 
 function KnowledgeAskView({
   tab,
+  folder,
   question,
   messages,
   busy,
@@ -4008,6 +4351,7 @@ function KnowledgeAskView({
   onDismissAction,
 }: {
   tab: KnowledgeTab
+  folder?: KnowledgeFolder
   question: string
   messages: ChatMessage[]
   busy: boolean
@@ -4017,12 +4361,20 @@ function KnowledgeAskView({
   onApproveAction: (action: AgentToolProposal) => void
   onDismissAction: (action: AgentToolProposal) => void
 }) {
+  const suggestions = (folder?.recommended_questions || []).filter(Boolean).slice(0, 4)
   return (
     <section className="knowledge-ask-view">
       <div className="knowledge-ask-center">
         <h2>基于知识库问答</h2>
         {!messages.length ? (
           <p>{tab === 'personal' ? '可以围绕个人资料梳理经历、准备面试题和整理投递策略。' : '可以围绕收藏资料解释概念、拆解方法并迁移到你的求职场景。'}</p>
+        ) : null}
+        {!messages.length && suggestions.length ? (
+          <div className="knowledge-ask-suggestions">
+            {suggestions.map((item) => (
+              <button type="button" key={item} onClick={() => onQuestion(item)}>{item}</button>
+            ))}
+          </div>
         ) : null}
       </div>
       <div className="knowledge-chat-thread">
@@ -4100,7 +4452,7 @@ function KnowledgeDetailView({
   return (
     <section className="knowledge-detail-view">
       <header className="knowledge-detail-hero">
-        <button className="text-button" type="button" onClick={onBack}>返回问答</button>
+        <button className="knowledge-back-icon" type="button" onClick={onBack} aria-label="返回问答" title="返回问答">‹</button>
         <div>
           <span>{isCreating ? '新建资料' : canEdit ? '个人资料' : '收藏资料'}</span>
           <h2>{displayTitle}</h2>
@@ -5144,6 +5496,72 @@ function toKnowledgeDraft(item: KnowledgeItem): KnowledgeDraft {
   }
 }
 
+function compactText(value?: string) {
+  return (value || '').replace(/\s+/g, '').trim()
+}
+
+function needsServerKnowledgeSummary(item: KnowledgeItem) {
+  const content = compactText(item.content)
+  const summary = compactText(item.summary)
+  if (!content || content.length < 120) return false
+  if (item.summary_status === 'queued' || item.summary_status === 'running') return true
+  if (!summary) return true
+  return content.startsWith(summary.slice(0, Math.min(summary.length, 80)))
+}
+
+function knowledgeCoverStyle(cover?: string) {
+  const value = (cover || '').trim()
+  if (/^(data:image\/|https?:\/\/)/i.test(value)) {
+    return {
+      backgroundImage: `url("${value}")`,
+      backgroundPosition: 'center',
+      backgroundSize: 'cover',
+    }
+  }
+  return {
+    background: value || 'linear-gradient(180deg, #f6d5e2, #e9a9bf)',
+  }
+}
+
+function isSupportedDocumentFile(filename: string) {
+  return /\.(pdf|doc|docx|md|markdown|html|htm)$/i.test(filename)
+}
+
+function readCoverImage(file: File) {
+  if (!/^image\/(png|jpeg|webp)$/.test(file.type)) {
+    return Promise.reject(new Error('封面只支持 png、jpg 或 webp。'))
+  }
+  if (file.size > 4 * 1024 * 1024) {
+    return Promise.reject(new Error('封面图片请控制在 4MB 以内。'))
+  }
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error('封面读取失败，请换一张图片。'))
+    reader.onload = () => {
+      const image = new Image()
+      image.onerror = () => reject(new Error('封面图片无法识别。'))
+      image.onload = () => {
+        const maxSide = 360
+        const scale = Math.min(1, maxSide / Math.max(image.width, image.height))
+        const width = Math.max(1, Math.round(image.width * scale))
+        const height = Math.max(1, Math.round(image.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const context = canvas.getContext('2d')
+        if (!context) {
+          reject(new Error('当前浏览器无法处理封面图片。'))
+          return
+        }
+        context.drawImage(image, 0, 0, width, height)
+        resolve(canvas.toDataURL('image/jpeg', 0.86))
+      }
+      image.src = String(reader.result || '')
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
 function uniqueKnowledgeItems(items: KnowledgeItem[]) {
   const seen = new Set<string>()
   return items.filter((item) => {
@@ -5205,6 +5623,46 @@ function summarizeClientText(value: string, limit = 160) {
   const clean = value.replace(/\s+/g, ' ').trim()
   if (!clean) return ''
   return clean.slice(0, limit) + (clean.length > limit ? '...' : '')
+}
+
+function buildResumeBackgroundSummary(value: string, profile: Profile) {
+  const clean = value.replace(/\s+/g, ' ').trim()
+  if (!clean) return '已保存主简历，桃子会继续提炼教育背景、实习经历和岗位匹配信号。'
+
+  const school = firstMatch(clean, /(北京航空航天大学|清华大学|北京大学|复旦大学|上海交通大学|浙江大学|南京大学|中国人民大学|[\u4e00-\u9fa5]{2,18}(?:大学|学院))/)
+  const degree = firstMatch(clean, /(博士|硕士|研究生|本科|大专|MBA|PhD|Master|Bachelor)/i)
+  const role = firstMatch(clean, /(AI\s*产品|AIGC\s*产品|大模型产品|策略产品|产品经理|产品运营|用户增长|商业分析|数据分析)/i) || profile.target_role
+  const companies = uniqueStrings([...clean.matchAll(/([\u4e00-\u9fa5A-Za-z0-9]{2,16})(?:产品|AI|算法|策略|运营)?实习/g)].map((match) => match[1]))
+    .filter((item) => !/(拥有|负责|参与|完成|相关|经历|项目|产品经理|教育背景)/.test(item))
+    .slice(0, 3)
+  const internshipCount = countResumeInternships(clean)
+  const skills = uniqueStrings([
+    ...clean.matchAll(/(AI|AIGC|大模型|LLM|Prompt|用户调研|需求分析|数据分析|SQL|Python|PRD|竞品分析|增长|商业化)/gi),
+  ].map((match) => match[1])).slice(0, 4)
+
+  const identity = [school, degree].filter(Boolean).join(' ')
+  const parts = [
+    identity ? `${identity}背景` : '',
+    internshipCount ? `拥有 ${internshipCount} 段${/AI|AIGC|大模型|LLM/i.test(clean) ? ' AI/产品' : ''}实习经历` : companies.length ? `有 ${companies.join('、')} 等经历` : '',
+    role ? `目标方向偏 ${role}` : '',
+    skills.length ? `关键词包括 ${skills.join('、')}` : '',
+  ].filter(Boolean)
+
+  return parts.length
+    ? `${parts.join('，')}。`
+    : '已保存主简历，桃子会继续提炼教育背景、实习经历、项目亮点和岗位匹配信号。'
+}
+
+function firstMatch(value: string, pattern: RegExp) {
+  return value.match(pattern)?.[1]?.trim() || ''
+}
+
+function countResumeInternships(value: string) {
+  const explicit = value.match(/(\d+|一|二|两|三|四|五|六|七|八|九|十)\s*段[^。；，,\n]{0,12}实习/)
+  if (explicit?.[1]) return explicit[1]
+  const companyLike = uniqueStrings([...value.matchAll(/[\u4e00-\u9fa5A-Za-z0-9]{2,16}(?:公司|集团|科技|字节|快手|百度|腾讯|阿里|美团|小红书|京东|网易|华为)[^。；\n]{0,24}实习/g)].map((match) => match[0]))
+  if (companyLike.length >= 2) return String(companyLike.length)
+  return ''
 }
 
 function isInterviewFinishIntent(value: string) {
@@ -5539,18 +5997,75 @@ function buildKnowledgeItems(profile: Profile): KnowledgeItem[] {
   ]
 }
 
-function sortResumeFiles(files: ParsedUpload[], mode: 'time' | 'role') {
-  const values = [...files]
-  if (mode === 'role') return values.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'))
-  return values
+type ResumeListItem =
+  | {
+      kind: 'version'
+      id: string
+      title: string
+      summary: string
+      content: string
+      size: number
+      createdAt: string
+      updatedAt: string
+      updatedLabel: string
+      source: ResumeVersion
+    }
+  | {
+      kind: 'file'
+      id: string
+      title: string
+      summary: string
+      content: string
+      size: number
+      createdAt: string
+      updatedAt: string
+      updatedLabel: string
+    }
+
+function buildResumeListItems(
+  versions: ResumeVersion[],
+  files: ParsedUpload[],
+  search: string,
+  mode: ResumeSortMode,
+): ResumeListItem[] {
+  const keyword = search.trim().toLowerCase()
+  const versionItems: ResumeListItem[] = versions.map((resume) => ({
+    kind: 'version',
+    id: resume.id,
+    title: resume.title || resume.filename || `第 ${resume.version_no} 版简历`,
+    summary: resume.summary || '已保存为历史版本',
+    content: resume.content,
+    size: resume.size ?? resume.content.length,
+    createdAt: resume.created_at || '',
+    updatedAt: resume.updated_at || resume.created_at || '',
+    updatedLabel: formatResumeUpdatedLabel(resume.updated_at || resume.created_at),
+    source: resume,
+  }))
+  const fileItems: ResumeListItem[] = versions.length ? [] : files.map((file) => ({
+    kind: 'file',
+    id: file.filename,
+    title: file.title || file.filename,
+    summary: file.summary || '已解析',
+    content: file.content,
+    size: file.size ?? file.content.length,
+    createdAt: '',
+    updatedAt: '',
+    updatedLabel: '刚刚',
+  }))
+  return [...versionItems, ...fileItems]
+    .filter((item) => !keyword || item.title.toLowerCase().includes(keyword))
+    .sort((a, b) => {
+      if (mode === 'size') return b.size - a.size
+      if (mode === 'created') return String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
+      return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''))
+    })
 }
 
-function sortResumeVersions(resumes: ResumeVersion[], mode: 'time' | 'role') {
-  const values = [...resumes]
-  if (mode === 'role') {
-    return values.sort((a, b) => (a.target_role || a.title).localeCompare(b.target_role || b.title, 'zh-CN'))
-  }
-  return values.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+function formatResumeUpdatedLabel(value?: string) {
+  if (!value) return '刚刚'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '刚刚'
+  return `更新于 ${date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })}`
 }
 
 function extractExperienceNames(content: string) {

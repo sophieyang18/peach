@@ -1,7 +1,7 @@
 import re
 from contextvars import ContextVar
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Response, UploadFile
 from sqlalchemy import delete, desc, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -977,6 +977,9 @@ async def create_knowledge_folder(payload: KnowledgeFolderIn, session: AsyncSess
         name=payload.name.strip()[:120] or "新建文件夹",
         scope=normalize_folder_scope(payload.scope),
         item_ids=payload.item_ids,
+        cover=payload.cover.strip()[:500],
+        description=payload.description.strip()[:800],
+        recommended_questions=normalize_recommended_questions(payload.recommended_questions),
         sort_order=payload.sort_order,
     )
     session.add(folder)
@@ -992,6 +995,9 @@ async def update_knowledge_folder(folder_id: str, payload: KnowledgeFolderIn, se
     folder.name = payload.name.strip()[:120] or folder.name
     folder.scope = normalize_folder_scope(payload.scope)
     folder.item_ids = payload.item_ids
+    folder.cover = payload.cover.strip()[:500]
+    folder.description = payload.description.strip()[:800]
+    folder.recommended_questions = normalize_recommended_questions(payload.recommended_questions)
     folder.sort_order = payload.sort_order
     await session.commit()
     await session.refresh(folder)
@@ -1008,12 +1014,13 @@ async def delete_knowledge_folder(folder_id: str, session: AsyncSession = Depend
 
 
 @router.post("/knowledge")
-async def create_knowledge(payload: KnowledgeIn, session: AsyncSession = Depends(get_session)) -> dict:
+async def create_knowledge(payload: KnowledgeIn, background_tasks: BackgroundTasks, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
     resource = KnowledgeResource(
         user_id=profile.id,
-        title=payload.title,
+        title=payload.title.strip()[:160] or "新建资料",
         summary=payload.summary,
+        summary_status="ready",
         content=payload.content,
         source=payload.source,
         url=payload.url,
@@ -1025,12 +1032,13 @@ async def create_knowledge(payload: KnowledgeIn, session: AsyncSession = Depends
         await add_item_to_folder(session, profile.id, payload.folder_id, resource.id)
     else:
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    await queue_knowledge_summary(session, background_tasks, resource)
     await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource)}
 
 
 @router.post("/knowledge/link")
-async def create_knowledge_from_link(payload: KnowledgeLinkIn, session: AsyncSession = Depends(get_session)) -> dict:
+async def create_knowledge_from_link(payload: KnowledgeLinkIn, background_tasks: BackgroundTasks, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
     try:
         parsed = await parse_link(payload.url)
@@ -1040,6 +1048,7 @@ async def create_knowledge_from_link(payload: KnowledgeLinkIn, session: AsyncSes
         user_id=profile.id,
         title=parsed.title[:160],
         summary=parsed.summary,
+        summary_status="ready",
         content=parsed.content,
         source="personal",
         url=payload.url,
@@ -1051,6 +1060,7 @@ async def create_knowledge_from_link(payload: KnowledgeLinkIn, session: AsyncSes
         await add_item_to_folder(session, profile.id, payload.folder_id, resource.id)
     else:
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    await queue_knowledge_summary(session, background_tasks, resource)
     await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource), "file": serialize_parsed_file(parsed, payload.url)}
 
@@ -1061,6 +1071,7 @@ async def update_knowledge(item_id: str, payload: KnowledgeIn, session: AsyncSes
     resource = await owned_knowledge(session, profile.id, item_id)
     resource.title = payload.title
     resource.summary = payload.summary
+    resource.summary_status = "ready"
     resource.content = payload.content
     resource.source = payload.source
     resource.url = payload.url
@@ -1081,6 +1092,18 @@ async def delete_knowledge(item_id: str, session: AsyncSession = Depends(get_ses
     return {"deleted": True, "id": item_id}
 
 
+@router.post("/knowledge/{item_id}/summary")
+async def refresh_knowledge_summary(
+    item_id: str,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    profile = await get_or_create_profile(session)
+    resource = await owned_knowledge(session, profile.id, item_id)
+    await queue_knowledge_summary(session, background_tasks, resource, force=True)
+    return {"item": serialize_knowledge(resource)}
+
+
 @router.post("/files/parse")
 async def parse_file(file: UploadFile = File(...)) -> dict:
     parsed = await parse_uploaded_file(file)
@@ -1089,6 +1112,7 @@ async def parse_file(file: UploadFile = File(...)) -> dict:
 
 @router.post("/knowledge/upload")
 async def upload_knowledge(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     folder_id: str = Form(""),
     session: AsyncSession = Depends(get_session),
@@ -1099,6 +1123,7 @@ async def upload_knowledge(
         user_id=profile.id,
         title=parsed["title"],
         summary=parsed["summary"],
+        summary_status="ready",
         content=parsed["content"],
         source="personal",
         url="",
@@ -1110,6 +1135,7 @@ async def upload_knowledge(
         await add_item_to_folder(session, profile.id, folder_id, resource.id)
     else:
         await add_item_to_default_folder(session, profile.id, resource.id, "personal")
+    await queue_knowledge_summary(session, background_tasks, resource)
     await refresh_recommendations_after_commit(profile, trigger_reason="knowledge", source_type="knowledge", source_id=resource.id)
     return {"item": serialize_knowledge(resource), "file": parsed}
 
@@ -1198,9 +1224,11 @@ def serialize_knowledge(item: KnowledgeResource) -> dict:
         "id": item.id,
         "title": item.title,
         "summary": item.summary,
+        "summary_status": item.summary_status or "ready",
         "content": item.content,
         "source": item.source,
         "url": item.url,
+        "pinned": int(item.pinned or 0),
         "created_at": item.created_at.isoformat() if item.created_at else None,
     }
 
@@ -1211,6 +1239,9 @@ def serialize_folder(folder: KnowledgeFolder) -> dict:
         "name": folder.name,
         "scope": folder.scope,
         "item_ids": folder.item_ids or [],
+        "cover": folder.cover or "",
+        "description": folder.description or "",
+        "recommended_questions": folder.recommended_questions or [],
         "sort_order": folder.sort_order,
         "created_at": folder.created_at.isoformat() if folder.created_at else None,
         "updated_at": folder.updated_at.isoformat() if folder.updated_at else None,
@@ -1226,6 +1257,7 @@ def serialize_resume_version(resume: ResumeVersion | None) -> dict | None:
         "filename": resume.filename,
         "summary": resume.summary,
         "content": resume.content,
+        "size": len((resume.content or "").encode("utf-8")),
         "source": resume.source,
         "target_role": resume.target_role,
         "version_no": resume.version_no,
@@ -1242,6 +1274,7 @@ def serialize_parsed_file(parsed, url: str = "") -> dict:
         "title": parsed.title,
         "summary": parsed.summary,
         "content": parsed.content,
+        "size": len((parsed.content or "").encode("utf-8")),
         "warning": parsed.warning,
         "url": url,
     }
@@ -1785,6 +1818,87 @@ async def owned_knowledge(session: AsyncSession, user_id: str, item_id: str) -> 
     return resource
 
 
+def normalize_recommended_questions(values: list[str] | None) -> list[str]:
+    questions: list[str] = []
+    for value in values or []:
+        text_value = re.sub(r"\s+", " ", str(value or "")).strip()
+        if text_value and text_value not in questions:
+            questions.append(text_value[:80])
+        if len(questions) >= 8:
+            break
+    return questions
+
+
+def fallback_knowledge_summary(title: str, content: str) -> str:
+    clean = re.sub(r"\s+", " ", content or "").strip()
+    if not clean:
+        return f"{title or '这份资料'}暂无可总结内容。"
+    return f"这份资料主要包含：{clean[:180]}{'...' if len(clean) > 180 else ''}"
+
+
+def clean_knowledge_summary(value: str, title: str, content: str) -> str:
+    clean = re.sub(r"\s+", " ", value or "").strip()
+    clean = re.sub(r"^(摘要|总结|资料摘要)[:：]\s*", "", clean)
+    if not clean:
+        return fallback_knowledge_summary(title, content)
+    return clean[:420]
+
+
+async def queue_knowledge_summary(
+    session: AsyncSession,
+    background_tasks: BackgroundTasks,
+    resource: KnowledgeResource,
+    *,
+    force: bool = False,
+) -> None:
+    content = (resource.content or "").strip()
+    if not content or (not force and len(content) < 120):
+        resource.summary_status = "ready"
+        await session.commit()
+        await session.refresh(resource)
+        return
+    resource.summary_status = "queued"
+    await session.commit()
+    await session.refresh(resource)
+    background_tasks.add_task(generate_knowledge_summary, resource.id)
+
+
+async def generate_knowledge_summary(item_id: str) -> None:
+    async with SessionLocal() as session:
+        resource = await session.get(KnowledgeResource, item_id)
+        if not resource:
+            return
+        resource.summary_status = "running"
+        await session.commit()
+        content = (resource.content or "").strip()
+        fallback = fallback_knowledge_summary(resource.title, content)
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "你是求职知识库整理助手。请把用户上传的资料总结成真正的资料摘要，"
+                    "不要照抄开头，不要输出 Markdown，不要编造。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"资料标题：{resource.title}\n\n"
+                    f"资料正文：{content[:6000]}\n\n"
+                    "请用 1 到 2 句中文总结这份资料的主题、关键信息和可用于求职准备的价值，控制在 120 字以内。"
+                ),
+            },
+        ]
+        try:
+            summary = await agent.complete(prompt, fallback=fallback, allow_fallback=True)
+            resource.summary = clean_knowledge_summary(summary, resource.title, content)
+            resource.summary_status = "ready"
+        except Exception:
+            resource.summary = fallback
+            resource.summary_status = "failed"
+        await session.commit()
+
+
 async def parse_uploaded_file(file: UploadFile) -> dict:
     filename = file.filename or "upload"
     extension = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -1806,9 +1920,10 @@ async def parse_uploaded_file(file: UploadFile) -> dict:
     return {
         "filename": parsed.filename,
         "extension": parsed.extension,
-        "title": parsed.title,
+        "title": parsed.filename or filename,
         "summary": parsed.summary,
         "content": parsed.content,
+        "size": len(content),
         "warning": parsed.warning,
     }
 

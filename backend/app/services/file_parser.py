@@ -172,8 +172,14 @@ def doc_stream_candidates(content: bytes) -> list[bytes]:
 
 
 def decode_text_best_effort(content: bytes) -> str:
+    for encoding in ["utf-8-sig", "utf-8"]:
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
     candidates: list[str] = []
-    for encoding in ["utf-8-sig", "utf-8", "gb18030", "utf-16le", "utf-16be", "big5"]:
+    for encoding in ["gb18030", "utf-16le", "utf-16be", "big5"]:
         try:
             candidates.append(content.decode(encoding, errors="ignore"))
         except Exception:
