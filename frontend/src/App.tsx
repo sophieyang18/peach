@@ -2620,7 +2620,7 @@ function AccountGate({
         </div>
         <div className="account-copy">
           <p>桃子账号</p>
-          <h1>我是桃子，一个越用越懂你、越用越会教你的求职搭子</h1>
+          <h1>我是桃子，一个越用越懂你、越用越会教你的求职搭子！</h1>
           <span>先告诉桃子你叫什么</span>
         </div>
       </section>
@@ -4253,6 +4253,7 @@ function KnowledgeFolderSettingsDialog({
   const [description, setDescription] = useState(folder.description || '')
   const [questions, setQuestions] = useState((folder.recommended_questions?.length ? folder.recommended_questions : ['']).join('\n'))
   const [coverError, setCoverError] = useState('')
+  const coverInputRef = useRef<HTMLInputElement>(null)
   const coverOptions = [
     '',
     'linear-gradient(180deg, #f6d5e2, #e9a9bf)',
@@ -4260,6 +4261,17 @@ function KnowledgeFolderSettingsDialog({
     'linear-gradient(180deg, #ffe4ef, #ffb2cc)',
     'linear-gradient(180deg, #fce7f3, #f59e0b)',
   ]
+  const handleCoverFile = (file?: File) => {
+    if (!file) return
+    void readCoverImage(file)
+      .then((value) => {
+        setCover(value)
+        setCoverError('')
+      })
+      .catch((err) => {
+        setCoverError(err instanceof Error ? err.message : '封面读取失败，请换一张图片。')
+      })
+  }
   return (
     <div className="kb-settings-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="kb-settings-dialog" role="dialog" aria-modal="true" aria-label="知识库设置" onMouseDown={(event) => event.stopPropagation()}>
@@ -4286,27 +4298,27 @@ function KnowledgeFolderSettingsDialog({
                   <span style={knowledgeCoverStyle(option)} />
                 </button>
               ))}
-              <label className="kb-cover-upload">
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg,image/webp"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0]
-                    event.currentTarget.value = ''
-                    if (!file) return
-                    void readCoverImage(file)
-                      .then((value) => {
-                        setCover(value)
-                        setCoverError('')
-                      })
-                      .catch((err) => {
-                        setCoverError(err instanceof Error ? err.message : '封面读取失败，请换一张图片。')
-                      })
-                  }}
-                />
+              <button className="kb-cover-upload" type="button" onClick={() => coverInputRef.current?.click()}>
                 上传图片
-              </label>
+              </button>
+              <input
+                ref={coverInputRef}
+                className="kb-cover-file-input"
+                type="file"
+                accept="image/*"
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  event.currentTarget.value = ''
+                  handleCoverFile(file)
+                }}
+              />
             </div>
+            {isImageCover(cover) ? (
+              <div className="kb-cover-current">
+                <span style={knowledgeCoverStyle(cover)} />
+                <em>已选择图片封面，点确定后保存。</em>
+              </div>
+            ) : null}
             {coverError ? <small className="kb-settings-error">{coverError}</small> : null}
           </div>
         </div>
@@ -5511,7 +5523,7 @@ function needsServerKnowledgeSummary(item: KnowledgeItem) {
 
 function knowledgeCoverStyle(cover?: string) {
   const value = (cover || '').trim()
-  if (/^(data:image\/|https?:\/\/)/i.test(value)) {
+  if (isImageCover(value)) {
     return {
       backgroundImage: `url("${value}")`,
       backgroundPosition: 'center',
@@ -5523,16 +5535,20 @@ function knowledgeCoverStyle(cover?: string) {
   }
 }
 
+function isImageCover(cover?: string) {
+  return /^(data:image\/|https?:\/\/)/i.test((cover || '').trim())
+}
+
 function isSupportedDocumentFile(filename: string) {
   return /\.(pdf|doc|docx|md|markdown|html|htm)$/i.test(filename)
 }
 
 function readCoverImage(file: File) {
-  if (!/^image\/(png|jpeg|webp)$/.test(file.type)) {
-    return Promise.reject(new Error('封面只支持 png、jpg 或 webp。'))
+  if (!/^image\//.test(file.type)) {
+    return Promise.reject(new Error('封面只支持图片文件。'))
   }
-  if (file.size > 4 * 1024 * 1024) {
-    return Promise.reject(new Error('封面图片请控制在 4MB 以内。'))
+  if (file.size > 8 * 1024 * 1024) {
+    return Promise.reject(new Error('封面图片请控制在 8MB 以内。'))
   }
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader()

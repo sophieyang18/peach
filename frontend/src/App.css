@@ -611,8 +611,37 @@
 .kb-more-button {
   width: 32px;
   min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  color: transparent;
+  font-size: 0;
   padding: 0;
-  letter-spacing: 1px;
+  letter-spacing: 0;
+}
+
+.kb-more-button::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #8f7f86;
+  box-shadow: -8px 0 0 #8f7f86, 8px 0 0 #8f7f86;
+}
+
+.kb-more-button:hover {
+  border-color: #f4d2df;
+  background: #fff7fb;
+  transform: translateY(-1px);
+}
+
+.kb-more-button:active {
+  transform: translateY(0);
 }
 
 .kb-menu-wrap {
@@ -782,8 +811,35 @@
   cursor: pointer;
 }
 
-.kb-cover-upload input {
+.kb-cover-upload:hover {
+  background: #fff0f7;
+  border-color: #ff9fc6;
+}
+
+.kb-cover-file-input {
   display: none;
+}
+
+.kb-cover-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: #8f7781;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.kb-cover-current span {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid #f0ded7;
+  border-radius: 9px;
+}
+
+.kb-cover-current em {
+  font-style: normal;
 }
 
 .kb-settings-error {
