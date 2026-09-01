@@ -26,6 +26,95 @@ class ChatIn(BaseModel):
     message: str
 
 
+class CandidateProfilePatchIn(BaseModel):
+    basics: dict = Field(default_factory=dict)
+    education: list[dict] = Field(default_factory=list)
+    experiences: list[dict] = Field(default_factory=list)
+    projects: list[dict] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    target_preferences: dict = Field(default_factory=dict)
+    field_statuses: dict = Field(default_factory=dict)
+
+
+class ConversationMessageIn(BaseModel):
+    role: str
+    content: str = ""
+    actions: list[dict] = Field(default_factory=list)
+
+
+class ConversationIn(BaseModel):
+    id: str
+    title: str = "新建对话"
+    updatedAt: str = ""
+    messages: list[ConversationMessageIn] = Field(default_factory=list)
+
+
+class ConversationSyncIn(BaseModel):
+    conversations: list[ConversationIn] = Field(default_factory=list)
+    activeConversationId: str = ""
+
+
+class ProductEventIn(BaseModel):
+    event_name: str
+    anonymous_id: str = ""
+    session_id: str = ""
+    page: str = ""
+    module: str = ""
+    source: str = ""
+    properties: dict = Field(default_factory=dict)
+    client_version: str = ""
+    device_type: str = ""
+    browser: str = ""
+    referrer: str = ""
+
+
+class ApplicationIn(BaseModel):
+    company: str = ""
+    role: str = ""
+    jd_text: str = ""
+    source_url: str = ""
+    resume_version_id: str = ""
+    status: str = "draft"
+    source: str = "manual"
+    notes: str = ""
+
+
+class ApplicationPatchIn(BaseModel):
+    company: str | None = None
+    role: str | None = None
+    jd_text: str | None = None
+    source_url: str | None = None
+    resume_version_id: str | None = None
+    status: str | None = None
+    source: str | None = None
+    notes: str | None = None
+
+
+class DailyActionPatchIn(BaseModel):
+    status: str
+
+
+class InterviewExperienceIn(BaseModel):
+    company: str = ""
+    role: str = ""
+    department: str = ""
+    interview_stage: str = ""
+    interview_date: str = ""
+    raw_content: str
+    source_type: str = "manual"
+    source_name: str = ""
+    source_url: str = ""
+    published_at: str = ""
+
+
+class QuestionSetBuildIn(BaseModel):
+    company: str = ""
+    role: str = ""
+    interview_stage: str = ""
+    jd: str = ""
+    limit: int = 10
+
+
 class AgentActionIn(BaseModel):
     message: str
     context: dict = Field(default_factory=dict)
@@ -73,6 +162,7 @@ class InterviewStartIn(BaseModel):
     role: str = ""
     jd: str = ""
     question_bank: str = ""
+    question_set_id: str = ""
 
 
 class InterviewAnswerIn(BaseModel):

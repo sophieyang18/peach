@@ -11,12 +11,13 @@ const INTERVIEW_STAGES = ['投递期', '业务一面', '业务二面', '业务�
 const INTERVIEW_DURATIONS = ['不限', '10分钟', '20分钟', '30分钟', '40分钟']
 const NAV_ICONS: Record<PrimaryModule, string> = {
   peach: '/peach-assets/nav-peach.jpg',
+  applications: '/peach-assets/nav-profile.jpg',
   profile: '/peach-assets/nav-profile.jpg',
   knowledge: '/peach-assets/nav-knowledge.jpg',
   growth: '/peach-assets/nav-growth.png',
 }
 
-type PrimaryModule = 'peach' | 'profile' | 'knowledge' | 'growth'
+type PrimaryModule = 'peach' | 'applications' | 'profile' | 'knowledge' | 'growth'
 type PeachPanel = 'new-chat' | 'interview-setup' | 'question-bank-setup' | 'live-interview'
 type InterviewMode = 'voice'
 type TtsRateMode = 'slow' | 'medium' | 'fast'
@@ -53,8 +54,19 @@ type AgentToolProposal = {
 type MemoryWrite = { id: string; kind: string; content: string }
 type ChatMessage = { role: 'peach' | 'user' | 'system'; content: string; actions?: AgentToolProposal[] }
 type Conversation = { id: string; title: string; updatedAt: string; messages: ChatMessage[] }
-type BusyKey = 'account' | 'refresh' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload'
+type BusyKey = 'account' | 'refresh' | 'chat' | 'interviewStart' | 'profile' | 'knowledge' | 'upload' | 'application'
 type Account = { username: string; display_name?: string }
+type CandidateProfile = {
+  basics: Record<string, unknown>
+  education: unknown[]
+  experiences: unknown[]
+  projects: unknown[]
+  skills: string[]
+  target_preferences: Record<string, unknown>
+  field_statuses: Record<string, unknown>
+  completeness: number
+  source: string
+}
 
 type Profile = {
   id: string
@@ -73,6 +85,12 @@ type Profile = {
 
 type Dashboard = {
   profile: Profile
+  candidate_profile?: CandidateProfile
+  applications?: ApplicationState[]
+  application_summary?: ApplicationSummary
+  job_weather?: JobWeather
+  daily_action?: DailyAction
+  peach_tree?: PeachTree
   resume_versions?: ResumeVersion[]
   checkin: {
     message: string
@@ -114,6 +132,63 @@ type Dashboard = {
   }
   home_context?: HomeContext
   growth_center?: GrowthCenter
+}
+
+type ApplicationStatus = 'draft' | 'ready' | 'applied' | 'screening' | 'interview' | 'final' | 'offer' | 'rejected' | 'withdrawn'
+type ApplicationState = {
+  id: string
+  company: string
+  role: string
+  jd_text: string
+  source_url: string
+  resume_version_id: string
+  status: ApplicationStatus
+  status_label: string
+  source: string
+  notes: string
+  next_step: string
+  created_at?: string
+  updated_at?: string
+}
+type ApplicationSummary = { total: number; applied: number; waiting: number; interviewing: number; offer: number }
+type JobWeather = {
+  weather: string
+  label: string
+  summary: string
+  reason: string
+  application_count: number
+  interviewing_count: number
+  waiting_count: number
+  issue_count: number
+}
+type DailyAction = {
+  id: string
+  date: string
+  action_type: string
+  title: string
+  description: string
+  source_type: string
+  source_id: string
+  status: string
+}
+type PeachTree = {
+  id: string
+  stage: string
+  stage_label: string
+  next_stage: string
+  next_stage_label: string
+  growth_xp: number
+  peach_points: number
+  progress: number
+  streak_days: number
+}
+type InterviewQuestionSet = {
+  id: string
+  company: string
+  role: string
+  interview_stage: string
+  questions: Array<{ question: string; source_type?: string; assessment_point?: string; generation_reason?: string }>
+  source_summary?: Record<string, unknown>
 }
 
 type HomeContext = {
@@ -197,6 +272,7 @@ type InterviewSettings = {
   style: string
   mode: InterviewMode
   questionBank: string
+  questionSetId: string
   targetRole: string
   targetCompany: string
   stage: string
@@ -464,6 +540,20 @@ function isConversationLike(value: unknown): value is Conversation {
   return Boolean(item?.id && item?.title && Array.isArray(item.messages))
 }
 
+function hasMeaningfulConversation(conversations: Conversation[]) {
+  return conversations.some((conversation) => conversation.messages.some((message) => message.role !== 'system' && message.content.trim()))
+}
+
+function getOrCreateClientId(key: string) {
+  const existing = window.localStorage.getItem(key)
+  if (existing) return existing
+  const next = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `client-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  window.localStorage.setItem(key, next)
+  return next
+}
+
 function App() {
   const [account, setAccount] = useState<Account | null>(null)
   const [accountInput, setAccountInput] = useState(() => window.localStorage.getItem('peach:last-username') ?? '')
@@ -506,6 +596,7 @@ function App() {
     style: '不限',
     mode: 'voice',
     questionBank: '产品经理通用题库',
+    questionSetId: '',
     targetRole: '',
     targetCompany: '',
     stage: '投递期',
@@ -543,6 +634,9 @@ function App() {
   const profileHydratedRef = useRef(false)
   const knowledgeHydratedRef = useRef(false)
   const conversationsHydratedRef = useRef(false)
+  const conversationSyncTimerRef = useRef<number | undefined>(undefined)
+  const anonymousIdRef = useRef(getOrCreateClientId('peach:anonymous-id'))
+  const sessionIdRef = useRef(`session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
   const summarizingKnowledgeRef = useRef<Set<string>>(new Set())
 
   const profile = dashboard?.profile ?? defaultProfile
@@ -569,6 +663,30 @@ function App() {
       },
     })
   }, [account?.username])
+
+  const trackEvent = useCallback((eventName: string, properties: Record<string, unknown> = {}, usernameOverride?: string) => {
+    if (!eventName.trim()) return
+    const username = usernameOverride ?? account?.username
+    window.setTimeout(() => {
+      void fetch(`${API_BASE}/api/events`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(username ? { 'X-Peach-User': username } : {}),
+        },
+        body: JSON.stringify({
+          event_name: eventName,
+          page: module,
+          module: peachPanel,
+          anonymous_id: anonymousIdRef.current,
+          session_id: sessionIdRef.current,
+          source: 'web',
+          client_version: 'mvp-1',
+          properties,
+        }),
+      }).catch(() => undefined)
+    }, 0)
+  }, [account?.username, module, peachPanel])
 
   const uploadApi = useCallback(async <T,>(path: string, file: File, fields: Record<string, string> = {}): Promise<T> => {
     setError('')
@@ -770,6 +888,10 @@ function App() {
     profileHydratedRef.current = false
     knowledgeHydratedRef.current = false
     conversationsHydratedRef.current = false
+    if (conversationSyncTimerRef.current) {
+      window.clearTimeout(conversationSyncTimerRef.current)
+      conversationSyncTimerRef.current = undefined
+    }
   }, [mediaStream])
 
   const accountRequest = useCallback(async (path: string, username?: string) => {
@@ -803,6 +925,7 @@ function App() {
     try {
       const data = await accountRequest('/api/accounts/login', username)
       enterAccount(data.account)
+      trackEvent('account_login', { username_length: username.length }, username)
     } catch (err) {
       setAccountMessage(err instanceof Error ? err.message : '登录失败，可以试试创建账号。')
     } finally {
@@ -821,6 +944,7 @@ function App() {
     try {
       const data = await accountRequest('/api/accounts', username)
       enterAccount(data.account)
+      trackEvent('account_create', { username_length: username.length }, username)
     } catch (err) {
       setAccountMessage(err instanceof Error ? err.message : '创建失败，请换一个用户名。')
     } finally {
@@ -897,14 +1021,43 @@ function App() {
     const stored = loadStoredConversations(account.username)
     setConversations(stored.conversations)
     setActiveConversationId(stored.activeConversationId)
-    window.setTimeout(() => {
-      conversationsHydratedRef.current = true
+    fetchJsonWithRetry<{ conversations: Conversation[]; activeConversationId: string }>(`${API_BASE}/api/conversations`, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Peach-User': account.username,
+      },
     }, 0)
+      .then((server) => {
+        const serverConversations = Array.isArray(server.conversations)
+          ? server.conversations.filter(isConversationLike)
+          : []
+        if (serverConversations.length && !hasMeaningfulConversation(stored.conversations)) {
+          setConversations(serverConversations)
+          setActiveConversationId(serverConversations.some((item) => item.id === server.activeConversationId)
+            ? server.activeConversationId
+            : serverConversations[0].id)
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        conversationsHydratedRef.current = true
+      })
   }, [account?.username])
 
   useEffect(() => {
     if (!account?.username || !conversationsHydratedRef.current) return
     saveStoredConversations(account.username, conversations, activeConversationId)
+    if (conversationSyncTimerRef.current) window.clearTimeout(conversationSyncTimerRef.current)
+    conversationSyncTimerRef.current = window.setTimeout(() => {
+      void fetch(`${API_BASE}/api/conversations/sync`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Peach-User': account.username,
+        },
+        body: JSON.stringify({ conversations, activeConversationId }),
+      }).catch(() => undefined)
+    }, 700)
   }, [account?.username, activeConversationId, conversations])
 
   useEffect(() => {
@@ -963,6 +1116,10 @@ function App() {
     if ('speechSynthesis' in window) window.speechSynthesis.cancel()
   }, [])
 
+  useEffect(() => () => {
+    if (conversationSyncTimerRef.current) window.clearTimeout(conversationSyncTimerRef.current)
+  }, [])
+
   function updateConversation(id: string, updater: (conversation: Conversation) => Conversation) {
     setConversations((current) => current.map((item) => (item.id === id ? updater(item) : item)))
   }
@@ -1008,6 +1165,7 @@ function App() {
       warnInterviewNavigationLocked()
       return
     }
+    if (nextModule !== module) trackEvent('nav_click', { from: module, to: nextModule })
     stopTts()
     setModule(nextModule)
     if (nextModule === 'peach') setPeachPanel('new-chat')
@@ -1039,6 +1197,7 @@ function App() {
       { id, title: '新建对话', updatedAt: '刚刚', messages: [] },
       ...current,
     ])
+    trackEvent('conversation_create')
     setActiveConversationId(id)
     setPeachPanel('new-chat')
     setNotice('已新建对话。')
@@ -1094,6 +1253,7 @@ function App() {
     const fallback: Conversation = { id: `chat-${Date.now()}`, title: '新建对话', updatedAt: '刚刚', messages: [] }
     const nextConversations = rest.length ? rest : [fallback]
     setConversations(nextConversations)
+    trackEvent('conversation_delete', { had_linked_interview: Boolean(linkedInterview) })
     if (activeConversationId === id) {
       setActiveConversationId(nextConversations[0].id)
       setPeachPanel('new-chat')
@@ -1158,6 +1318,11 @@ function App() {
     stopTts()
     const snapshot = prompt.trim()
     const visibleSnapshot = visibleContent.trim()
+    trackEvent('chat_message_send', {
+      input_type: 'text',
+      text_length: snapshot.length,
+      active_profile_section: activeProfileSection,
+    })
     setInput('')
     appendMessage({ role: 'user', content: visibleSnapshot || snapshot })
     appendMessage({ role: 'system', content: '桃子正在回复。' })
@@ -1183,11 +1348,17 @@ function App() {
       removeSystemMessage('桃子正在回复。')
       appendMessage({ role: 'peach', content: cleanAssistantText(data.reply), actions: normalizeAgentActions(data.actions) })
       setNotice(data.memory_writes?.length ? '桃子已记住。' : '回复已生成。')
+      trackEvent('chat_response_success', {
+        reply_length: data.reply.length,
+        action_count: data.actions?.length ?? 0,
+        memory_write_count: data.memory_writes?.length ?? 0,
+      })
     } catch (err) {
       removeSystemMessage('桃子正在回复。')
       setInput(snapshot)
       const detail = err instanceof Error ? err.message : ''
       setError(detail ? `桃子刚刚卡了一下：${detail}。内容已经放回输入框。` : '桃子刚刚掉线了一下，内容已经放回输入框。')
+      trackEvent('chat_response_fail', { reason: detail || 'unknown' })
       console.error(err)
     } finally {
       end('chat')
@@ -1356,8 +1527,63 @@ function App() {
       targetRole: current.targetRole || profile.target_role,
       targetCompany: current.targetCompany || profile.target_company,
       questionBank: `${focus}：围绕为什么做、如何决策、指标结果和业务价值连续追问 3-5 题。`,
+      questionSetId: '',
     }))
     setNotice('已为你预填专项训练配置。')
+  }
+
+  async function buildPersonalQuestionSet(rawContent: string): Promise<InterviewQuestionSet | null> {
+    const content = rawContent.trim()
+    if (!content) {
+      setError('请先粘贴一段真实面经，再生成个性化题集。')
+      return null
+    }
+    begin('interviewStart', '正在生成个性化题集')
+    try {
+      await api<{ experience: unknown; questions: unknown[] }>('/api/interview-experiences/import', {
+        method: 'POST',
+        body: JSON.stringify({
+          company: settings.targetCompany || profile.target_company,
+          role: settings.targetRole || profile.target_role,
+          interview_stage: settings.stage || profile.stage,
+          raw_content: content,
+          source_type: 'manual',
+          source_name: '用户导入面经',
+        }),
+      })
+      const data = await api<{ question_set: InterviewQuestionSet }>('/api/interview-question-set/build', {
+        method: 'POST',
+        body: JSON.stringify({
+          company: settings.targetCompany || profile.target_company,
+          role: settings.targetRole || profile.target_role,
+          interview_stage: settings.stage || profile.stage,
+          jd: settings.jd,
+          limit: 8,
+        }),
+      })
+      const questionBankText = data.question_set.questions
+        .map((item, index) => `${index + 1}. ${item.question}`)
+        .join('\n')
+      setSettings((current) => ({
+        ...current,
+        questionBank: questionBankText || current.questionBank,
+        questionSetId: data.question_set.id,
+      }))
+      trackEvent('question_set_build_complete', {
+        company: settings.targetCompany || profile.target_company,
+        role: settings.targetRole || profile.target_role,
+        stage: settings.stage || profile.stage,
+        question_count: data.question_set.questions.length,
+      })
+      setNotice('已基于真实面经生成个性化题集。')
+      return data.question_set
+    } catch (err) {
+      setError('个性化题集生成失败，请稍后再试。')
+      console.error(err)
+      return null
+    } finally {
+      end('interviewStart')
+    }
   }
 
   async function startLiveInterview(kind: 'interview' | 'question-bank') {
@@ -1394,10 +1620,19 @@ function App() {
           role: settings.targetRole || profile.target_role,
           jd: [`当前阶段：${settings.stage || profile.stage}`, `面试时长：${settings.duration}`, settings.jd].filter(Boolean).join('\n\n'),
           question_bank: kind === 'question-bank' ? settings.questionBank : '',
+          question_set_id: kind === 'question-bank' ? settings.questionSetId : '',
         }),
       })
 
       setActiveInterviewId(data.interview.id)
+      trackEvent('interview_start', {
+        kind,
+        role: settings.targetRole || profile.target_role,
+        stage: settings.stage || profile.stage,
+        duration: settings.duration,
+        interviewer_gender: settings.gender,
+        interviewer_style: settings.style,
+      })
       setInterviewProgress(data.progress ?? defaultInterviewProgress)
       setPeachPanel('live-interview')
       const openingText = cleanAssistantText(`${data.opening.opening}\n\n${data.opening.question}`)
@@ -1438,6 +1673,7 @@ function App() {
       return
     }
     const interviewId = activeInterviewId
+    trackEvent('interview_answer_send', { text_length: normalizedAnswer.length })
     setInput('')
     appendMessage({ role: 'user', content: normalizedAnswer })
     appendMessage({ role: 'system', content: '面试官正在追问。' })
@@ -1488,10 +1724,15 @@ function App() {
         setFinishSuggestionShown(true)
       }
       setNotice(data.interview.status === 'completed' ? '面试已完成。' : '追问已生成。')
+      trackEvent('interview_answer_success', {
+        status: data.interview.status,
+        progress: data.progress?.completion ?? interviewProgress.completion,
+      })
     } catch (err) {
       removeSystemMessage('面试官正在追问。')
       setInput(answer)
       setError('面试追问生成失败，回答已经放回输入框。')
+      trackEvent('interview_answer_fail')
       console.error(err)
     } finally {
       end('chat')
@@ -1525,6 +1766,9 @@ function App() {
       const reportText = formatInterviewReportMessage(data.report || data.interview.report)
       appendMessage({ role: 'peach', content: reportText })
       setNotice('面试已结束，报告已生成。')
+      trackEvent('interview_finish', {
+        report_score: (data.report || data.interview.report)?.overall_score ?? null,
+      })
       void refreshDashboard()
     } catch (err) {
       removeSystemMessage('正在生成面试报告。')
@@ -1532,6 +1776,88 @@ function App() {
       console.error(err)
     } finally {
       end('chat')
+    }
+  }
+
+  async function createApplicationDraft(payload: {
+    company: string
+    role: string
+    jd_text: string
+    source_url: string
+    notes: string
+    status: ApplicationStatus
+  }) {
+    begin('application', '正在记录投递')
+    try {
+      await api<{ application: ApplicationState }>('/api/applications', {
+        method: 'POST',
+        body: JSON.stringify({ ...payload, source: 'manual' }),
+      })
+      trackEvent('application_create', { source: 'manual', status: payload.status })
+      await refreshDashboard()
+      setNotice('投递记录已更新。')
+    } catch (err) {
+      setError('投递记录保存失败，请稍后再试。')
+      console.error(err)
+    } finally {
+      end('application')
+    }
+  }
+
+  async function updateApplicationStatus(application: ApplicationState, status: ApplicationStatus) {
+    begin('application', '正在更新投递状态')
+    try {
+      await api<{ application: ApplicationState }>(`/api/applications/${application.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      })
+      trackEvent('application_status_change', { from: application.status, to: status })
+      await refreshDashboard()
+      setNotice('投递状态已更新。')
+    } catch (err) {
+      setError('投递状态更新失败，请稍后再试。')
+      console.error(err)
+    } finally {
+      end('application')
+    }
+  }
+
+  async function deleteApplicationRecord(application: ApplicationState) {
+    const confirmed = window.confirm(`确定删除「${application.company || '目标公司'} ${application.role || '岗位'}」这条投递记录吗？`)
+    if (!confirmed) return
+    begin('application', '正在删除投递记录')
+    try {
+      await api<{ deleted: boolean }>(`/api/applications/${application.id}`, { method: 'DELETE' })
+      trackEvent('application_delete', { status: application.status })
+      await refreshDashboard()
+      setNotice('投递记录已删除。')
+    } catch (err) {
+      setError('投递记录删除失败，请稍后再试。')
+      console.error(err)
+    } finally {
+      end('application')
+    }
+  }
+
+  async function updateDailyActionStatus(status: 'started' | 'completed' | 'skipped') {
+    const action = dashboard?.daily_action
+    if (!action) return
+    begin('application', status === 'completed' ? '正在完成今日行动' : '正在更新今日行动')
+    try {
+      await api<{ daily_action: DailyAction; peach_tree?: PeachTree }>(`/api/daily-action/${action.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      })
+      trackEvent(`daily_action_${status === 'started' ? 'start' : status === 'skipped' ? 'skip' : 'complete'}`, {
+        action_type: action.action_type,
+      })
+      await refreshDashboard()
+      setNotice(status === 'completed' ? '今日行动已完成，桃子树也记录了这一步。' : '今日行动已更新。')
+    } catch (err) {
+      setError('今日行动更新失败，请稍后再试。')
+      console.error(err)
+    } finally {
+      end('application')
     }
   }
 
@@ -2344,6 +2670,21 @@ function App() {
           <button
             className={[
               'main-nav-item',
+              module === 'applications' ? 'active' : '',
+              isInterviewNavigationLocked ? 'locked' : '',
+            ].filter(Boolean).join(' ')}
+            type="button"
+            aria-disabled={isInterviewNavigationLocked}
+            title={isInterviewNavigationLocked ? '请先结束当前面试' : undefined}
+            onClick={() => openModule('applications')}
+          >
+            <span className="nav-icon"><img src={NAV_ICONS.applications} alt="" /></span>
+            <strong>投递</strong>
+            {isInterviewNavigationLocked ? <span className="nav-lock" aria-hidden="true">锁定</span> : null}
+          </button>
+          <button
+            className={[
+              'main-nav-item',
               module === 'profile' ? 'active' : '',
               isInterviewNavigationLocked ? 'locked' : '',
             ].filter(Boolean).join(' ')}
@@ -2486,6 +2827,7 @@ function App() {
             onSettingsChange={setSettings}
             onStartInterview={() => void startLiveInterview('interview')}
             onStartQuestionBank={() => void startLiveInterview('question-bank')}
+            onBuildQuestionSet={(rawContent) => buildPersonalQuestionSet(rawContent)}
             onUploadInterviewFile={(file, target) => void uploadInterviewFile(file, target)}
             onUploadChatFile={(file) => void uploadChatFile(file)}
             onPauseToggle={() => setPaused((value) => !value)}
@@ -2537,6 +2879,23 @@ function App() {
             onOpenGrowth={() => openModule('growth')}
             onStopReportSpeech={stopTts}
             onDeleteInterviewReport={(interview) => void deleteInterviewReport(interview)}
+          />
+        ) : null}
+
+        {module === 'applications' ? (
+          <ApplicationsWorkspace
+            profile={profile}
+            applications={dashboard?.applications ?? []}
+            summary={dashboard?.application_summary}
+            weather={dashboard?.job_weather}
+            dailyAction={dashboard?.daily_action}
+            peachTree={dashboard?.peach_tree}
+            busy={Boolean(busy.application || busy.refresh)}
+            onCreate={(payload) => void createApplicationDraft(payload)}
+            onStatus={(application, status) => void updateApplicationStatus(application, status)}
+            onDelete={(application) => void deleteApplicationRecord(application)}
+            onDailyAction={(status) => void updateDailyActionStatus(status)}
+            onStartTraining={startGrowthTraining}
           />
         ) : null}
 
@@ -2863,6 +3222,7 @@ function PeachWorkspace(props: {
   onSettingsChange: (value: InterviewSettings) => void
   onStartInterview: () => void
   onStartQuestionBank: () => void
+  onBuildQuestionSet: (rawContent: string) => Promise<InterviewQuestionSet | null>
   onUploadInterviewFile: (file: File, target: 'resume' | 'questionBank') => void
   onUploadChatFile: (file: File) => void
   onPauseToggle: () => void
@@ -2963,6 +3323,7 @@ function InterviewSetup({
   onSettingsChange,
   onStartInterview,
   onStartQuestionBank,
+  onBuildQuestionSet,
   onUploadInterviewFile,
 }: {
   kind: 'interview' | 'question-bank'
@@ -2972,6 +3333,7 @@ function InterviewSetup({
   onSettingsChange: (value: InterviewSettings) => void
   onStartInterview: () => void
   onStartQuestionBank: () => void
+  onBuildQuestionSet: (rawContent: string) => Promise<InterviewQuestionSet | null>
   onUploadInterviewFile: (file: File, target: 'resume' | 'questionBank') => void
 }) {
   const isBank = kind === 'question-bank'
@@ -2980,6 +3342,10 @@ function InterviewSetup({
   const trainingFocus = targetedTraining ? settings.questionBank.split(/[：:]/)[0] : ''
   const interviewerPortrait = settings.gender === '男性' ? LIZI_PORTRAIT : PEACH_PORTRAIT
   const interviewerName = settings.gender === '男性' ? '李子' : '桃子'
+  const [experienceText, setExperienceText] = useState('')
+  const [generatedSet, setGeneratedSet] = useState<InterviewQuestionSet | null>(null)
+  const presetQuestionBanks = ['产品经理通用题库', '简历深挖题库', 'AIGC 产品题库']
+  const hasCustomQuestionBank = Boolean(settings.questionBank && !presetQuestionBanks.includes(settings.questionBank))
 
   return (
     <section className="setup-panel">
@@ -3037,15 +3403,35 @@ function InterviewSetup({
         </Field>
         {isBank ? (
           <Field label="面试题库">
-            <select value={settings.questionBank} onChange={(event) => onSettingsChange({ ...settings, questionBank: event.target.value })}>
-              <option>产品经理通用题库</option>
-              <option>简历深挖题库</option>
-              <option>AIGC 产品题库</option>
+            <select value={settings.questionBank} onChange={(event) => onSettingsChange({ ...settings, questionBank: event.target.value, questionSetId: '' })}>
+              {presetQuestionBanks.map((bank) => <option key={bank}>{bank}</option>)}
+              {hasCustomQuestionBank ? <option value={settings.questionBank}>个性化题集</option> : null}
             </select>
             <label className="upload-card">
               <input type="file" accept=".pdf,.doc,.docx,.md,.markdown,.html,.htm" onChange={(event) => event.target.files?.[0] && onUploadInterviewFile(event.target.files[0], 'questionBank')} />
               <span>上传题库文件</span>
             </label>
+          </Field>
+        ) : null}
+        {isBank ? (
+          <Field label="真实面经材料">
+            <textarea
+              rows={5}
+              value={experienceText}
+              onChange={(event) => setExperienceText(event.target.value)}
+              placeholder="粘贴真实面经，桃子会抽题、去重并结合你的简历改写"
+            />
+            <button
+              className="secondary-action-button"
+              type="button"
+              disabled={Boolean(busy.interviewStart)}
+              onClick={() => void onBuildQuestionSet(experienceText).then(setGeneratedSet)}
+            >
+              {busy.interviewStart ? '生成中' : '生成个性化题集'}
+            </button>
+            {generatedSet || settings.questionSetId ? (
+              <small className="field-hint">已生成 {generatedSet?.questions.length || '一组'} 道个性化题，开始面试后会优先使用。</small>
+            ) : null}
           </Field>
         ) : null}
         <Field label="面试简历">
@@ -3722,6 +4108,172 @@ function ReportGrowthLoop({
     </section>
   )
 }
+
+function ApplicationsWorkspace({
+  profile,
+  applications,
+  summary,
+  weather,
+  dailyAction,
+  peachTree,
+  busy,
+  onCreate,
+  onStatus,
+  onDelete,
+  onDailyAction,
+  onStartTraining,
+}: {
+  profile: Profile
+  applications: ApplicationState[]
+  summary?: ApplicationSummary
+  weather?: JobWeather
+  dailyAction?: DailyAction
+  peachTree?: PeachTree
+  busy: boolean
+  onCreate: (payload: { company: string; role: string; jd_text: string; source_url: string; notes: string; status: ApplicationStatus }) => void
+  onStatus: (application: ApplicationState, status: ApplicationStatus) => void
+  onDelete: (application: ApplicationState) => void
+  onDailyAction: (status: 'started' | 'completed' | 'skipped') => void
+  onStartTraining: (prompt: string) => void
+}) {
+  const [draft, setDraft] = useState({
+    company: '',
+    role: profile.target_role || '产品经理',
+    jd_text: '',
+    source_url: '',
+    notes: '',
+    status: 'ready' as ApplicationStatus,
+  })
+  const stats = summary ?? { total: applications.length, applied: 0, waiting: 0, interviewing: 0, offer: 0 }
+  const tree = peachTree ?? {
+    id: '',
+    stage: 'seed',
+    stage_label: '种子',
+    next_stage: 'sprout',
+    next_stage_label: '发芽',
+    growth_xp: 0,
+    peach_points: 0,
+    progress: 0,
+    streak_days: 0,
+  }
+
+  function submitDraft() {
+    if (!draft.company.trim() && !draft.role.trim()) return
+    onCreate(draft)
+    setDraft({ company: '', role: profile.target_role || '产品经理', jd_text: '', source_url: '', notes: '', status: 'ready' })
+  }
+
+  return (
+    <section className="applications-workspace">
+      <header className="applications-hero">
+        <div>
+          <p>投递</p>
+          <h1>把投递、面试和今天该做什么连起来</h1>
+          <span>目标：{profile.target_company ? `${profile.target_company} · ` : ''}{profile.target_role || '产品经理'}</span>
+        </div>
+        <div className="tree-card">
+          <span>桃子树 · {tree.stage_label}</span>
+          <strong>{tree.growth_xp} XP</strong>
+          <div className="tree-progress"><i style={{ width: `${Math.max(4, tree.progress)}%` }} /></div>
+          <small>{tree.peach_points} 桃子点 · 下一阶段 {tree.next_stage_label}</small>
+        </div>
+      </header>
+
+      <div className="applications-grid">
+        <section className="app-status-card weather-card">
+          <div className="profile-card-head">
+            <strong>今日求职天气</strong>
+            <span>{weather?.label || '晴'}</span>
+          </div>
+          <p>{weather?.summary || '暂无紧急节点，适合轻量补齐简历或做一次基础 Mock。'}</p>
+          <small>{weather?.reason || '基于投递、面试和成长记录生成。'}</small>
+        </section>
+
+        <section className="app-status-card daily-action-card">
+          <div className="profile-card-head">
+            <strong>今日只做一件事</strong>
+            <span>{dailyAction?.status === 'completed' ? '已完成' : dailyAction?.status === 'skipped' ? '已休息' : '待完成'}</span>
+          </div>
+          <h2>{dailyAction?.title || '补齐一处简历证据'}</h2>
+          <p>{dailyAction?.description || '选一段项目或实习经历，补上背景、动作、结果和可追问细节。'}</p>
+          <div className="daily-action-buttons">
+            <button type="button" disabled={busy || dailyAction?.status === 'completed'} onClick={() => onDailyAction('started')}>开始</button>
+            <button type="button" disabled={busy || dailyAction?.status === 'completed'} onClick={() => onDailyAction('completed')}>完成</button>
+            <button type="button" disabled={busy || dailyAction?.status === 'completed'} onClick={() => onDailyAction('skipped')}>今天先休息</button>
+            <button type="button" onClick={() => onStartTraining(dailyAction?.title || '项目深挖专项训练')}>拿它练一轮</button>
+          </div>
+        </section>
+
+        <section className="app-status-card application-summary-card">
+          <div className="profile-card-head">
+            <strong>投递漏斗</strong>
+            <span>{stats.total} 条记录</span>
+          </div>
+          <div className="application-stats">
+            <span><b>{stats.applied}</b> 已投递</span>
+            <span><b>{stats.waiting}</b> 等反馈</span>
+            <span><b>{stats.interviewing}</b> 面试中</span>
+            <span><b>{stats.offer}</b> Offer</span>
+          </div>
+        </section>
+      </div>
+
+      <section className="application-create-panel">
+        <div className="profile-card-head">
+          <strong>新增投递</strong>
+          <span>用户确认后记录状态</span>
+        </div>
+        <div className="application-form">
+          <input value={draft.company} onChange={(event) => setDraft({ ...draft, company: event.target.value })} placeholder="目标公司" />
+          <input value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="岗位" />
+          <select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as ApplicationStatus })}>
+            {applicationStatusOptions.map((status) => <option key={status.value} value={status.value}>{status.label}</option>)}
+          </select>
+          <input value={draft.source_url} onChange={(event) => setDraft({ ...draft, source_url: event.target.value })} placeholder="网申链接，可选" />
+          <textarea value={draft.jd_text} onChange={(event) => setDraft({ ...draft, jd_text: event.target.value })} placeholder="粘贴 JD，可选" />
+          <textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} placeholder="备注开放题、投递材料或下一节点，可选" />
+          <button type="button" disabled={busy} onClick={submitDraft}>{busy ? '保存中' : '保存投递'}</button>
+        </div>
+      </section>
+
+      <section className="application-list-panel">
+        <div className="profile-card-head">
+          <strong>投递记录</strong>
+          <span>待处理优先</span>
+        </div>
+        {applications.length ? applications.map((application) => (
+          <article className="application-row" key={application.id}>
+            <div>
+              <strong>{application.company || '目标公司'} · {application.role || profile.target_role}</strong>
+              <p>{application.next_step}</p>
+              {application.notes ? <small>{application.notes}</small> : null}
+            </div>
+            <div className="application-row-actions">
+              <select value={application.status} onChange={(event) => onStatus(application, event.target.value as ApplicationStatus)}>
+                {applicationStatusOptions.map((status) => <option key={status.value} value={status.value}>{status.label}</option>)}
+              </select>
+              <button type="button" onClick={() => onDelete(application)}>删除</button>
+            </div>
+          </article>
+        )) : (
+          <p className="empty-copy">还没有投递记录。先把一家公司和岗位记下来，桃子就能据此调整今日行动和面试准备。</p>
+        )}
+      </section>
+    </section>
+  )
+}
+
+const applicationStatusOptions: Array<{ value: ApplicationStatus; label: string }> = [
+  { value: 'draft', label: '草稿' },
+  { value: 'ready', label: '待投递' },
+  { value: 'applied', label: '已投递' },
+  { value: 'screening', label: '筛选中' },
+  { value: 'interview', label: '面试中' },
+  { value: 'final', label: '终面' },
+  { value: 'offer', label: 'Offer' },
+  { value: 'rejected', label: '已拒绝' },
+  { value: 'withdrawn', label: '已撤回' },
+]
 
 function GrowthWorkspace({
   profile,
@@ -4627,6 +5179,7 @@ function ChatComposer({
   const finalTextRef = useRef('')
   const baseValueRef = useRef('')
   const autoSubmitTimerRef = useRef<number | null>(null)
+  const startBrowserSpeechInputRef = useRef<(mode?: VoiceCaptureMode) => void>(() => undefined)
   const manualStopRef = useRef(false)
   const startingRef = useRef(false)
   const submittingRef = useRef(false)
@@ -4769,7 +5322,7 @@ function ChatComposer({
         && !disabledRef.current
         && !submittingRef.current
       ) {
-        window.setTimeout(() => startBrowserSpeechInput(mode), 260)
+        window.setTimeout(() => startBrowserSpeechInputRef.current(mode), 260)
       }
     }
     recognitionRef.current = recognition
@@ -4784,6 +5337,10 @@ function ChatComposer({
       setListening(false)
     }
   }, [clearAutoSubmitTimer, onChange, onVoiceSubmit, submitVoiceText])
+
+  useEffect(() => {
+    startBrowserSpeechInputRef.current = startBrowserSpeechInput
+  }, [startBrowserSpeechInput])
 
   const startFunAsrInput = useCallback(async (mode: VoiceCaptureMode = 'auto') => {
     if (!ASR_WS_URL || voiceModeRef.current !== 'stream') return false
@@ -5873,7 +6430,7 @@ async function fetchJsonWithRetry<T>(url: string, options: RequestInit, retries 
       return fetchJsonWithRetry<T>(url, options, retries - 1)
     }
     if (isNetworkFetchError(err)) {
-      throw new Error(`Failed to fetch ${url}`)
+      throw new Error(`Failed to fetch ${url}`, { cause: err })
     }
     throw err
   }
@@ -6100,12 +6657,14 @@ function personalGreeting(profile: Profile) {
 
 function moduleNotice(module: PrimaryModule) {
   if (module === 'peach') return '已进入桃子。'
+  if (module === 'applications') return '已进入投递。'
   if (module === 'profile') return '已进入个人档案。'
   if (module === 'growth') return '已进入成长中心。'
   return '已进入求职知识库。'
 }
 
 function workspaceKicker(module: PrimaryModule, panel: PeachPanel) {
+  if (module === 'applications') return '投递'
   if (module === 'profile') return '个人档案'
   if (module === 'knowledge') return '求职知识库'
   if (module === 'growth') return '成长中心'
@@ -6116,6 +6675,7 @@ function workspaceKicker(module: PrimaryModule, panel: PeachPanel) {
 }
 
 function workspaceTitle(module: PrimaryModule, panel: PeachPanel) {
+  if (module === 'applications') return '投递状态和下一步行动'
   if (module === 'profile') return '简历、经历和复盘都在这里'
   if (module === 'knowledge') return '管理你的求职资料和收藏'
   if (module === 'growth') return '你现在在哪里，下一步练什么'

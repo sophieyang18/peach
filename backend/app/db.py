@@ -62,6 +62,12 @@ def ensure_demo_columns(sync_conn) -> None:
         if "recommended_questions" not in columns:
             sync_conn.execute(text("ALTER TABLE knowledge_folders ADD COLUMN recommended_questions JSON"))
 
+    if "conversation_messages" in tables:
+        columns = {column["name"] for column in inspector.get_columns("conversation_messages")}
+        if "sort_order" not in columns:
+            sync_conn.execute(text("ALTER TABLE conversation_messages ADD COLUMN sort_order INTEGER"))
+            sync_conn.execute(text("UPDATE conversation_messages SET sort_order = 0 WHERE sort_order IS NULL"))
+
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:

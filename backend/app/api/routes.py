@@ -13,13 +13,24 @@ from backend.app.models import (
     ActionState,
     AgentMemory,
     AgentMemoryEvent,
+    ApplicationState,
+    CandidateProfile,
+    Conversation,
+    ConversationMessage,
+    DailyAction,
     GrowthInsight,
     GrowthIssue,
     HomeRecommendation,
+    InterviewExperience,
+    InterviewQuestion,
+    InterviewQuestionSet,
     InterviewSession,
     KnowledgeFolder,
     KnowledgeResource,
+    PeachTreeState,
     PracticeRecord,
+    ProductEvent,
+    RewardEvent,
     ResumeVersion,
     UserAbilityScore,
     UserProfile,
@@ -28,21 +39,42 @@ from backend.app.schemas import (
     AccountIn,
     AgentActionIn,
     AgentToolExecuteIn,
+    ApplicationIn,
+    ApplicationPatchIn,
+    CandidateProfilePatchIn,
     ChatIn,
+    ConversationSyncIn,
+    DailyActionPatchIn,
+    InterviewExperienceIn,
     InterviewAnswerIn,
     InterviewStartIn,
     KnowledgeFolderIn,
     KnowledgeIn,
     KnowledgeLinkIn,
     PracticeIn,
+    ProductEventIn,
     ProfileIn,
+    QuestionSetBuildIn,
     ReviewIn,
 )
+from backend.app.services.analytics import analytics_summary, record_product_event
 from backend.app.services.agent import PeachAgent
+from backend.app.services.applications import create_application, delete_application, list_applications, patch_application, serialize_application
+from backend.app.services.candidate_profile import ensure_candidate_profile, serialize_candidate_profile
+from backend.app.services.companion import build_job_weather, ensure_daily_action, serialize_daily_action, update_daily_action
+from backend.app.services.conversations import delete_conversation, list_conversations, sync_conversations
 from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
 from backend.app.services.growth import apply_interview_growth_update, build_growth_center, build_home_context
+from backend.app.services.interview_intelligence import (
+    build_question_set,
+    import_experience,
+    serialize_experience,
+    serialize_question,
+    serialize_question_set,
+)
 from backend.app.services.memory import PeachMemoryService, build_memory_context, remember_interaction, remember_interaction_isolated, retrieve_relevant_memories, upsert_memory
 from backend.app.services.recommendations import refresh_home_recommendations
+from backend.app.services.rewards import award_once, ensure_tree, refresh_tree_stage, serialize_tree
 
 router = APIRouter(prefix="/api")
 agent = PeachAgent()
@@ -188,6 +220,16 @@ async def reset_account(session: AsyncSession = Depends(get_session)) -> dict:
     await session.execute(delete(KnowledgeResource).where(KnowledgeResource.user_id == profile.id))
     await session.execute(delete(KnowledgeFolder).where(KnowledgeFolder.user_id == profile.id))
     await session.execute(delete(ResumeVersion).where(ResumeVersion.user_id == profile.id))
+    await session.execute(delete(CandidateProfile).where(CandidateProfile.user_id == profile.id))
+    await session.execute(delete(ConversationMessage).where(ConversationMessage.user_id == profile.id))
+    await session.execute(delete(Conversation).where(Conversation.user_id == profile.id))
+    await session.execute(delete(ProductEvent).where(ProductEvent.user_id == profile.id))
+    await session.execute(delete(ApplicationState).where(ApplicationState.user_id == profile.id))
+    await session.execute(delete(DailyAction).where(DailyAction.user_id == profile.id))
+    await session.execute(delete(PeachTreeState).where(PeachTreeState.user_id == profile.id))
+    await session.execute(delete(RewardEvent).where(RewardEvent.user_id == profile.id))
+    await session.execute(delete(InterviewExperience).where(InterviewExperience.user_id == profile.id))
+    await session.execute(delete(InterviewQuestionSet).where(InterviewQuestionSet.user_id == profile.id))
     await session.execute(delete(ActionState).where(ActionState.user_id == profile.id))
     await session.execute(delete(AbilityScoreHistory).where(AbilityScoreHistory.user_id == profile.id))
     await session.execute(delete(UserAbilityScore).where(UserAbilityScore.user_id == profile.id))
@@ -271,6 +313,8 @@ async def capabilities() -> dict:
             "个人档案、完整简历、实习/项目/教育/技能经历沉淀",
             "个人知识库文件上传、链接解析、资料编辑和基于知识库问答",
             "长期记忆按用户隔离检索，让 Agent 越用越了解用户",
+            "投递状态、每日行动和成长奖励闭环，辅助用户判断下一步",
+            "面经导入、问题抽取和个性化题集生成，支持更贴近真实面试的训练",
         ],
         "tools": [
             "start_interview",
@@ -281,6 +325,11 @@ async def capabilities() -> dict:
             "add_knowledge_item",
             "update_knowledge_item",
             "delete_knowledge_item",
+            "create_application",
+            "update_application_status",
+            "complete_daily_action",
+            "import_interview_experience",
+            "build_interview_question_set",
         ],
         "file_formats": sorted(SUPPORTED_EXTENSIONS),
         "safety": [
@@ -302,6 +351,213 @@ async def export_profile(format: str = "md", session: AsyncSession = Depends(get
     profile = await get_or_create_profile(session)
     content = profile_export_content(profile)
     return downloadable_text_response(content, f"peach-profile-{profile.username}", format)
+
+
+@router.get("/candidate-profile")
+async def read_candidate_profile(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    candidate = await ensure_candidate_profile(session, profile)
+    await session.commit()
+    await session.refresh(candidate)
+    return {"candidate_profile": serialize_candidate_profile(candidate)}
+
+
+@router.post("/candidate-profile/initialize")
+async def initialize_candidate_profile(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    candidate = await ensure_candidate_profile(session, profile, force=True, source="initialize")
+    await session.commit()
+    await session.refresh(candidate)
+    return {"candidate_profile": serialize_candidate_profile(candidate)}
+
+
+@router.patch("/candidate-profile")
+async def update_candidate_profile(payload: CandidateProfilePatchIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    candidate = await ensure_candidate_profile(session, profile)
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(candidate, key, value)
+    candidate.completeness = candidate_profile_completeness(candidate.field_statuses)
+    candidate.source = "user_confirmed"
+    await session.commit()
+    await session.refresh(candidate)
+    return {"candidate_profile": serialize_candidate_profile(candidate)}
+
+
+@router.get("/conversations")
+async def read_conversations(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return await list_conversations(session, profile)
+
+
+@router.post("/conversations/sync")
+async def sync_user_conversations(payload: ConversationSyncIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    result = await sync_conversations(session, profile, payload)
+    await session.commit()
+    return result
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_user_conversation(conversation_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    deleted = await delete_conversation(session, profile, conversation_id)
+    await session.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"deleted": True, "id": conversation_id}
+
+
+@router.post("/events")
+async def track_product_event(payload: ProductEventIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    event = await record_product_event(session, profile, payload)
+    await session.commit()
+    return {"ok": True, "event_id": event.id}
+
+
+@router.get("/analytics/summary")
+async def read_analytics_summary(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return await analytics_summary(session, profile.id)
+
+
+@router.get("/applications")
+async def read_applications(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return await list_applications(session, profile)
+
+
+@router.post("/applications")
+async def create_application_state(payload: ApplicationIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    item = await create_application(session, profile, payload)
+    daily = await ensure_daily_action(session, profile, force_new=True)
+    tree = await refresh_tree_stage(session, profile)
+    await session.commit()
+    await session.refresh(item)
+    return {
+        "application": serialize_application(item),
+        "daily_action": serialize_daily_action(daily),
+        "job_weather": await build_job_weather(session, profile),
+        "peach_tree": serialize_tree(tree),
+    }
+
+
+@router.patch("/applications/{application_id}")
+async def update_application_state(application_id: str, payload: ApplicationPatchIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    item = await patch_application(session, profile, application_id, payload)
+    daily = await ensure_daily_action(session, profile, force_new=True)
+    tree = await refresh_tree_stage(session, profile)
+    await session.commit()
+    await session.refresh(item)
+    return {
+        "application": serialize_application(item),
+        "daily_action": serialize_daily_action(daily),
+        "job_weather": await build_job_weather(session, profile),
+        "peach_tree": serialize_tree(tree),
+    }
+
+
+@router.delete("/applications/{application_id}")
+async def delete_application_state(application_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    await delete_application(session, profile, application_id)
+    tree = await refresh_tree_stage(session, profile)
+    await session.commit()
+    return {"deleted": True, "id": application_id, "peach_tree": serialize_tree(tree)}
+
+
+@router.get("/job-weather")
+async def read_job_weather(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return {"job_weather": await build_job_weather(session, profile)}
+
+
+@router.get("/daily-action")
+async def read_daily_action(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    action = await ensure_daily_action(session, profile)
+    await session.commit()
+    await session.refresh(action)
+    return {"daily_action": serialize_daily_action(action)}
+
+
+@router.patch("/daily-action/{action_id}")
+async def patch_daily_action(action_id: str, payload: DailyActionPatchIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    action = await update_daily_action(session, profile, action_id, payload.status)
+    tree = await refresh_tree_stage(session, profile)
+    await session.commit()
+    await session.refresh(action)
+    return {"daily_action": serialize_daily_action(action), "peach_tree": serialize_tree(tree)}
+
+
+@router.get("/peach-tree")
+async def read_peach_tree(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    tree = await refresh_tree_stage(session, profile)
+    await session.commit()
+    await session.refresh(tree)
+    return {"peach_tree": serialize_tree(tree)}
+
+
+@router.post("/interview-experiences/import")
+async def import_interview_experience(payload: InterviewExperienceIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    experience, questions = await import_experience(session, profile, payload)
+    await session.commit()
+    await session.refresh(experience)
+    return {
+        "experience": serialize_experience(experience),
+        "questions": [serialize_question(item) for item in questions],
+    }
+
+
+@router.get("/interview-experiences")
+async def read_interview_experiences(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    items = (
+        await session.execute(
+            select(InterviewExperience)
+            .where(InterviewExperience.user_id == profile.id)
+            .order_by(desc(InterviewExperience.imported_at))
+            .limit(80)
+        )
+    ).scalars().all()
+    return {"items": [serialize_experience(item) for item in items]}
+
+
+@router.get("/interview-questions")
+async def read_interview_questions(company: str = "", role: str = "", stage: str = "", session: AsyncSession = Depends(get_session)) -> dict:
+    query = select(InterviewQuestion)
+    if company:
+        query = query.where(InterviewQuestion.company == company)
+    if role:
+        query = query.where(InterviewQuestion.role == role)
+    if stage:
+        query = query.where(InterviewQuestion.interview_stage == stage)
+    items = (await session.execute(query.order_by(desc(InterviewQuestion.source_count)).limit(80))).scalars().all()
+    return {"items": [serialize_question(item) for item in items]}
+
+
+@router.post("/interview-question-set/build")
+async def create_interview_question_set(payload: QuestionSetBuildIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    question_set = await build_question_set(session, profile, payload)
+    await session.commit()
+    await session.refresh(question_set)
+    return {"question_set": serialize_question_set(question_set)}
+
+
+@router.get("/interview-question-set/{question_set_id}")
+async def read_interview_question_set(question_set_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    question_set = await session.get(InterviewQuestionSet, question_set_id)
+    if not question_set or question_set.user_id != profile.id:
+        raise HTTPException(status_code=404, detail="question set not found")
+    return {"question_set": serialize_question_set(question_set)}
 
 
 @router.get("/profile/resumes")
@@ -326,6 +582,10 @@ async def upload_resume_version(file: UploadFile = File(...), session: AsyncSess
     )
     if was_resume_empty:
         profile.resume_text = parsed["content"]
+    candidate = await ensure_candidate_profile(session, profile, force=True, source="resume_upload")
+    await award_once(session, profile, "first_resume_uploaded", version.id if version else profile.id, {"filename": parsed["filename"]})
+    if (candidate.completeness or 0) >= 55:
+        await award_once(session, profile, "profile_completed", candidate.id, {"completeness": candidate.completeness})
     await refresh_recommendations_safely(
         session,
         profile,
@@ -396,6 +656,9 @@ async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get
             source="profile_save",
             optimized=1 if "优化" in profile.resume_text else 0,
         )
+        candidate = await ensure_candidate_profile(session, profile, force=True, source="profile_save")
+        if (candidate.completeness or 0) >= 55:
+            await award_once(session, profile, "profile_completed", candidate.id, {"completeness": candidate.completeness})
     await session.commit()
     await session.refresh(profile)
     return {
@@ -428,9 +691,23 @@ async def dashboard(session: AsyncSession = Depends(get_session)) -> dict:
     checkin = build_local_checkin(profile, list(records))
     home_context = await build_home_context(session, profile)
     growth_center = await build_growth_center(session, profile)
+    candidate = await ensure_candidate_profile(session, profile)
+    applications = await list_applications(session, profile)
+    daily = await ensure_daily_action(session, profile)
+    tree = await refresh_tree_stage(session, profile)
+    await session.commit()
+    await session.refresh(candidate)
+    await session.refresh(daily)
+    await session.refresh(tree)
 
     return {
         "profile": serialize_profile(profile),
+        "candidate_profile": serialize_candidate_profile(candidate),
+        "applications": applications["items"],
+        "application_summary": applications["summary"],
+        "job_weather": await build_job_weather(session, profile),
+        "daily_action": serialize_daily_action(daily),
+        "peach_tree": serialize_tree(tree),
         "resume_versions": await serialized_resume_versions(session, profile.id),
         "checkin": checkin,
         "recent_practices": [serialize_practice(item) for item in records],
@@ -506,10 +783,19 @@ async def submit_practice(payload: PracticeIn, session: AsyncSession = Depends(g
 @router.post("/interviews")
 async def start_interview(payload: InterviewStartIn, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
+    question_set_context = ""
+    if payload.question_set_id:
+        question_set = await session.get(InterviewQuestionSet, payload.question_set_id)
+        if not question_set or question_set.user_id != profile.id:
+            raise HTTPException(status_code=404, detail="question set not found")
+        question_set_context = "\n".join(
+            f"{index + 1}. {item.get('question', '')}（来源：{item.get('source_type', 'unknown')}，考察点：{item.get('assessment_point', '')}）"
+            for index, item in enumerate((question_set.questions or [])[:10])
+        )
     memory_context = await relevant_memory_context(
         session,
         profile,
-        "\n".join([payload.company, payload.role, payload.jd, payload.question_bank]),
+        "\n".join([payload.company, payload.role, payload.jd, payload.question_bank, question_set_context]),
         task_type="mock_interview",
     )
     interview = InterviewSession(
@@ -522,7 +808,12 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
     opening = await agent.start_interview(
         profile,
         interview,
-        {"jd": payload.jd, "question_bank": payload.question_bank, "memory_context": memory_context},
+        {
+            "jd": payload.jd,
+            "question_bank": "\n\n".join([payload.question_bank, question_set_context]).strip(),
+            "question_set_id": payload.question_set_id,
+            "memory_context": memory_context,
+        },
     )
     interview.transcript = [
         *(
@@ -533,6 +824,11 @@ async def start_interview(payload: InterviewStartIn, session: AsyncSession = Dep
         *(
             [{"role": "system", "content": f"题库材料：{payload.question_bank[:3000]}"}]
             if payload.question_bank.strip()
+            else []
+        ),
+        *(
+            [{"role": "system", "content": f"个性化题集：{question_set_context[:3000]}"}]
+            if question_set_context
             else []
         ),
         {"role": "interviewer", "content": opening["opening"]},
@@ -566,9 +862,7 @@ async def answer_interview(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     profile = await get_or_create_profile(session)
-    interview = await session.get(InterviewSession, interview_id)
-    if not interview:
-        raise HTTPException(status_code=404, detail="interview not found")
+    interview = await owned_interview(session, profile.id, interview_id)
 
     memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{payload.answer}", task_type="mock_interview")
     transcript = [*interview.transcript, {"role": "candidate", "content": payload.answer}]
@@ -591,6 +885,7 @@ async def answer_interview(
         interview.status = "completed"
         interview.report = await agent.interview_report(profile, interview, memory_context)
         growth_update = await apply_interview_growth_update(session, profile, interview)
+        await award_once(session, profile, "mock_completed", interview.id, {"company": interview.company, "role": interview.role})
         await refresh_recommendations_safely(
             session,
             profile,
@@ -632,14 +927,13 @@ async def answer_interview(
 @router.post("/interviews/{interview_id}/finish")
 async def finish_interview(interview_id: str, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    interview = await session.get(InterviewSession, interview_id)
-    if not interview:
-        raise HTTPException(status_code=404, detail="interview not found")
+    interview = await owned_interview(session, profile.id, interview_id)
 
     memory_context = await relevant_memory_context(session, profile, f"{interview.company} {interview.role}\n{interview.transcript[-8:]}", task_type="growth_analysis")
     interview.status = "completed"
     interview.report = await agent.interview_report(profile, interview, memory_context)
     growth_update = await apply_interview_growth_update(session, profile, interview)
+    await award_once(session, profile, "mock_completed", interview.id, {"company": interview.company, "role": interview.role})
     await refresh_recommendations_safely(
         session,
         profile,
@@ -805,7 +1099,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
 
     if payload.tool == "finish_latest_interview":
         interview_id = str(data.get("interview_id") or "").strip()
-        interview = await session.get(InterviewSession, interview_id) if interview_id else None
+        interview = await owned_interview(session, profile.id, interview_id) if interview_id else None
         if not interview:
             interview = await latest_interview(session, profile.id, active_only=True)
         if not interview:
@@ -852,6 +1146,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             source="agent_update",
             optimized=1,
         )
+        await ensure_candidate_profile(session, profile, force=True, source="agent_update")
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, "简历已更新。")
@@ -887,6 +1182,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
                 source="profile_note",
                 optimized=0,
             )
+            await ensure_candidate_profile(session, profile, force=True, source="profile_note")
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, f"已补充到{title}。")
@@ -1816,6 +2112,21 @@ async def owned_knowledge(session: AsyncSession, user_id: str, item_id: str) -> 
     if not resource or resource.user_id != user_id:
         raise HTTPException(status_code=404, detail="knowledge item not found")
     return resource
+
+
+async def owned_interview(session: AsyncSession, user_id: str, interview_id: str) -> InterviewSession:
+    interview = await session.get(InterviewSession, interview_id)
+    if not interview or interview.user_id != user_id:
+        raise HTTPException(status_code=404, detail="interview not found")
+    return interview
+
+
+def candidate_profile_completeness(field_statuses: dict) -> int:
+    values = field_statuses.values() if isinstance(field_statuses, dict) else []
+    scores = [1 if value == "confirmed" else 0.45 if value == "uncertain" else 0 for value in values]
+    if not scores:
+        return 0
+    return round(sum(scores) / len(scores) * 100)
 
 
 def normalize_recommended_questions(values: list[str] | None) -> list[str]:
