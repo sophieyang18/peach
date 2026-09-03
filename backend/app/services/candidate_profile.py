@@ -18,6 +18,7 @@ PROFILE_FIELDS = [
     "projects",
     "skills",
 ]
+COPILOT_PROFILE_SOURCE = "copilot_parser_v2"
 
 
 async def ensure_candidate_profile(
@@ -50,6 +51,15 @@ async def ensure_candidate_profile(
     existing.source = source[:60]
     await session.flush()
     return existing
+
+
+async def ensure_copilot_candidate_profile(session: AsyncSession, profile: UserProfile) -> CandidateProfile:
+    existing = (
+        await session.execute(select(CandidateProfile).where(CandidateProfile.user_id == profile.id).limit(1))
+    ).scalar_one_or_none()
+    if existing and existing.source in {"user_confirmed", COPILOT_PROFILE_SOURCE}:
+        return existing
+    return await ensure_candidate_profile(session, profile, force=True, source=COPILOT_PROFILE_SOURCE)
 
 
 def build_candidate_profile_payload(profile: UserProfile, resume_text: str) -> dict[str, Any]:
@@ -121,7 +131,7 @@ def section_items(text: str, markers: list[str], item_type: str) -> list[dict[st
     excerpt = section_excerpt(text, markers)
     if not excerpt:
         return []
-    chunks = [chunk.strip(" \n-•") for chunk in re.split(r"\n\s*\n|(?=\n[•\-])", excerpt) if chunk.strip()]
+    chunks = split_section_chunks(excerpt, item_type)
     if not chunks:
         chunks = [excerpt]
     return [
@@ -134,7 +144,7 @@ def section_items(text: str, markers: list[str], item_type: str) -> list[dict[st
     ]
 
 
-def section_excerpt(text: str, markers: list[str], limit: int = 1200) -> str:
+def section_excerpt(text: str, markers: list[str], limit: int = 3200) -> str:
     if not text:
         return ""
     for marker in markers:
@@ -144,6 +154,47 @@ def section_excerpt(text: str, markers: list[str], limit: int = 1200) -> str:
             next_section = re.search(r"\n\s*(教育|实习|工作|项目|技能|竞赛|校园|获奖|自我评价)[^\n]{0,12}[:：]?", excerpt)
             return excerpt[: next_section.start()].strip() if next_section and next_section.start() > 20 else excerpt
     return ""
+
+
+def split_section_chunks(excerpt: str, item_type: str) -> list[str]:
+    lines = [line.strip(" \t") for line in (excerpt or "").splitlines()]
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if starts_new_item_line(line, item_type):
+            if current:
+                chunks.append(current)
+            current = [line]
+            continue
+        if current:
+            current.append(line)
+        else:
+            current = [line]
+    if current:
+        chunks.append(current)
+    if len(chunks) <= 1 and "\n" not in excerpt:
+        return [chunk.strip(" \n-•") for chunk in re.split(r"\n\s*\n", excerpt) if chunk.strip()]
+    return ["\n".join(chunk).strip(" \n-•") for chunk in chunks if "\n".join(chunk).strip(" \n-•")]
+
+
+def starts_new_item_line(line: str, item_type: str) -> bool:
+    clean = line.strip()
+    if not clean or clean.startswith(("•", "-", "·")):
+        return False
+    if re.match(r"^(工作概述|职责|工作内容|项目内容|项目职责|项目成果|成果|亮点|描述|背景|目标|行动|结果|收获)[:：]", clean):
+        return False
+    if item_type == "experience":
+        has_date = bool(re.search(r"20\d{2}(?:[./-]\d{1,2})?", clean))
+        has_role = bool(re.search(r"(产品经理|产品实习生|运营|用户研究|数据分析|策略产品|项目助理)", clean, re.I))
+        has_separator = bool(re.search(r"\s[-|｜丨—]\s|[-|｜丨—]", clean))
+        return len(clean) <= 120 and (has_date or has_separator) and has_role
+    if item_type == "project":
+        return len(clean) <= 120 and bool(re.search(r"(项目|Agent|系统|平台|工具|增长|商业化|探索|产品)", clean, re.I))
+    if item_type == "education":
+        return len(clean) <= 140 and bool(re.search(r"(大学|学院|学校|硕士|本科|博士|GPA|专业)", clean))
+    return False
 
 
 def title_from_chunk(chunk: str, fallback: str) -> str:

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "桃子 Application Copilot",
+  "version": "0.1.0",
+  "description": "扫描网申表单，基于 Peach 候选人档案预览并辅助填写，不自动提交。",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["http://127.0.0.1:8000/*", "https://*.tcloudbase.com/*"],
+  "action": {
+    "default_title": "桃子 Copilot",
+    "default_popup": "src/popup/popup.html"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/scanner/dom-scanner.js", "src/autofill/autofill.js", "src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

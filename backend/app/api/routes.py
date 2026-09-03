@@ -44,6 +44,9 @@ from backend.app.schemas import (
     CandidateProfilePatchIn,
     ChatIn,
     ConversationSyncIn,
+    CopilotConfirmApplicationIn,
+    CopilotMapIn,
+    CopilotOpenAnswerIn,
     DailyActionPatchIn,
     InterviewExperienceIn,
     InterviewAnswerIn,
@@ -60,9 +63,10 @@ from backend.app.schemas import (
 from backend.app.services.analytics import analytics_summary, record_product_event
 from backend.app.services.agent import PeachAgent
 from backend.app.services.applications import create_application, delete_application, list_applications, patch_application, serialize_application
-from backend.app.services.candidate_profile import ensure_candidate_profile, serialize_candidate_profile
+from backend.app.services.candidate_profile import ensure_candidate_profile, ensure_copilot_candidate_profile, serialize_candidate_profile
 from backend.app.services.companion import build_job_weather, ensure_daily_action, serialize_daily_action, update_daily_action
 from backend.app.services.conversations import delete_conversation, list_conversations, sync_conversations
+from backend.app.services.copilot import build_candidate_snapshot, build_open_answer_prompt, generate_open_answer, map_form_fields, refine_mappings_with_agent, refresh_repeat_actions
 from backend.app.services.file_parser import SUPPORTED_EXTENSIONS, parse_link, parse_upload
 from backend.app.services.growth import apply_interview_growth_update, build_growth_center, build_home_context
 from backend.app.services.interview_intelligence import (
@@ -72,6 +76,7 @@ from backend.app.services.interview_intelligence import (
     serialize_question,
     serialize_question_set,
 )
+from backend.app.services.job_market import recommend_jobs_for_profile, search_job_library
 from backend.app.services.memory import PeachMemoryService, build_memory_context, remember_interaction, remember_interaction_isolated, retrieve_relevant_memories, upsert_memory
 from backend.app.services.recommendations import refresh_home_recommendations
 from backend.app.services.rewards import award_once, ensure_tree, refresh_tree_stage, serialize_tree
@@ -315,6 +320,7 @@ async def capabilities() -> dict:
             "长期记忆按用户隔离检索，让 Agent 越用越了解用户",
             "投递状态、每日行动和成长奖励闭环，辅助用户判断下一步",
             "面经导入、问题抽取和个性化题集生成，支持更贴近真实面试的训练",
+            "Chrome Extension Application Copilot 扫描网申字段、预览映射、用户确认后辅助填写",
         ],
         "tools": [
             "start_interview",
@@ -330,12 +336,16 @@ async def capabilities() -> dict:
             "complete_daily_action",
             "import_interview_experience",
             "build_interview_question_set",
+            "copilot_scan_and_map",
+            "copilot_generate_open_answer",
+            "copilot_confirm_application",
         ],
         "file_formats": sorted(SUPPORTED_EXTENSIONS),
         "safety": [
             "工具动作默认需要用户确认",
             "进行中的面试会锁定导航，防止误切功能丢失上下文",
             "账号 demo 使用用户名隔离数据和记忆",
+            "Copilot 跳过密码、隐藏、验证码字段，不自动提交网申",
         ],
     }
 
@@ -422,6 +432,126 @@ async def read_analytics_summary(session: AsyncSession = Depends(get_session)) -
     return await analytics_summary(session, profile.id)
 
 
+@router.get("/copilot/profile")
+async def read_copilot_profile(session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    candidate = await ensure_copilot_candidate_profile(session, profile)
+    await session.commit()
+    await session.refresh(candidate)
+    snapshot = build_candidate_snapshot(profile, candidate)
+    return {
+        "profile": serialize_profile(profile),
+        "candidate_profile": serialize_candidate_profile(candidate),
+        "fill_values": snapshot.values,
+        "completeness": snapshot.completeness,
+    }
+
+
+@router.post("/copilot/map")
+async def map_copilot_fields(payload: CopilotMapIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    candidate = await ensure_copilot_candidate_profile(session, profile)
+    snapshot = build_candidate_snapshot(profile, candidate)
+    repeaters = [item.model_dump() for item in payload.repeaters]
+    preview = map_form_fields(
+        [item.model_dump() for item in payload.fields],
+        snapshot,
+        url=payload.url,
+    )
+    if payload.use_agent:
+        preview = await refine_mappings_with_agent(preview, snapshot, agent, domain=payload.domain)
+    preview = refresh_repeat_actions(preview, snapshot, repeaters)
+    await record_product_event(
+        session,
+        profile,
+        ProductEventIn(
+            event_name="copilot_mapping_complete",
+            page="extension",
+            module="copilot",
+            source="extension",
+            properties={
+                "domain": payload.domain,
+                "field_count": preview["field_count"],
+                "direct_fill": preview["summary"]["direct_fill"],
+                "ai_assisted": preview["summary"]["ai_assisted"],
+                "needs_confirmation": preview["summary"]["needs_confirmation"],
+                "skipped_count": preview["skipped_count"],
+            },
+        ),
+    )
+    await session.commit()
+    return preview
+
+
+@router.post("/copilot/open-answer")
+async def create_copilot_open_answer(payload: CopilotOpenAnswerIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    candidate = await ensure_copilot_candidate_profile(session, profile)
+    snapshot = build_candidate_snapshot(profile, candidate)
+    fallback = generate_open_answer(payload.question, payload.jd, snapshot, candidate_path=payload.candidate_path)
+    prompt = build_open_answer_prompt(
+        payload.question,
+        payload.jd,
+        snapshot,
+        company=payload.company,
+        role=payload.role,
+        candidate_path=payload.candidate_path,
+    )
+    answer_text = await agent.complete([{"role": "user", "content": prompt}], fallback["answer"], allow_fallback=True)
+    answer = {
+        **fallback,
+        "answer": answer_text[:800],
+        "source": "peach_agent_candidate_profile_resume_jd",
+    }
+    await record_product_event(
+        session,
+        profile,
+        ProductEventIn(
+            event_name="copilot_ai_answer_generate",
+            page="extension",
+            module="copilot",
+            source="extension",
+            properties={"question_length": len(payload.question), "company": payload.company, "role": payload.role},
+        ),
+    )
+    await session.commit()
+    return answer
+
+
+@router.post("/copilot/applications/confirm")
+async def confirm_copilot_application(payload: CopilotConfirmApplicationIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    item = await create_application(
+        session,
+        profile,
+        ApplicationIn(
+            company=payload.company or profile.target_company,
+            role=payload.role or profile.target_role,
+            jd_text=payload.jd_text,
+            source_url=payload.source_url,
+            resume_version_id=payload.resume_version_id,
+            status="applied",
+            source="copilot",
+            notes=payload.notes,
+        ),
+    )
+    tree = await refresh_tree_stage(session, profile)
+    await record_product_event(
+        session,
+        profile,
+        ProductEventIn(
+            event_name="copilot_application_confirm",
+            page="extension",
+            module="copilot",
+            source="extension",
+            properties={"company": item.company, "role": item.role, "status": item.status},
+        ),
+    )
+    await session.commit()
+    await session.refresh(item)
+    return {"application": serialize_application(item), "peach_tree": serialize_tree(tree)}
+
+
 @router.get("/applications")
 async def read_applications(session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
@@ -467,6 +597,24 @@ async def delete_application_state(application_id: str, session: AsyncSession = 
     tree = await refresh_tree_stage(session, profile)
     await session.commit()
     return {"deleted": True, "id": application_id, "peach_tree": serialize_tree(tree)}
+
+
+@router.get("/jobs/library")
+async def read_job_library(
+    q: str = "",
+    industry: str = "",
+    batch: str = "",
+    city: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    return search_job_library(query=q, industry=industry, batch=batch, city=city, limit=limit, offset=offset)
+
+
+@router.get("/jobs/recommendations")
+async def read_job_recommendations(q: str = "", limit: int = 6, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    return recommend_jobs_for_profile(profile, limit=limit, query=q)
 
 
 @router.get("/job-weather")
@@ -705,6 +853,7 @@ async def dashboard(session: AsyncSession = Depends(get_session)) -> dict:
         "candidate_profile": serialize_candidate_profile(candidate),
         "applications": applications["items"],
         "application_summary": applications["summary"],
+        "job_recommendations": recommend_jobs_for_profile(profile, limit=3)["items"],
         "job_weather": await build_job_weather(session, profile),
         "daily_action": serialize_daily_action(daily),
         "peach_tree": serialize_tree(tree),
@@ -1108,6 +1257,10 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             raise HTTPException(status_code=404, detail="没有可结束的面试")
         result = await finish_interview(interview.id, session)
         return {"message": "面试已结束，报告已生成。", **result}
+
+    if payload.tool == "recommend_jobs":
+        result = recommend_jobs_for_profile(profile, limit=int(data.get("limit") or 5), query=str(data.get("query") or ""))
+        return {"message": "已根据当前档案生成岗位推荐。", "job_recommendations": result["items"], "job_source": result["source"]}
 
     if payload.tool == "update_profile_fields":
         fields = data.get("fields", data)
@@ -1933,6 +2086,7 @@ def normalize_tool_action(action: dict, index: int) -> dict:
     allowed_tools = {
         "start_interview",
         "finish_latest_interview",
+        "recommend_jobs",
         "update_profile_fields",
         "update_resume",
         "append_profile_note",
@@ -1978,6 +2132,15 @@ def normalize_tool_actions_safely(actions: object) -> list[dict]:
 
 def normalize_action_payload(tool: str, payload: dict) -> dict:
     normalized = dict(payload)
+    if tool == "recommend_jobs":
+        normalized["query"] = str(normalized.get("query") or "")[:120]
+        try:
+            limit = int(normalized.get("limit") or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        normalized["limit"] = max(1, min(limit, 8))
+        return normalized
+
     if tool not in {
         "update_profile_fields",
         "update_resume",

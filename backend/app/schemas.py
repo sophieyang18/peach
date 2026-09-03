@@ -68,6 +68,57 @@ class ProductEventIn(BaseModel):
     referrer: str = ""
 
 
+class CopilotFormFieldIn(BaseModel):
+    id: str = ""
+    tagName: str = ""
+    inputType: str = ""
+    label: str = ""
+    placeholder: str = ""
+    name: str = ""
+    ariaLabel: str = ""
+    nearbyText: str = ""
+    required: bool = False
+    selector: str = ""
+    options: list[str] = Field(default_factory=list)
+    currentValue: str = ""
+
+
+class CopilotRepeaterIn(BaseModel):
+    id: str = ""
+    label: str = ""
+    selector: str = ""
+    section: str = ""
+    nearbyText: str = ""
+
+
+class CopilotMapIn(BaseModel):
+    url: str = ""
+    domain: str = ""
+    fields: list[CopilotFormFieldIn] = Field(default_factory=list)
+    repeaters: list[CopilotRepeaterIn] = Field(default_factory=list)
+    use_agent: bool = True
+
+
+class CopilotOpenAnswerIn(BaseModel):
+    question: str
+    jd: str = ""
+    company: str = ""
+    role: str = ""
+    candidate_path: str = ""
+    repeat_section: str = ""
+    repeat_index: int | None = None
+    field_key: str = ""
+
+
+class CopilotConfirmApplicationIn(BaseModel):
+    company: str = ""
+    role: str = ""
+    jd_text: str = ""
+    source_url: str = ""
+    notes: str = ""
+    resume_version_id: str = ""
+
+
 class ApplicationIn(BaseModel):
     company: str = ""
     role: str = ""

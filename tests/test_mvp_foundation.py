@@ -41,6 +41,38 @@ async def test_candidate_profile_builds_structured_snapshot_from_resume(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_candidate_profile_keeps_bullets_inside_each_experience(db_session) -> None:
+    profile = UserProfile(
+        id="u-candidate-experience-chunks",
+        username="candidate-experience-chunks",
+        name="杨诗卉",
+        resume_text=(
+            "实习经历\n"
+            "字节跳动 - AI产品经理 2026.3-至今 北京\n"
+            "• 工作概述：聚焦AIGC广告素材二创链路迭代，通过平台合作实现链路收益。\n"
+            "• 链路改造：主导将后验数据注入多模态分析节点。\n"
+            "快手 - AI产品经理 2025.10-2026.3 北京\n"
+            "• 工作概述：主导3款AI创作工具从0到1落地与迭代。\n"
+            "百度 - AIGC策略产品经理 2025.6-2025.9 北京\n"
+            "• 工作概述：主导AIGC原生视频自动化链路建设与优化。\n"
+            "项目经历\n"
+            "减肥搭子Agent项目丨独立产品和研发丨2025.7\n"
+        ),
+    )
+    db_session.add(profile)
+
+    candidate = await ensure_candidate_profile(db_session, profile, force=True, source="test")
+    await db_session.commit()
+
+    assert [item["title"] for item in candidate.experiences] == [
+        "字节跳动 - AI产品经理 2026.3-至今 北京",
+        "快手 - AI产品经理 2025.10-2026.3 北京",
+        "百度 - AIGC策略产品经理 2025.6-2025.9 北京",
+    ]
+    assert "通过平台合作" in candidate.experiences[0]["summary"]
+
+
+@pytest.mark.asyncio
 async def test_candidate_profile_is_user_scoped(db_session) -> None:
     first = UserProfile(id="u-profile-a", username="profile-a", name="A", resume_text="项目经历 负责 AI 产品。")
     second = UserProfile(id="u-profile-b", username="profile-b", name="B", resume_text="项目经历 负责增长产品。")

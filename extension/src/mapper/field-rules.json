@@ -1,0 +1,27 @@
+{
+  "note": "实际规则由 backend/app/services/copilot.py 统一维护，插件只负责扫描和执行填充，避免前端 hardcode 用户字段。",
+  "supported_fields": [
+    "姓名",
+    "手机",
+    "邮箱",
+    "学校",
+    "学历",
+    "专业",
+    "入学时间",
+    "毕业时间",
+    "目标公司",
+    "目标岗位",
+    "实习描述",
+    "项目名称",
+    "项目描述",
+    "奖项",
+    "技能",
+    "开放题"
+  ],
+  "security": [
+    "skip password",
+    "skip hidden",
+    "skip captcha",
+    "never auto submit"
+  ]
+}

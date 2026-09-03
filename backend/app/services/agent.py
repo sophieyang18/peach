@@ -68,6 +68,11 @@ AGENT_TOOLS = [
         "description": "删除个人知识库里已有的一条资料。需要用户审批。",
         "payload": {"id": ""},
     },
+    {
+        "tool": "recommend_jobs",
+        "description": "基于用户档案和桃子内置秋招岗位池推荐适合投递的岗位。适合用户说推荐岗位、我能投什么、找秋招机会、网申链接。需要用户审批。",
+        "payload": {"query": "", "limit": 5},
+    },
 ]
 
 
@@ -371,6 +376,8 @@ JSON 字段：comfort(str), what_went_well(list[str]), to_improve(list[str]), ar
 
     async def plan_actions(self, profile: UserProfile, message: str, context: dict[str, Any], memory_context: str = "") -> dict[str, Any]:
         fallback = local_action_plan(profile, message, context)
+        if is_application_copilot_request(message):
+            return {"reply": application_copilot_guide(), "actions": []}
         uploaded_file = context.get("uploaded_file") if isinstance(context, dict) else None
         prompt = f"""
 你正在和用户聊天。你可以正常回复，也可以在确实有帮助时提出待用户审批的工具动作。
@@ -502,8 +509,21 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
     material = file_content or text
     lower = text.lower()
     interview_active = bool(context.get("interview_active")) or context.get("current_panel") == "live-interview"
+    reply = ""
 
-    if any(word in text for word in ["结束面试", "生成报告", "面试报告"]):
+    if is_application_copilot_request(text):
+        reply = application_copilot_guide()
+    elif any(word in text for word in ["推荐岗位", "岗位推荐", "我能投", "投哪些", "适合投", "秋招岗位", "网申链接", "找岗位"]):
+        actions.append(
+            {
+                "tool": "recommend_jobs",
+                "title": "推荐可投岗位",
+                "summary": f"基于你的档案和目标方向，从桃子的秋招资料库里筛选适合{profile.target_role or '产品'}方向的机会。",
+                "payload": {"query": text[:80], "limit": 5},
+                "approval_required": True,
+            }
+        )
+    elif any(word in text for word in ["结束面试", "生成报告", "面试报告"]):
         actions.append(
             {
                 "tool": "finish_latest_interview",
@@ -606,16 +626,29 @@ def local_action_plan(profile: UserProfile, message: str, context: dict[str, Any
             }
         )
 
-    reply = ""
-    if interview_active and not actions:
+    if interview_active and not actions and not reply:
         reply = "这句话会作为当前面试回答处理，不会重新开一场。"
-    elif actions:
+    elif actions and not reply:
         reply = "我读完了，先给你整理成可确认的动作。你点确认后我再真正修改档案、简历或知识库。"
 
     return {
         "reply": reply,
         "actions": actions,
     }
+
+
+def is_application_copilot_request(text: str) -> bool:
+    return any(word in text for word in ["投递网申", "自动网申", "自动投递", "帮我投递岗位并自动网申", "chrome插件", "Chrome插件"])
+
+
+def application_copilot_guide() -> str:
+    return (
+        "没问题，桃子教你怎么用桃子 Chrome 插件来自动网申。\n\n"
+        "现在自动网申不是在桃子网页里直接操作招聘网站，而是通过 Chrome 插件完成。原因很简单：招聘网站的表单、下拉框、上传控件都在原网页里，插件可以在当前页面读取字段并填写；普通网页应用不能直接控制另一个网站。\n\n"
+        "你可以这样用：先打开 Chrome 的扩展程序页面 chrome://extensions，打开开发者模式，选择“加载已解压的扩展程序”，加载项目里的 extension 文件夹。加载后，先在桃子网页里把个人档案和完整简历补好，再打开目标招聘网站并登录到网申表单页。\n\n"
+        "到了网申页面，点浏览器右上角的小拼图，打开“桃子”插件，确认后端地址是 http://127.0.0.1:8000，本地测试时要先启动桃子后端。然后点击扫描，桃子会读取页面字段，并结合你的个人档案、简历、项目经历和目标岗位生成填写建议。\n\n"
+        "最后点击开始填写。桃子只会辅助填写普通字段、开放题和经历内容，不会填写密码、验证码、隐藏字段，也不会自动提交。你需要自己检查一遍，再手动预览和提交。"
+    )
 
 
 def infer_interviewer_style(text: str) -> str:

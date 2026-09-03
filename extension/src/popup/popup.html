@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>桃子 Copilot</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header>
+        <strong>桃子 Copilot</strong>
+        <span id="statusText">先连接你的 Peach 账号</span>
+      </header>
+
+      <section class="config-card">
+        <label>
+          <span>用户名</span>
+          <input id="usernameInput" placeholder="与你 Peach 登录用户名一致" />
+        </label>
+        <label>
+          <span>后端地址</span>
+          <input id="apiInput" placeholder="http://127.0.0.1:8000" />
+        </label>
+        <button id="saveConfigBtn" type="button">保存连接</button>
+      </section>
+
+      <section class="preview-card">
+        <div class="preview-head">
+          <strong>网申页扫描</strong>
+          <div class="preview-actions">
+            <button id="resetBtn" type="button" disabled>重置</button>
+            <button id="scanBtn" type="button">扫描</button>
+          </div>
+        </div>
+        <div id="summary" class="summary-grid">
+          <span><b>0</b> 字段</span>
+          <span><b>0</b> 可填</span>
+          <span><b>0</b> AI</span>
+          <span><b>0</b> 确认</span>
+        </div>
+        <div id="mappingList" class="mapping-list"></div>
+        <button id="generateAiBtn" type="button" disabled>生成核心字段草稿</button>
+        <div class="button-row">
+          <button id="fillBtn" type="button" disabled>开始填写</button>
+          <button id="confirmBtn" type="button" disabled>我已完成投递</button>
+        </div>
+        <p class="safe-copy">不会填写密码、验证码或隐藏字段，也不会自动提交。</p>
+      </section>
+    </main>
+    <script src="./popup.js"></script>
+  </body>
+</html>

@@ -33,6 +33,7 @@ type AgentToolName =
   | 'add_knowledge_item'
   | 'update_knowledge_item'
   | 'delete_knowledge_item'
+  | 'recommend_jobs'
   | 'unsupported'
 type AgentActionStatus = 'pending' | 'executing' | 'approved' | 'dismissed'
 type ToolActionDetail = {
@@ -40,6 +41,7 @@ type ToolActionDetail = {
   summary: string
   items: string[]
   content?: string
+  jobs?: JobOpportunity[]
 }
 type AgentToolProposal = {
   id: string
@@ -88,6 +90,7 @@ type Dashboard = {
   candidate_profile?: CandidateProfile
   applications?: ApplicationState[]
   application_summary?: ApplicationSummary
+  job_recommendations?: JobOpportunity[]
   job_weather?: JobWeather
   daily_action?: DailyAction
   peach_tree?: PeachTree
@@ -151,6 +154,34 @@ type ApplicationState = {
   updated_at?: string
 }
 type ApplicationSummary = { total: number; applied: number; waiting: number; interviewing: number; offer: number }
+type JobOpportunity = {
+  id: string
+  industry: string
+  batch: string
+  major_friendly: boolean
+  company: string
+  education: string
+  updated_at: string
+  announcement_url: string
+  position: string
+  application_url: string
+  written_test_free: boolean
+  deadline: string
+  deadline_status: string
+  company_type: string
+  target_graduates: string
+  notes: string
+  cities: string
+  match_score?: number
+  match_reasons?: string[]
+}
+type JobLibraryResponse = {
+  total: number
+  limit: number
+  offset: number
+  items: JobOpportunity[]
+  facets?: { industries?: string[]; batches?: string[]; company_types?: string[] }
+}
 type JobWeather = {
   weather: string
   label: string
@@ -457,8 +488,8 @@ const defaultProfile: Profile = {
   ],
 }
 
-const fixedBubbles = ['帮我模拟面试', '帮我写简历', '帮我改简历']
-const composerActions = ['模拟面试', '题库练习', '简历优化', '简历撰写']
+const fixedBubbles = ['帮我投递网申', '帮我模拟面试', '帮我写简历', '帮我改简历']
+const composerActions = ['投递网申', '模拟面试', '题库练习', '简历优化', '简历撰写']
 const defaultInterviewProgress: InterviewProgress = {
   answer_count: 0,
   question_count: 0,
@@ -853,6 +884,7 @@ function App() {
       style: '不限',
       mode: 'voice',
       questionBank: '产品经理通用题库',
+      questionSetId: '',
       targetRole: '',
       targetCompany: '',
       stage: '投递期',
@@ -1405,6 +1437,7 @@ function App() {
         deleted_knowledge_id?: string
         resume_versions?: ResumeVersion[]
         resume_version?: ResumeVersion | null
+        job_recommendations?: JobOpportunity[]
       }>('/api/agent/actions/execute', {
         method: 'POST',
         body: JSON.stringify({ tool: action.tool, payload: action.payload }),
@@ -1511,6 +1544,7 @@ function App() {
       return
     }
     const promptMap: Record<string, string> = {
+      投递网申: '帮我投递岗位并自动网申',
       简历优化: '帮我优化简历，重点提升项目经历和岗位匹配度。',
       简历撰写: '帮我从零写一版适合目标岗位的简历。',
     }
@@ -1540,7 +1574,12 @@ function App() {
     }
     begin('interviewStart', '正在生成个性化题集')
     try {
-      await api<{ experience: unknown; questions: unknown[] }>('/api/interview-experiences/import', {
+      trackEvent('question_set_build_start', {
+        company: settings.targetCompany || profile.target_company,
+        role: settings.targetRole || profile.target_role,
+        stage: settings.stage || profile.stage,
+      })
+      const imported = await api<{ experience: unknown; questions: unknown[] }>('/api/interview-experiences/import', {
         method: 'POST',
         body: JSON.stringify({
           company: settings.targetCompany || profile.target_company,
@@ -1550,6 +1589,10 @@ function App() {
           source_type: 'manual',
           source_name: '用户导入面经',
         }),
+      })
+      trackEvent('interview_experience_import', {
+        source_type: 'manual',
+        question_count: imported.questions.length,
       })
       const data = await api<{ question_set: InterviewQuestionSet }>('/api/interview-question-set/build', {
         method: 'POST',
@@ -1632,6 +1675,7 @@ function App() {
         duration: settings.duration,
         interviewer_gender: settings.gender,
         interviewer_style: settings.style,
+        has_question_set: Boolean(settings.questionSetId),
       })
       setInterviewProgress(data.progress ?? defaultInterviewProgress)
       setPeachPanel('live-interview')
@@ -1833,28 +1877,6 @@ function App() {
       setNotice('投递记录已删除。')
     } catch (err) {
       setError('投递记录删除失败，请稍后再试。')
-      console.error(err)
-    } finally {
-      end('application')
-    }
-  }
-
-  async function updateDailyActionStatus(status: 'started' | 'completed' | 'skipped') {
-    const action = dashboard?.daily_action
-    if (!action) return
-    begin('application', status === 'completed' ? '正在完成今日行动' : '正在更新今日行动')
-    try {
-      await api<{ daily_action: DailyAction; peach_tree?: PeachTree }>(`/api/daily-action/${action.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status }),
-      })
-      trackEvent(`daily_action_${status === 'started' ? 'start' : status === 'skipped' ? 'skip' : 'complete'}`, {
-        action_type: action.action_type,
-      })
-      await refreshDashboard()
-      setNotice(status === 'completed' ? '今日行动已完成，桃子树也记录了这一步。' : '今日行动已更新。')
-    } catch (err) {
-      setError('今日行动更新失败，请稍后再试。')
       console.error(err)
     } finally {
       end('application')
@@ -2885,17 +2907,14 @@ function App() {
         {module === 'applications' ? (
           <ApplicationsWorkspace
             profile={profile}
+            username={account?.username ?? ''}
             applications={dashboard?.applications ?? []}
             summary={dashboard?.application_summary}
-            weather={dashboard?.job_weather}
-            dailyAction={dashboard?.daily_action}
-            peachTree={dashboard?.peach_tree}
+            jobRecommendations={dashboard?.job_recommendations ?? []}
             busy={Boolean(busy.application || busy.refresh)}
             onCreate={(payload) => void createApplicationDraft(payload)}
             onStatus={(application, status) => void updateApplicationStatus(application, status)}
             onDelete={(application) => void deleteApplicationRecord(application)}
-            onDailyAction={(status) => void updateDailyActionStatus(status)}
-            onStartTraining={startGrowthTraining}
           />
         ) : null}
 
@@ -4111,30 +4130,24 @@ function ReportGrowthLoop({
 
 function ApplicationsWorkspace({
   profile,
+  username,
   applications,
   summary,
-  weather,
-  dailyAction,
-  peachTree,
+  jobRecommendations,
   busy,
   onCreate,
   onStatus,
   onDelete,
-  onDailyAction,
-  onStartTraining,
 }: {
   profile: Profile
+  username: string
   applications: ApplicationState[]
   summary?: ApplicationSummary
-  weather?: JobWeather
-  dailyAction?: DailyAction
-  peachTree?: PeachTree
+  jobRecommendations: JobOpportunity[]
   busy: boolean
   onCreate: (payload: { company: string; role: string; jd_text: string; source_url: string; notes: string; status: ApplicationStatus }) => void
   onStatus: (application: ApplicationState, status: ApplicationStatus) => void
   onDelete: (application: ApplicationState) => void
-  onDailyAction: (status: 'started' | 'completed' | 'skipped') => void
-  onStartTraining: (prompt: string) => void
 }) {
   const [draft, setDraft] = useState({
     company: '',
@@ -4144,18 +4157,17 @@ function ApplicationsWorkspace({
     notes: '',
     status: 'ready' as ApplicationStatus,
   })
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const [jobQuery, setJobQuery] = useState('')
+  const [jobLibrary, setJobLibrary] = useState<JobLibraryResponse | null>(null)
+  const [jobLibraryLoading, setJobLibraryLoading] = useState(false)
+  const [jobLibraryError, setJobLibraryError] = useState('')
+  const [jobRecommendationPrompt, setJobRecommendationPrompt] = useState('')
+  const [manualJobRecommendations, setManualJobRecommendations] = useState<JobOpportunity[] | null>(null)
+  const [jobRecommendationLoading, setJobRecommendationLoading] = useState(false)
+  const [jobRecommendationError, setJobRecommendationError] = useState('')
+  const visibleJobRecommendations = manualJobRecommendations ?? jobRecommendations
   const stats = summary ?? { total: applications.length, applied: 0, waiting: 0, interviewing: 0, offer: 0 }
-  const tree = peachTree ?? {
-    id: '',
-    stage: 'seed',
-    stage_label: '种子',
-    next_stage: 'sprout',
-    next_stage_label: '发芽',
-    growth_xp: 0,
-    peach_points: 0,
-    progress: 0,
-    streak_days: 0,
-  }
 
   function submitDraft() {
     if (!draft.company.trim() && !draft.role.trim()) return
@@ -4163,60 +4175,127 @@ function ApplicationsWorkspace({
     setDraft({ company: '', role: profile.target_role || '产品经理', jd_text: '', source_url: '', notes: '', status: 'ready' })
   }
 
+  async function loadJobLibrary(offset = 0) {
+    setJobLibraryLoading(true)
+    setJobLibraryError('')
+    try {
+      const params = new URLSearchParams({
+        q: jobQuery,
+        limit: '50',
+        offset: String(offset),
+      })
+      const data = await fetchJsonWithRetry<JobLibraryResponse>(`${API_BASE}/api/jobs/library?${params.toString()}`, {
+        headers: username ? { 'X-Peach-User': username } : undefined,
+      })
+      setJobLibrary(data)
+    } catch (err) {
+      setJobLibraryError(err instanceof Error ? err.message : '岗位库加载失败')
+    } finally {
+      setJobLibraryLoading(false)
+    }
+  }
+
+  async function refreshJobRecommendations() {
+    setJobRecommendationLoading(true)
+    setJobRecommendationError('')
+    try {
+      const params = new URLSearchParams({
+        q: jobRecommendationPrompt.trim(),
+        limit: '6',
+      })
+      const data = await fetchJsonWithRetry<{ items: JobOpportunity[] }>(`${API_BASE}/api/jobs/recommendations?${params.toString()}`, {
+        headers: username ? { 'X-Peach-User': username } : undefined,
+      })
+      setManualJobRecommendations(data.items)
+    } catch (err) {
+      setJobRecommendationError(err instanceof Error ? err.message : '岗位推荐更新失败')
+    } finally {
+      setJobRecommendationLoading(false)
+    }
+  }
+
+  function useJobAsDraft(job: JobOpportunity) {
+    onCreate({
+      company: job.company,
+      role: job.position || profile.target_role || '产品经理',
+      jd_text: [job.position, job.notes].filter(Boolean).join('\n'),
+      source_url: job.application_url || job.announcement_url,
+      notes: `来自秋招资料库：${[job.batch, job.industry, job.cities, job.deadline ? `截止 ${job.deadline}` : ''].filter(Boolean).join(' · ')}`,
+      status: 'ready',
+    })
+  }
+
   return (
     <section className="applications-workspace">
       <header className="applications-hero">
-        <div>
-          <p>投递</p>
-          <h1>把投递、面试和今天该做什么连起来</h1>
-          <span>目标：{profile.target_company ? `${profile.target_company} · ` : ''}{profile.target_role || '产品经理'}</span>
-        </div>
-        <div className="tree-card">
-          <span>桃子树 · {tree.stage_label}</span>
-          <strong>{tree.growth_xp} XP</strong>
-          <div className="tree-progress"><i style={{ width: `${Math.max(4, tree.progress)}%` }} /></div>
-          <small>{tree.peach_points} 桃子点 · 下一阶段 {tree.next_stage_label}</small>
-        </div>
+        <p>投递</p>
       </header>
 
       <div className="applications-grid">
-        <section className="app-status-card weather-card">
-          <div className="profile-card-head">
-            <strong>今日求职天气</strong>
-            <span>{weather?.label || '晴'}</span>
-          </div>
-          <p>{weather?.summary || '暂无紧急节点，适合轻量补齐简历或做一次基础 Mock。'}</p>
-          <small>{weather?.reason || '基于投递、面试和成长记录生成。'}</small>
-        </section>
-
-        <section className="app-status-card daily-action-card">
-          <div className="profile-card-head">
-            <strong>今日只做一件事</strong>
-            <span>{dailyAction?.status === 'completed' ? '已完成' : dailyAction?.status === 'skipped' ? '已休息' : '待完成'}</span>
-          </div>
-          <h2>{dailyAction?.title || '补齐一处简历证据'}</h2>
-          <p>{dailyAction?.description || '选一段项目或实习经历，补上背景、动作、结果和可追问细节。'}</p>
-          <div className="daily-action-buttons">
-            <button type="button" disabled={busy || dailyAction?.status === 'completed'} onClick={() => onDailyAction('started')}>开始</button>
-            <button type="button" disabled={busy || dailyAction?.status === 'completed'} onClick={() => onDailyAction('completed')}>完成</button>
-            <button type="button" disabled={busy || dailyAction?.status === 'completed'} onClick={() => onDailyAction('skipped')}>今天先休息</button>
-            <button type="button" onClick={() => onStartTraining(dailyAction?.title || '项目深挖专项训练')}>拿它练一轮</button>
-          </div>
-        </section>
-
         <section className="app-status-card application-summary-card">
           <div className="profile-card-head">
             <strong>投递漏斗</strong>
             <span>{stats.total} 条记录</span>
           </div>
           <div className="application-stats">
-            <span><b>{stats.applied}</b> 已投递</span>
-            <span><b>{stats.waiting}</b> 等反馈</span>
-            <span><b>{stats.interviewing}</b> 面试中</span>
+            <span><b>{stats.applied}</b> 投递</span>
+            <span><b>{stats.waiting}</b> 测评/AI面/笔试</span>
+            <span><b>{stats.interviewing}</b> 面试</span>
             <span><b>{stats.offer}</b> Offer</span>
           </div>
         </section>
       </div>
+
+      <section className="application-job-panel">
+        <div className="profile-card-head">
+          <strong>桃子推荐岗位</strong>
+          <button type="button" onClick={() => { setLibraryOpen((open) => !open); if (!libraryOpen && !jobLibrary) void loadJobLibrary() }}>
+            {libraryOpen ? '收起岗位库' : '查看全部岗位库'}
+          </button>
+        </div>
+        <div className="job-recommendation-compose">
+          <input
+            value={jobRecommendationPrompt}
+            onChange={(event) => setJobRecommendationPrompt(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) void refreshJobRecommendations()
+            }}
+            placeholder="告诉桃子你想要什么岗位，例如大厂、中台、偏算法、偏业务"
+          />
+          <button type="button" disabled={jobRecommendationLoading} onClick={() => void refreshJobRecommendations()}>
+            {jobRecommendationLoading ? '推荐中' : '更新推荐'}
+          </button>
+        </div>
+        {jobRecommendationError ? <p className="error-inline">{jobRecommendationError}</p> : null}
+        <div className="job-recommendation-grid">
+          {visibleJobRecommendations.length ? visibleJobRecommendations.slice(0, 3).map((job) => (
+            <JobOpportunityCard key={job.id} job={job} onUse={useJobAsDraft} />
+          )) : (
+            <p className="empty-copy">完善目标岗位、城市或上传简历后，桃子会从秋招资料库里推荐更贴近你的岗位。</p>
+          )}
+        </div>
+        {libraryOpen ? (
+          <div className="job-library-panel">
+            <div className="job-library-search">
+              <input value={jobQuery} onChange={(event) => setJobQuery(event.target.value)} placeholder="搜索公司、岗位、城市、行业或备注" />
+              <button type="button" disabled={jobLibraryLoading} onClick={() => void loadJobLibrary()}>{jobLibraryLoading ? '查找中' : '查找'}</button>
+            </div>
+            {jobLibraryError ? <p className="error-inline">{jobLibraryError}</p> : null}
+            <div className="job-library-list">
+              {(jobLibrary?.items ?? []).map((job) => <JobOpportunityRow key={job.id} job={job} onUse={useJobAsDraft} />)}
+            </div>
+            {jobLibrary ? (
+              <div className="job-library-footer">
+                <span>共 {jobLibrary.total} 条，当前显示 {jobLibrary.offset + 1}-{Math.min(jobLibrary.total, jobLibrary.offset + jobLibrary.items.length)}</span>
+                <div>
+                  <button type="button" disabled={jobLibraryLoading || jobLibrary.offset <= 0} onClick={() => void loadJobLibrary(Math.max(0, jobLibrary.offset - jobLibrary.limit))}>上一页</button>
+                  <button type="button" disabled={jobLibraryLoading || jobLibrary.offset + jobLibrary.limit >= jobLibrary.total} onClick={() => void loadJobLibrary(jobLibrary.offset + jobLibrary.limit)}>下一页</button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
 
       <section className="application-create-panel">
         <div className="profile-card-head">
@@ -4260,6 +4339,59 @@ function ApplicationsWorkspace({
         )}
       </section>
     </section>
+  )
+}
+
+function JobOpportunityCard({ job, onUse }: { job: JobOpportunity; onUse: (job: JobOpportunity) => void }) {
+  return (
+    <article className="job-card">
+      <div className="job-card-head">
+        <span>{job.match_score ? `${job.match_score}% 匹配` : job.batch || '岗位'}</span>
+        <small>{job.deadline_status === 'expired' ? '可能已截止' : job.deadline || '开放中'}</small>
+      </div>
+      <strong>{job.company}</strong>
+      <p>{job.position}</p>
+      <div className="job-tags">
+        {jobTags(job).map((tag) => <span key={tag}>{tag}</span>)}
+      </div>
+      {job.match_reasons?.length ? <small>{job.match_reasons.join(' · ')}</small> : null}
+      <div className="job-actions">
+        <a href={job.application_url || job.announcement_url} target="_blank" rel="noreferrer">去投递</a>
+        <button type="button" onClick={() => onUse(job)}>加入投递记录</button>
+      </div>
+    </article>
+  )
+}
+
+function jobTags(job: JobOpportunity) {
+  return [
+    job.batch,
+    job.industry,
+    job.company_type,
+    job.major_friendly ? '不限专业' : '',
+    job.written_test_free ? '免笔试' : '',
+  ].filter((tag): tag is string => Boolean(tag)).slice(0, 5)
+}
+
+function compactDelimitedText(value: string, limit = 3) {
+  const items = value.split(/[,，、/]/).map((item) => item.trim()).filter(Boolean)
+  if (items.length <= limit) return items.join('、') || value
+  return `${items.slice(0, limit).join('、')}等`
+}
+
+function JobOpportunityRow({ job, onUse }: { job: JobOpportunity; onUse: (job: JobOpportunity) => void }) {
+  return (
+    <article className="job-row">
+      <div>
+        <strong>{job.company} · {job.position}</strong>
+        <p>{[job.batch, job.industry, job.company_type, job.cities, job.deadline ? `截止 ${job.deadline}` : ''].filter(Boolean).join(' · ')}</p>
+        {job.notes ? <small>{job.notes}</small> : null}
+      </div>
+      <div className="job-actions">
+        <a href={job.application_url || job.announcement_url} target="_blank" rel="noreferrer">链接</a>
+        <button type="button" onClick={() => onUse(job)}>记录</button>
+      </div>
+    </article>
   )
 }
 
@@ -5707,7 +5839,10 @@ function ToolApprovalCard({
   const [detailOpen, setDetailOpen] = useState(false)
   const draftDetail = useMemo(() => buildPendingToolActionDetail(action), [action])
   const visibleDetail = action.result ?? draftDetail
+  const jobResults = action.tool === 'recommend_jobs' && action.status === 'approved' ? action.result?.jobs ?? [] : []
   const detailLabel = action.result ? '改动' : '草案'
+  const displayTitle = jobResults.length && action.result ? action.result.title : action.title
+  const displaySummary = jobResults.length && action.result ? action.result.summary : action.summary
   const statusLabel: Record<AgentActionStatus, string> = {
     pending: '待确认',
     executing: '执行中',
@@ -5716,15 +5851,16 @@ function ToolApprovalCard({
   }
 
   return (
-    <section className={`tool-approval-card ${status}`}>
+    <section className={`tool-approval-card ${status} ${jobResults.length ? 'job-result' : ''}`}>
       <div>
         <span>{toolLabel(action.tool)}</span>
-        <strong>{action.title}</strong>
-        <p>{action.summary}</p>
+        <strong>{displayTitle}</strong>
+        <p>{displaySummary}</p>
+        {jobResults.length ? <ChatJobRecommendationCards jobs={jobResults} /> : null}
       </div>
       <div className="tool-approval-actions">
         <small>{statusLabel[status]}</small>
-        {visibleDetail ? (
+        {visibleDetail && !jobResults.length ? (
           <button type="button" onClick={() => setDetailOpen(true)}>{detailLabel}</button>
         ) : null}
         {!done ? <button type="button" onClick={onDismiss} disabled={status === 'executing'}>取消</button> : null}
@@ -5749,6 +5885,37 @@ function ToolApprovalCard({
         </div>
       ) : null}
     </section>
+  )
+}
+
+function ChatJobRecommendationCards({ jobs }: { jobs: JobOpportunity[] }) {
+  return (
+    <div className="chat-job-card-list" aria-label="岗位推荐列表">
+      {jobs.slice(0, 6).map((job) => {
+        const href = job.application_url || job.announcement_url
+        const content = (
+          <>
+            <div className="chat-job-card-head">
+              <strong>{job.company}</strong>
+              <span>{job.match_score ? `${job.match_score}%` : job.batch || '岗位'}</span>
+            </div>
+            <p>推荐岗位：{job.position || '查看岗位详情'}</p>
+            <small>工作城市：{compactDelimitedText(job.cities || '未标注', 3)}</small>
+            <em>匹配度：{job.match_score ? `${job.match_score}%` : '待评估'}</em>
+            <b>去投递</b>
+          </>
+        )
+        return href ? (
+          <a className="chat-job-card" href={href} key={job.id} target="_blank" rel="noreferrer">
+            {content}
+          </a>
+        ) : (
+          <article className="chat-job-card" key={job.id} tabIndex={0}>
+            {content}
+          </article>
+        )
+      })}
+    </div>
   )
 }
 
@@ -5803,6 +5970,7 @@ function normalizeAgentActions(actions?: AgentToolProposal[]) {
     'add_knowledge_item',
     'update_knowledge_item',
     'delete_knowledge_item',
+    'recommend_jobs',
     'unsupported',
   ]
   return (actions ?? [])
@@ -5857,6 +6025,9 @@ function pendingActionItems(action: AgentToolProposal) {
   if (action.tool === 'delete_knowledge_item') {
     return [`删除资料 ID：${String(payload.id || '未提供')}`]
   }
+  if (action.tool === 'recommend_jobs') {
+    return [`关键词：${String(payload.query || '当前档案')}`, `推荐数量：${String(payload.limit || 5)}`]
+  }
   return []
 }
 
@@ -5870,6 +6041,7 @@ function buildToolActionDetail(
     report?: InterviewReport
     knowledge?: KnowledgeItem
     deleted_knowledge_id?: string
+    job_recommendations?: JobOpportunity[]
   },
   beforeProfile: Profile,
   beforeKnowledgeItems: KnowledgeItem[],
@@ -5904,6 +6076,22 @@ function buildToolActionDetail(
         data.report?.overall_score ? `综合分：${data.report.overall_score}` : '综合分：暂无',
       ],
       content: data.report?.summary || data.interview?.report?.summary || '',
+    }
+  }
+
+  if (action.tool === 'recommend_jobs') {
+    const jobs = data.job_recommendations ?? []
+    return {
+      title: '已生成岗位推荐',
+      summary: jobs.length ? `桃子从秋招资料库里筛出了 ${jobs.length} 个更适合当前档案的机会。` : '暂时没有筛到足够匹配的岗位，可以换关键词再试。',
+      items: jobs.map((job) => `${job.company} · ${job.position}${job.application_url ? ` · ${job.application_url}` : ''}`),
+      jobs,
+      content: jobs.map((job) => [
+        `${job.company} · ${job.position}`,
+        [job.batch, job.industry, job.cities, job.deadline ? `截止 ${job.deadline}` : ''].filter(Boolean).join(' · '),
+        job.match_reasons?.length ? `匹配理由：${job.match_reasons.join('、')}` : '',
+        job.application_url || job.announcement_url,
+      ].filter(Boolean).join('\n')).join('\n\n'),
     }
   }
 
@@ -6051,6 +6239,7 @@ function toolLabel(tool: AgentToolName) {
     add_knowledge_item: '知识库',
     update_knowledge_item: '知识库',
     delete_knowledge_item: '知识库',
+    recommend_jobs: '岗位',
     unsupported: '动作',
   }
   return labels[tool]
