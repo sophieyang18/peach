@@ -4041,7 +4041,7 @@ button:active,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 18px;
+  margin-bottom: 16px;
 }
 
 .applications-hero p {
@@ -4053,6 +4053,8 @@ button:active,
 .applications-hero h1 {
   margin: 0;
   font-size: 30px;
+  color: var(--text);
+  line-height: 1.2;
   letter-spacing: 0;
 }
 
@@ -4181,6 +4183,61 @@ button:active,
   gap: 10px;
 }
 
+.application-funnel {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0 2px;
+}
+
+.application-funnel article {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 48px;
+  margin: 0 auto;
+  border: 1px solid rgba(246, 166, 197, 0.48);
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), #f48a5d);
+  clip-path: polygon(6% 0, 94% 0, 86% 100%, 14% 100%);
+  box-shadow: 0 10px 24px rgba(213, 75, 128, 0.12);
+}
+
+.application-funnel article:nth-child(1) {
+  width: 100%;
+}
+
+.application-funnel article:nth-child(2) {
+  width: 82%;
+  background: linear-gradient(135deg, #e85d85, #f08862);
+}
+
+.application-funnel article:nth-child(3) {
+  width: 64%;
+  background: linear-gradient(135deg, #d84f78, #e77b5c);
+}
+
+.application-funnel article:nth-child(4) {
+  width: 46%;
+  background: linear-gradient(135deg, #be3e68, #dc6a58);
+}
+
+.application-funnel b {
+  font-size: 24px;
+  line-height: 1;
+}
+
+.application-funnel span {
+  max-width: min(72%, 180px);
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 900;
+}
+
 .application-summary-card {
   grid-column: 1 / -1;
 }
@@ -4305,6 +4362,8 @@ button:active,
 }
 
 .job-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
   margin-top: auto;
 }
 
@@ -4331,6 +4390,11 @@ button:active,
   border: 0;
   background: linear-gradient(135deg, var(--accent), #f48a5d);
   color: #fff;
+}
+
+.job-actions button:disabled {
+  opacity: 0.62;
+  cursor: wait;
 }
 
 .job-library-panel {
@@ -4520,6 +4584,7 @@ button:active,
 .growth-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.9fr);
+  align-items: start;
   gap: 14px;
 }
 
@@ -4628,7 +4693,7 @@ button:active,
 
 .ability-radar text {
   fill: #6b515e;
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 900;
 }
 
@@ -4672,7 +4737,7 @@ button:active,
 }
 
 .readiness-training-card {
-  align-self: start;
+  align-self: stretch;
 }
 
 .readiness-summary {

@@ -1955,6 +1955,42 @@ function App() {
     }
   }
 
+  async function generateTargetedResume(job: JobOpportunity) {
+    begin('application', '正在生成专属简历')
+    try {
+      const data = await api<{
+        message?: string
+        resume_version?: ResumeVersion | null
+        resume_versions?: ResumeVersion[]
+      }>('/api/jobs/resume', {
+        method: 'POST',
+        body: JSON.stringify({
+          company: job.company,
+          position: job.position,
+          industry: job.industry,
+          batch: job.batch,
+          cities: job.cities,
+          education: job.education,
+          company_type: job.company_type,
+          target_graduates: job.target_graduates,
+          notes: job.notes,
+          application_url: job.application_url,
+          announcement_url: job.announcement_url,
+          match_reasons: job.match_reasons ?? [],
+        }),
+      })
+      if (data.resume_versions) setResumeVersions(data.resume_versions)
+      setDashboard((current) => (current && data.resume_versions ? { ...current, resume_versions: data.resume_versions } : current))
+      trackEvent('targeted_resume_generate', { company: job.company, has_version: Boolean(data.resume_version) })
+      setNotice(data.message || '专属简历已归档到个人档案的简历列表。')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '专属简历生成失败，请稍后再试。')
+      console.error(err)
+    } finally {
+      end('application')
+    }
+  }
+
   function selectProfileSection(id: ProfileSectionId) {
     setActiveProfileSection(id)
     setProfileActionResult('')
@@ -3062,6 +3098,7 @@ function App() {
             onCreate={(payload) => void createApplicationDraft(payload)}
             onStatus={(application, status) => void updateApplicationStatus(application, status)}
             onDelete={(application) => void deleteApplicationRecord(application)}
+            onGenerateResume={(job) => generateTargetedResume(job)}
           />
         ) : null}
 
@@ -4305,6 +4342,7 @@ function ApplicationsWorkspace({
   onCreate,
   onStatus,
   onDelete,
+  onGenerateResume,
 }: {
   profile: Profile
   username: string
@@ -4315,6 +4353,7 @@ function ApplicationsWorkspace({
   onCreate: (payload: { company: string; role: string; jd_text: string; source_url: string; notes: string; status: ApplicationStatus }) => void
   onStatus: (application: ApplicationState, status: ApplicationStatus) => void
   onDelete: (application: ApplicationState) => void
+  onGenerateResume: (job: JobOpportunity) => Promise<void>
 }) {
   const [draft, setDraft] = useState({
     company: '',
@@ -4333,6 +4372,7 @@ function ApplicationsWorkspace({
   const [manualJobRecommendations, setManualJobRecommendations] = useState<JobOpportunity[] | null>(null)
   const [jobRecommendationLoading, setJobRecommendationLoading] = useState(false)
   const [jobRecommendationError, setJobRecommendationError] = useState('')
+  const [generatingResumeJobId, setGeneratingResumeJobId] = useState('')
   const visibleJobRecommendations = manualJobRecommendations ?? jobRecommendations
   const stats = summary ?? { total: applications.length, applied: 0, waiting: 0, interviewing: 0, offer: 0 }
 
@@ -4392,10 +4432,19 @@ function ApplicationsWorkspace({
     })
   }
 
+  async function generateResume(job: JobOpportunity) {
+    setGeneratingResumeJobId(job.id)
+    try {
+      await onGenerateResume(job)
+    } finally {
+      setGeneratingResumeJobId('')
+    }
+  }
+
   return (
     <section className="applications-workspace">
       <header className="applications-hero">
-        <p>投递</p>
+        <h1>投递</h1>
       </header>
 
       <div className="applications-grid">
@@ -4404,11 +4453,23 @@ function ApplicationsWorkspace({
             <strong>投递漏斗</strong>
             <span>{stats.total} 条记录</span>
           </div>
-          <div className="application-stats">
-            <span><b>{stats.applied}</b> 投递</span>
-            <span><b>{stats.waiting}</b> 测评/AI面/笔试</span>
-            <span><b>{stats.interviewing}</b> 面试</span>
-            <span><b>{stats.offer}</b> Offer</span>
+          <div className="application-funnel" aria-label="投递漏斗">
+            <article>
+              <b>{stats.applied}</b>
+              <span>投递</span>
+            </article>
+            <article>
+              <b>{stats.waiting}</b>
+              <span>测评/AI面/笔试</span>
+            </article>
+            <article>
+              <b>{stats.interviewing}</b>
+              <span>面试</span>
+            </article>
+            <article>
+              <b>{stats.offer}</b>
+              <span>Offer</span>
+            </article>
           </div>
         </section>
       </div>
@@ -4436,7 +4497,13 @@ function ApplicationsWorkspace({
         {jobRecommendationError ? <p className="error-inline">{jobRecommendationError}</p> : null}
         <div className="job-recommendation-grid">
           {visibleJobRecommendations.length ? visibleJobRecommendations.slice(0, 3).map((job) => (
-            <JobOpportunityCard key={job.id} job={job} onUse={useJobAsDraft} />
+            <JobOpportunityCard
+              key={job.id}
+              job={job}
+              generatingResume={generatingResumeJobId === job.id}
+              onUse={useJobAsDraft}
+              onGenerateResume={(targetJob) => void generateResume(targetJob)}
+            />
           )) : (
             <p className="empty-copy">完善目标岗位、城市或上传简历后，桃子会从秋招资料库里推荐更贴近你的岗位。</p>
           )}
@@ -4509,7 +4576,17 @@ function ApplicationsWorkspace({
   )
 }
 
-function JobOpportunityCard({ job, onUse }: { job: JobOpportunity; onUse: (job: JobOpportunity) => void }) {
+function JobOpportunityCard({
+  job,
+  generatingResume,
+  onUse,
+  onGenerateResume,
+}: {
+  job: JobOpportunity
+  generatingResume: boolean
+  onUse: (job: JobOpportunity) => void
+  onGenerateResume: (job: JobOpportunity) => void
+}) {
   return (
     <article className="job-card">
       <div className="job-card-head">
@@ -4524,6 +4601,9 @@ function JobOpportunityCard({ job, onUse }: { job: JobOpportunity; onUse: (job: 
       {job.match_reasons?.length ? <small>{job.match_reasons.join(' · ')}</small> : null}
       <div className="job-actions">
         <a href={job.application_url || job.announcement_url} target="_blank" rel="noreferrer">去投递</a>
+        <button type="button" disabled={generatingResume} onClick={() => onGenerateResume(job)}>
+          {generatingResume ? '生成中' : '生成专属简历'}
+        </button>
         <button type="button" onClick={() => onUse(job)}>加入投递记录</button>
       </div>
     </article>
@@ -4593,7 +4673,6 @@ function GrowthWorkspace({
     <section className="growth-workspace">
       <header className="growth-hero">
         <div>
-          <p>成长中心</p>
           <h1>成长中心</h1>
         </div>
       </header>
@@ -4667,6 +4746,8 @@ function AbilityRadarChart({ abilities }: { abilities: GrowthCenter['abilities']
   const rings = [0.25, 0.5, 0.75, 1]
   const points = axes.map((ability, index) => {
     const angle = (Math.PI * 2 * index) / axes.length - Math.PI / 2
+    const horizontal = Math.cos(angle)
+    const labelAnchor: 'start' | 'end' | 'middle' = horizontal > 0.45 ? 'start' : horizontal < -0.45 ? 'end' : 'middle'
     const score = Math.max(0, Math.min(100, ability.current_score ?? 18))
     const radius = (score / 100) * maxRadius
     return {
@@ -4676,15 +4757,16 @@ function AbilityRadarChart({ abilities }: { abilities: GrowthCenter['abilities']
       y: center + Math.sin(angle) * radius,
       axisX: center + Math.cos(angle) * maxRadius,
       axisY: center + Math.sin(angle) * maxRadius,
-      labelX: center + Math.cos(angle) * (maxRadius + 30),
+      labelX: center + Math.cos(angle) * maxRadius + (horizontal > 0.45 ? 8 : horizontal < -0.45 ? -8 : 0),
       labelY: center + Math.sin(angle) * (maxRadius + 24),
+      labelAnchor,
     }
   })
   const polygon = points.map((point) => `${point.x},${point.y}`).join(' ')
 
   return (
     <div className="ability-radar">
-      <svg viewBox="0 0 240 240" role="img" aria-label="能力 Gap 雷达图">
+      <svg viewBox="-28 -10 296 260" role="img" aria-label="能力 Gap 雷达图">
         {rings.map((ring) => (
           <polygon
             key={ring}
@@ -4702,7 +4784,7 @@ function AbilityRadarChart({ abilities }: { abilities: GrowthCenter['abilities']
         {points.map((point) => (
           <g key={point.ability.dimension}>
             <circle className="radar-dot" cx={point.x} cy={point.y} r="3.5" />
-            <text x={point.labelX} y={point.labelY} textAnchor="middle">
+            <text x={point.labelX} y={point.labelY} textAnchor={point.labelAnchor} dominantBaseline="middle">
               {point.ability.label}
             </text>
           </g>
@@ -7043,6 +7125,13 @@ function firstMatch(value: string, pattern: RegExp) {
   return value.match(pattern)?.[1]?.trim() || ''
 }
 
+function cleanProjectLinkValue(value: string) {
+  const clean = String(value || '').trim()
+  if (!clean) return ''
+  if (/^(描述|补充信息|项目名称|项目角色|起止时间)[:：]/.test(clean)) return ''
+  return clean.split('\n')[0].trim()
+}
+
 function countResumeInternships(value: string) {
   const explicit = value.match(/(\d+|一|二|两|三|四|五|六|七|八|九|十)\s*段[^。；，,\n]{0,12}实习/)
   if (explicit?.[1]) return explicit[1]
@@ -7471,11 +7560,11 @@ function parseInternshipSectionContent(content: string): { items: InternshipForm
       extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
       continue
     }
-    const company = firstMatch(block, /公司名称[:：]\s*([^\n]*)/)
-    const role = firstMatch(block, /职位名称[:：]\s*([^\n]*)/)
-    const range = firstMatch(block, /起止时间[:：]\s*([^\n]*)/)
+    const company = firstMatch(block, /公司名称[:：][^\S\n]*([^\n]*)/)
+    const role = firstMatch(block, /职位名称[:：][^\S\n]*([^\n]*)/)
+    const range = firstMatch(block, /起止时间[:：][^\S\n]*([^\n]*)/)
     const [start, end] = parseFormDateRange(range)
-    const description = firstMatch(block, /描述[:：]\s*([\s\S]*?)(?:\n补充信息[:：]|$)/)
+    const description = firstMatch(block, /(?:^|\n)描述[:：][^\S\n]*([\s\S]*?)(?:\n补充信息[:：]|$)/)
     const item = { company, role, start, end, description: description.trim() }
     if (Object.values(item).some(Boolean) || /公司名称[:：]|职位名称[:：]|起止时间[:：]/.test(block)) items.push(item)
   }
@@ -7522,12 +7611,12 @@ function parseProjectSectionContent(content: string): { items: ProjectFormItem[]
       extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
       continue
     }
-    const name = firstMatch(block, /项目名称[:：]\s*([^\n]*)/)
-    const role = firstMatch(block, /项目角色[:：]\s*([^\n]*)/)
-    const range = firstMatch(block, /起止时间[:：]\s*([^\n]*)/)
+    const name = firstMatch(block, /项目名称[:：][^\S\n]*([^\n]*)/)
+    const role = firstMatch(block, /项目角色[:：][^\S\n]*([^\n]*)/)
+    const range = firstMatch(block, /起止时间[:：][^\S\n]*([^\n]*)/)
     const [start, end] = parseFormDateRange(range)
-    const link = firstMatch(block, /项目链接[:：]\s*([^\n]*)/)
-    const description = firstMatch(block, /描述[:：]\s*([\s\S]*?)(?:\n补充信息[:：]|$)/)
+    const link = cleanProjectLinkValue(firstMatch(block, /项目链接[:：][^\S\n]*([^\n]*)/))
+    const description = firstMatch(block, /(?:^|\n)描述[:：][^\S\n]*([\s\S]*?)(?:\n补充信息[:：]|$)/)
     const item = { name, role, start, end, link, description: description.trim() }
     if (Object.values(item).some(Boolean) || /项目名称[:：]|项目角色[:：]|项目链接[:：]|起止时间[:：]/.test(block)) items.push(item)
   }
@@ -7542,7 +7631,7 @@ function serializeProjectSection(items: ProjectFormItem[], extra = '', keepEmpty
       role: item.role.trim(),
       start: item.start.trim(),
       end: item.end.trim(),
-      link: item.link.trim(),
+      link: cleanProjectLinkValue(item.link),
       description: item.description.trim(),
     }))
     .filter((item) => keepEmpty || Object.values(item).some(Boolean))
@@ -7576,23 +7665,23 @@ function parseEducationSectionContent(content: string): { items: EducationFormIt
       extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
       continue
     }
-    const range = firstMatch(block, /时间[:：]\s*([^\n]*)/)
+    const range = firstMatch(block, /时间[:：][^\S\n]*([^\n]*)/)
     const [start, end] = parseFormDateRange(range)
     const item = {
-      degree: firstMatch(block, /学历[:：]\s*([^\n]*)/),
-      school: firstMatch(block, /学校全称[:：]\s*([^\n]*)/),
-      college: firstMatch(block, /所在院系[:：]\s*([^\n]*)/),
-      major: firstMatch(block, /专业[:：]\s*([^\n]*)/),
-      ranking: firstMatch(block, /专业排名[:：]\s*([^\n]*)/),
-      gpaTotal: firstMatch(block, /GPA总分[:：]\s*([^\n]*)/),
-      gpa: firstMatch(block, /个人GPA[:：]\s*([^\n]*)/),
-      advisor: firstMatch(block, /导师[:：]\s*([^\n]*)/),
-      lab: firstMatch(block, /实验室[:：]\s*([^\n]*)/),
-      research: firstMatch(block, /研究方向[:：]\s*([^\n]*)/),
+      degree: firstMatch(block, /学历[:：][^\S\n]*([^\n]*)/),
+      school: firstMatch(block, /学校全称[:：][^\S\n]*([^\n]*)/),
+      college: firstMatch(block, /所在院系[:：][^\S\n]*([^\n]*)/),
+      major: firstMatch(block, /专业[:：][^\S\n]*([^\n]*)/),
+      ranking: firstMatch(block, /专业排名[:：][^\S\n]*([^\n]*)/),
+      gpaTotal: firstMatch(block, /GPA总分[:：][^\S\n]*([^\n]*)/),
+      gpa: firstMatch(block, /个人GPA[:：][^\S\n]*([^\n]*)/),
+      advisor: firstMatch(block, /导师[:：][^\S\n]*([^\n]*)/),
+      lab: firstMatch(block, /实验室[:：][^\S\n]*([^\n]*)/),
+      research: firstMatch(block, /研究方向[:：][^\S\n]*([^\n]*)/),
       start,
       end,
-      recommended: firstMatch(block, /该学历是否保送[:：]\s*([^\n]*)/),
-      scholarship: firstMatch(block, /是否获得国家奖学金[:：]\s*([^\n]*)/),
+      recommended: firstMatch(block, /该学历是否保送[:：][^\S\n]*([^\n]*)/),
+      scholarship: firstMatch(block, /是否获得国家奖学金[:：][^\S\n]*([^\n]*)/),
     }
     if (Object.values(item).some(Boolean) || /学校全称[:：]|学历[:：]|专业[:：]|时间[:：]/.test(block)) items.push(item)
   }
@@ -7658,14 +7747,14 @@ function parseAwardSectionContent(content: string): { items: AwardFormItem[]; ex
       extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
       continue
     }
-    const kind = firstMatch(block, /类型[:：]\s*([^\n]*)/) || (/荣誉名称[:：]/.test(block) ? '荣誉经历' : '竞赛经历')
+    const kind = firstMatch(block, /类型[:：][^\S\n]*([^\n]*)/) || (/荣誉名称[:：]/.test(block) ? '荣誉经历' : '竞赛经历')
     const item = {
       kind,
-      level: firstMatch(block, /奖项级别[:：]\s*([^\n]*)/),
-      name: firstMatch(block, /(?:竞赛名称|荣誉名称|名称)[:：]\s*([^\n]*)/),
-      grade: firstMatch(block, /(?:奖项等级|荣誉称号)[:：]\s*([^\n]*)/),
-      date: firstMatch(block, /获奖时间[:：]\s*([^\n]*)/),
-      description: firstMatch(block, /(?:获奖项目概述|荣誉说明|描述)[:：]\s*([\s\S]*?)(?:\n补充信息[:：]|$)/).trim(),
+      level: firstMatch(block, /奖项级别[:：][^\S\n]*([^\n]*)/),
+      name: firstMatch(block, /(?:竞赛名称|荣誉名称|名称)[:：][^\S\n]*([^\n]*)/),
+      grade: firstMatch(block, /(?:奖项等级|荣誉称号)[:：][^\S\n]*([^\n]*)/),
+      date: firstMatch(block, /获奖时间[:：][^\S\n]*([^\n]*)/),
+      description: firstMatch(block, /(?:^|\n)(?:获奖项目概述|荣誉说明|描述)[:：][^\S\n]*([\s\S]*?)(?:\n补充信息[:：]|$)/).trim(),
     }
     if (Object.values(item).some(Boolean)) items.push(item)
   }
@@ -8041,12 +8130,19 @@ function parseDateRange(value: string): [string, string] {
 }
 
 function parseFormDateRange(value: string): [string, string] {
-  const clean = String(value || '')
-  const parts = clean.split(/\s[-—–至到]\s|[—–]/)
-  if (parts.length >= 2) {
-    return [normalizeDateInput(parts[0]), normalizeDateInput(parts.slice(1).join('-'))]
-  }
-  return parseDateRange(clean)
+  const clean = String(value || '').trim()
+  if (!clean) return ['', '']
+
+  const explicitRange = clean.match(/^(20\d{2}(?:[./-]\d{1,2})?)\s*[-—–至到]\s*(20\d{2}(?:[./-]\d{1,2})?|至今|现在)$/)
+  if (explicitRange) return [normalizeDateInput(explicitRange[1]), normalizeDateInput(explicitRange[2])]
+
+  const endOnlyRange = clean.match(/^[-—–]\s*([\s\S]*)$/)
+  if (endOnlyRange) return ['', normalizeDateInput(endOnlyRange[1])]
+
+  const editableRange = clean.match(/^([\s\S]*?)(?:\s+[-—–]\s*|[—–]|\s+(?:至|到)\s*)([\s\S]*)$/)
+  if (editableRange) return [normalizeDateInput(editableRange[1]), normalizeDateInput(editableRange[2])]
+
+  return [normalizeDateInput(clean), '']
 }
 
 function normalizeDateInput(value: string) {

@@ -141,6 +141,21 @@ class ApplicationPatchIn(BaseModel):
     notes: str | None = None
 
 
+class JobResumeGenerateIn(BaseModel):
+    company: str = ""
+    position: str = ""
+    industry: str = ""
+    batch: str = ""
+    cities: str = ""
+    education: str = ""
+    company_type: str = ""
+    target_graduates: str = ""
+    notes: str = ""
+    application_url: str = ""
+    announcement_url: str = ""
+    match_reasons: list[str] = Field(default_factory=list)
+
+
 class DailyActionPatchIn(BaseModel):
     status: str
 

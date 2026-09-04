@@ -51,6 +51,7 @@ from backend.app.schemas import (
     InterviewExperienceIn,
     InterviewAnswerIn,
     InterviewStartIn,
+    JobResumeGenerateIn,
     KnowledgeFolderIn,
     KnowledgeIn,
     KnowledgeLinkIn,
@@ -615,6 +616,139 @@ async def read_job_library(
 async def read_job_recommendations(q: str = "", limit: int = 6, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
     return recommend_jobs_for_profile(profile, limit=limit, query=q)
+
+
+@router.post("/jobs/resume")
+async def generate_resume_for_job(payload: JobResumeGenerateIn, session: AsyncSession = Depends(get_session)) -> dict:
+    profile = await get_or_create_profile(session)
+    company = payload.company.strip()[:120]
+    position = payload.position.strip()[:220] or profile.target_role or "目标岗位"
+    if not company and not position:
+        raise HTTPException(status_code=400, detail="company or position is required")
+
+    latest_resume = (
+        await session.execute(
+            select(ResumeVersion)
+            .where(ResumeVersion.user_id == profile.id)
+            .order_by(desc(ResumeVersion.created_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    resume_source = (profile.resume_text or "").strip() or (latest_resume.content if latest_resume else "")
+    if not resume_source.strip():
+        raise HTTPException(status_code=400, detail="请先在个人档案里上传或保存一份完整简历。")
+
+    candidate = (
+        await session.execute(
+            select(CandidateProfile)
+            .where(CandidateProfile.user_id == profile.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    knowledge_rows = (
+        await session.execute(
+            select(KnowledgeResource)
+            .where(KnowledgeResource.user_id == profile.id)
+            .order_by(desc(KnowledgeResource.pinned), desc(KnowledgeResource.created_at))
+            .limit(6)
+        )
+    ).scalars().all()
+    knowledge_context = "\n\n".join(
+        f"【{item.title}】\n{(item.summary or item.content or '')[:700]}"
+        for item in knowledge_rows
+        if (item.summary or item.content or "").strip()
+    )
+    job_context = "\n".join([
+        f"公司：{company or '未指定'}",
+        f"推荐岗位：{position}",
+        f"行业：{payload.industry or '未指定'}",
+        f"批次：{payload.batch or '未指定'}",
+        f"城市：{payload.cities or '未指定'}",
+        f"学历要求：{payload.education or '未指定'}",
+        f"企业类型：{payload.company_type or '未指定'}",
+        f"面向届别：{payload.target_graduates or '未指定'}",
+        f"岗位备注：{payload.notes or '无'}",
+        f"匹配理由：{'；'.join(payload.match_reasons) if payload.match_reasons else '无'}",
+        f"投递链接：{payload.application_url or payload.announcement_url or '无'}",
+    ])
+    memory_context = await relevant_memory_context(
+        session,
+        profile,
+        "\n".join([company, position, payload.notes, resume_source[:2000]]),
+        task_type="resume_generation",
+    )
+    prompt = f"""
+请基于用户的真实个人资料，为下面岗位生成一份「岗位专属中文简历」正文，并用于归档为一个新的简历版本。
+
+岗位信息：
+{job_context}
+
+用户基础档案：
+{serialize_profile(profile)}
+
+结构化候选人资料：
+{serialize_candidate_profile(candidate) if candidate else "暂无结构化资料"}
+
+个人知识库参考：
+{knowledge_context[:2600] or "暂无"}
+
+长期记忆参考：
+{memory_context[:1600] or "暂无"}
+
+当前完整简历：
+{resume_source[:7000]}
+
+要求：
+1. 只输出简历正文，不要解释生成过程，不要 markdown 表格。
+2. 必须以用户真实资料为边界；公司、学校、时间、数据、项目链接没有依据时不要编造。
+3. 优先保留联系方式、教育背景、实习经历、项目经历、技能与获奖经历。
+4. 根据岗位要求调整经历顺序和表达重点，突出与岗位最匹配的证据。
+5. 信息不足的位置可以写“待补充”，不要用空泛套话补齐。
+""".strip()
+    try:
+        resume = await agent.complete(
+            [{"role": "user", "content": prompt}],
+            "",
+            allow_fallback=False,
+            temperature=0.35,
+            max_tokens=3000,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="桃子暂时没能生成专属简历，请稍后重试。") from exc
+
+    resume = normalize_resume_content(resume)
+    if len(resume) < 120:
+        raise HTTPException(status_code=503, detail="桃子生成的专属简历内容过短，请稍后重试。")
+
+    title_parts = [company, position]
+    title = "-".join(part for part in title_parts if part)[:150] or "岗位专属简历"
+    version = await create_resume_version(
+        session,
+        profile,
+        resume,
+        title=f"{title}-专属简历",
+        source="job_targeted",
+        optimized=1,
+    )
+    if version:
+        version.target_role = position[:120]
+    await session.commit()
+    if version:
+        await session.refresh(version)
+    await remember_interaction_safely(
+        session,
+        agent,
+        profile,
+        source="job_targeted_resume",
+        user_message=f"为{company or '目标公司'} {position}生成专属简历",
+        assistant_reply=resume[:1800],
+        context={"job": payload.model_dump(), "resume_version_id": version.id if version else ""},
+    )
+    return {
+        "message": "专属简历已生成，并归档到个人档案的简历列表。",
+        "resume_version": serialize_resume_version(version) if version else None,
+        "resume_versions": await serialized_resume_versions(session, profile.id),
+    }
 
 
 @router.get("/job-weather")
