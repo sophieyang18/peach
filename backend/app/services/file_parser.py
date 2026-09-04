@@ -4,7 +4,7 @@ import io
 import re
 import zipfile
 from dataclasses import dataclass
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,6 +30,7 @@ class ParsedFile:
     title: str
     content: str
     summary: str
+    content_html: str = ""
     warning: str = ""
 
 
@@ -39,15 +40,19 @@ def parse_upload(filename: str, content: bytes) -> ParsedFile:
         raise ValueError("unsupported file type")
 
     warning = ""
+    content_html = ""
     if extension == ".pdf":
         text = parse_pdf(content)
+        content_html = parse_pdf_html(content)
     elif extension == ".docx":
         text = parse_docx(content)
+        content_html = parse_docx_html(content)
     elif extension == ".doc":
         text = parse_doc_binary_best_effort(content)
         warning = "老版 doc 文件采用基础文本抽取，复杂排版可能不完整。"
     elif extension in {".html", ".htm"}:
         text = parse_html(content)
+        content_html = sanitize_html_for_editor(content)
     else:
         text = parse_markdown(content)
 
@@ -59,6 +64,7 @@ def parse_upload(filename: str, content: bytes) -> ParsedFile:
         title=title,
         content=clean,
         summary=summarize(clean),
+        content_html=content_html or plain_text_to_html(clean),
         warning=warning,
     )
 
@@ -71,6 +77,37 @@ def parse_pdf(content: bytes) -> str:
     return "\n\n".join(pages)
 
 
+def parse_pdf_html(content: bytes) -> str:
+    reader = PdfReader(io.BytesIO(content))
+    pages: list[str] = []
+    for page in reader.pages[:20]:
+        fragments: list[str] = []
+
+        def visitor_text(text, _cm, _tm, font_dict, font_size):
+            if not text:
+                return
+            styles = []
+            if font_size:
+                styles.append(f"font-size:{max(8, min(24, round(float(font_size), 1)))}pt")
+            base_font = ""
+            if isinstance(font_dict, dict):
+                base_font = str(font_dict.get("/BaseFont") or "").split("+")[-1].replace("-", " ")
+            if base_font:
+                styles.append(f"font-family:{escape(base_font, quote=True)}")
+            style_attr = f" style=\"{';'.join(styles)}\"" if styles else ""
+            fragments.append(f"<span{style_attr}>{escape(text).replace(chr(10), '<br />')}</span>")
+
+        try:
+            page.extract_text(visitor_text=visitor_text)
+        except TypeError:
+            text = page.extract_text() or ""
+            fragments.append(plain_text_to_html(text))
+        page_html = "".join(fragments).strip()
+        if page_html:
+            pages.append(f"<section>{page_html}</section>")
+    return "\n".join(pages)
+
+
 def parse_docx(content: bytes) -> str:
     document = Document(io.BytesIO(content))
     parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
@@ -79,6 +116,42 @@ def parse_docx(content: bytes) -> str:
             cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
             if cells:
                 parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
+
+def parse_docx_html(content: bytes) -> str:
+    document = Document(io.BytesIO(content))
+    parts: list[str] = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            parts.append("<p><br /></p>")
+            continue
+        tag = "h3" if (paragraph.style and "heading" in paragraph.style.name.lower()) or len(text) <= 16 and re.search(r"(教育背景|实习经历|项目经历|个人技能|竞赛经历|获奖经历|荣誉经历|求职意向)", text) else "p"
+        runs = []
+        for run in paragraph.runs:
+            if not run.text:
+                continue
+            styles = []
+            if run.bold:
+                styles.append("font-weight:700")
+            if run.italic:
+                styles.append("font-style:italic")
+            if run.font.size:
+                styles.append(f"font-size:{max(9, min(24, round(run.font.size.pt)))}pt")
+            if run.font.name:
+                styles.append(f"font-family:{escape(run.font.name, quote=True)}")
+            style_attr = f" style=\"{';'.join(styles)}\"" if styles else ""
+            runs.append(f"<span{style_attr}>{escape(run.text)}</span>")
+        parts.append(f"<{tag}>{''.join(runs) or escape(text)}</{tag}>")
+    for table in document.tables:
+        rows = []
+        for row in table.rows:
+            cells = "".join(f"<td>{plain_text_to_html(cell.text)}</td>" for cell in row.cells)
+            if cells:
+                rows.append(f"<tr>{cells}</tr>")
+        if rows:
+            parts.append(f"<table>{''.join(rows)}</table>")
     return "\n".join(parts)
 
 
@@ -102,6 +175,30 @@ def parse_html(content: bytes) -> str:
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return soup.get_text("\n")
+
+
+def sanitize_html_for_editor(content: bytes) -> str:
+    raw = decode_text_best_effort(content)
+    soup = BeautifulSoup(raw, "html.parser")
+    for tag in soup(["script", "style", "iframe", "object", "embed"]):
+        tag.decompose()
+    allowed = {"h1", "h2", "h3", "p", "ul", "ol", "li", "table", "tr", "td", "th", "strong", "b", "em", "i", "span", "br"}
+    for tag in soup.find_all(True):
+        if tag.name not in allowed:
+            tag.unwrap()
+            continue
+        safe_style = tag.get("style", "")
+        tag.attrs = {}
+        if tag.name == "span" and safe_style:
+            whitelisted = []
+            for rule in safe_style.split(";"):
+                name, _, value = rule.partition(":")
+                if name.strip().lower() in {"font-size", "font-family", "font-weight", "font-style"}:
+                    whitelisted.append(f"{name.strip()}:{escape(value.strip(), quote=True)}")
+            if whitelisted:
+                tag["style"] = ";".join(whitelisted)
+    body = soup.body or soup
+    return "\n".join(str(tag) for tag in body.find_all(list(allowed), recursive=True)[:240])
 
 
 async def parse_link(url: str) -> ParsedFile:
@@ -253,6 +350,22 @@ def summarize(value: str, limit: int = 180) -> str:
     if not clean:
         return "文件已解析，但没有提取到有效文本。"
     return clean[:limit] + ("..." if len(clean) > limit else "")
+
+
+def plain_text_to_html(value: str) -> str:
+    parts = []
+    for line in str(value or "").splitlines():
+        clean = line.strip()
+        if not clean:
+            parts.append("<p><br /></p>")
+        elif re.match(r"^【.+】$", clean) or re.match(r"^(教育背景|实习经历|工作经历|项目经历|个人技能|竞赛经历|获奖经历|求职意向)$", clean):
+            parts.append(f"<h3>{escape(clean)}</h3>")
+        elif re.match(r"^[•·*\-]\s*", clean):
+            bullet_text = re.sub(r"^[•·*\-]\s*", "", clean)
+            parts.append(f"<p>• {escape(bullet_text)}</p>")
+        else:
+            parts.append(f"<p>{escape(clean)}</p>")
+    return "\n".join(parts)
 
 
 def file_title(filename: str, content: str) -> str:

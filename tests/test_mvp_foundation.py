@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -6,11 +7,81 @@ from sqlalchemy import select
 from backend.app.models import ApplicationState, CandidateProfile, InterviewQuestion, ProductEvent, RewardEvent, UserProfile
 from backend.app.services.analytics import record_product_event
 from backend.app.services.applications import create_application, list_applications, patch_application
+from backend.app.services import candidate_profile as candidate_profile_service
 from backend.app.services.candidate_profile import ensure_candidate_profile, serialize_candidate_profile
 from backend.app.services.companion import ensure_daily_action, update_daily_action
 from backend.app.services.conversations import list_conversations, sync_conversations
 from backend.app.services.interview_intelligence import build_question_set, import_experience
 from backend.app.services.rewards import refresh_tree_stage, serialize_tree
+
+
+class FakeResumeParserAgent:
+    async def extract_candidate_profile(self, _profile, _resume_text, fallback):
+        return {
+            **fallback,
+            "education": [
+                {
+                    "title": "北京航空航天大学 外国语言学及应用语言学 硕士",
+                    "degree": "硕士",
+                    "school": "北京航空航天大学",
+                    "college": "外国语学院",
+                    "major": "外国语言学及应用语言学",
+                    "start_date": "2024.09",
+                    "end_date": "2027.06",
+                    "gpa_total": "4.0",
+                    "gpa": "3.86",
+                    "status": "confirmed",
+                }
+            ],
+            "experiences": [
+                {
+                    "title": "字节跳动 AI产品经理实习生",
+                    "company": "字节跳动",
+                    "role": "AI产品经理实习生",
+                    "start_date": "2026.03",
+                    "end_date": "至今",
+                    "summary": "聚焦 AIGC 广告素材二创链路迭代。",
+                    "status": "confirmed",
+                },
+                {
+                    "title": "快手 AI产品经理实习生",
+                    "company": "快手",
+                    "role": "AI产品经理实习生",
+                    "start_date": "2025.10",
+                    "end_date": "2026.03",
+                    "summary": "主导 AI 创作工具落地与迭代。",
+                    "status": "confirmed",
+                },
+            ],
+            "projects": [
+                {
+                    "title": "求职搭子 Agent",
+                    "project_name": "求职搭子 Agent",
+                    "role": "独立产品和研发",
+                    "summary": "完成从需求调研到 demo 搭建。",
+                    "status": "confirmed",
+                }
+            ],
+            "skills": ["Figma", "SQL", "Python"],
+            "field_statuses": {},
+            "completeness": 88,
+        }
+
+
+class NonObjectResumeParserAgent:
+    async def extract_candidate_profile(self, _profile, _resume_text, _fallback):
+        return []
+
+
+class SlowResumeParserAgent:
+    async def extract_candidate_profile(self, _profile, _resume_text, _fallback):
+        await asyncio.sleep(1)
+        return {}
+
+
+class FallbackEchoResumeParserAgent:
+    async def extract_candidate_profile(self, _profile, _resume_text, fallback):
+        return fallback
 
 
 @pytest.mark.asyncio
@@ -38,6 +109,102 @@ async def test_candidate_profile_builds_structured_snapshot_from_resume(db_sessi
     assert "Python" in serialized["skills"]
     assert "SQL" in serialized["skills"]
     assert serialized["target_preferences"]["role"] == "AI 产品经理"
+
+
+@pytest.mark.asyncio
+async def test_candidate_profile_prefers_agent_resume_parser(db_session) -> None:
+    profile = UserProfile(
+        id="u-candidate-agent-parser",
+        username="candidate-agent-parser",
+        name="杨诗卉",
+        target_role="AI 产品经理",
+        resume_text="这份简历排版复杂，规则解析容易串位。",
+    )
+    db_session.add(profile)
+
+    candidate = await ensure_candidate_profile(
+        db_session,
+        profile,
+        force=True,
+        source="test",
+        llm_agent=FakeResumeParserAgent(),
+    )
+    await db_session.commit()
+
+    assert candidate.completeness == 88
+    assert [item["company"] for item in candidate.experiences] == ["字节跳动", "快手"]
+    assert candidate.education[0]["major"] == "外国语言学及应用语言学"
+
+
+@pytest.mark.asyncio
+async def test_candidate_profile_falls_back_when_agent_returns_non_object(db_session) -> None:
+    profile = UserProfile(
+        id="u-candidate-agent-parser-non-object",
+        username="candidate-agent-parser-non-object",
+        name="杨诗卉",
+        target_role="AI 产品经理",
+        resume_text="教育背景 北京航空航天大学 外国语言学 GPA 3.86/4.0\n技能 Figma SQL Python",
+    )
+    db_session.add(profile)
+
+    candidate = await ensure_candidate_profile(
+        db_session,
+        profile,
+        force=True,
+        source="test",
+        llm_agent=NonObjectResumeParserAgent(),
+    )
+    await db_session.commit()
+
+    assert candidate.field_statuses["_parser"] == "rules"
+    assert candidate.completeness >= 0
+
+
+@pytest.mark.asyncio
+async def test_candidate_profile_falls_back_when_agent_parser_times_out(db_session, monkeypatch) -> None:
+    monkeypatch.setattr(candidate_profile_service, "AGENT_PARSE_TIMEOUT_SECONDS", 0.01)
+    profile = UserProfile(
+        id="u-candidate-agent-parser-timeout",
+        username="candidate-agent-parser-timeout",
+        name="杨诗卉",
+        target_role="AI 产品经理",
+        resume_text="教育背景 北京航空航天大学 外国语言学 GPA 3.86/4.0\n技能 Figma SQL Python",
+    )
+    db_session.add(profile)
+
+    candidate = await ensure_candidate_profile(
+        db_session,
+        profile,
+        force=True,
+        source="test",
+        llm_agent=SlowResumeParserAgent(),
+    )
+    await db_session.commit()
+
+    assert candidate.field_statuses["_parser"] == "rules"
+
+
+@pytest.mark.asyncio
+async def test_candidate_profile_does_not_mark_echoed_rules_as_agent(db_session) -> None:
+    profile = UserProfile(
+        id="u-candidate-agent-parser-rules-echo",
+        username="candidate-agent-parser-rules-echo",
+        name="杨诗卉",
+        target_role="AI 产品经理",
+        resume_text="教育背景 北京航空航天大学 外国语言学 GPA 3.86/4.0\n技能 Figma SQL Python",
+    )
+    db_session.add(profile)
+
+    candidate = await ensure_candidate_profile(
+        db_session,
+        profile,
+        force=True,
+        source="test",
+        llm_agent=FallbackEchoResumeParserAgent(),
+    )
+    await db_session.commit()
+
+    assert candidate.field_statuses["_parser"] == "rules"
 
 
 @pytest.mark.asyncio
@@ -70,6 +237,57 @@ async def test_candidate_profile_keeps_bullets_inside_each_experience(db_session
         "百度 - AIGC策略产品经理 2025.6-2025.9 北京",
     ]
     assert "通过平台合作" in candidate.experiences[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_profile_splits_resume_sections_without_swallowing_project_bullets(db_session) -> None:
+    profile = UserProfile(
+        id="u-candidate-pdf-style-sections",
+        username="candidate-pdf-style-sections",
+        name="候选人",
+        target_role="AI 产品经理",
+        resume_text=(
+            "教育背景\n"
+            "北京航空航天大学 - 外国语言学及应用语言学（硕士） GPA：3.86/4.0 专业第二 2024.9-至今 北京\n"
+            "广东外语外贸大学 - 法语（本科） GPA：3.94/4.0 专业第二 2020.9-2024.7 广州\n"
+            "实习经历\n"
+            "字节跳动 - AI产品经理 2026.3-2026.8 北京\n"
+            "项目1：负责广告素材生成Agent混剪成片链路策略迭代。\n"
+            "项目2：聚焦AIGC广告素材二创Agent迭代。\n"
+            "快手 - AI产品经理 2025.10-2026.3 北京\n"
+            "工作概述：主导3款AI创作工具从0到1落地与迭代。\n"
+            "百度 - AIGC策略产品经理 2025.6-2025.9 北京\n"
+            "工作概述：主导AIGC原生视频自动化链路建设与优化。\n"
+            "项目经历\n"
+            "求职搭子Agent项目 丨独立产品和研发 2026.8\n"
+            "基于竞品调研、用户调研形成产品方案并完成搭建。\n"
+            "AIGC内容账号增长与商业化探索丨独立产品负责人丨已成功变现 2025.2-2025.6\n"
+            "从0到1策划并运营小红书AIGC治愈内容账号。\n"
+            "其他\n"
+            "技能：Python SQL Figma Axure RAG LLM Agent"
+        ),
+    )
+    db_session.add(profile)
+
+    candidate = await ensure_candidate_profile(db_session, profile, force=True, source="test")
+    await db_session.commit()
+
+    assert [item["major"] for item in candidate.education] == ["外国语言学及应用语言学", "法语"]
+    assert [item["company"] for item in candidate.experiences] == ["字节跳动", "快手", "百度"]
+    assert [item["project_name"] for item in candidate.projects] == ["求职搭子Agent项目", "AIGC内容账号增长与商业化探索"]
+    assert "其他" not in candidate.projects[-1]["summary"]
+
+
+def test_candidate_profile_rejects_agent_payload_when_section_coverage_is_missing() -> None:
+    resume_text = (
+        "实习经历\n"
+        "字节跳动 - AI产品经理 2026.3-2026.8 北京\n"
+        "快手 - AI产品经理 2025.10-2026.3 北京\n"
+        "百度 - AIGC策略产品经理 2025.6-2025.9 北京\n"
+    )
+    payload = {"experiences": [{"company": "字节跳动", "role": "AI产品经理"}], "education": [], "projects": []}
+
+    assert not candidate_profile_service.agent_payload_has_expected_coverage(payload, resume_text)
 
 
 @pytest.mark.asyncio

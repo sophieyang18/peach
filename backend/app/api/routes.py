@@ -63,7 +63,7 @@ from backend.app.schemas import (
 from backend.app.services.analytics import analytics_summary, record_product_event
 from backend.app.services.agent import PeachAgent
 from backend.app.services.applications import create_application, delete_application, list_applications, patch_application, serialize_application
-from backend.app.services.candidate_profile import ensure_candidate_profile, ensure_copilot_candidate_profile, serialize_candidate_profile
+from backend.app.services.candidate_profile import BACKGROUND_AGENT_PARSE_TIMEOUT_SECONDS, ensure_candidate_profile, ensure_copilot_candidate_profile, serialize_candidate_profile
 from backend.app.services.companion import build_job_weather, ensure_daily_action, serialize_daily_action, update_daily_action
 from backend.app.services.conversations import delete_conversation, list_conversations, sync_conversations
 from backend.app.services.copilot import build_candidate_snapshot, build_open_answer_prompt, generate_open_answer, map_form_fields, refine_mappings_with_agent, refresh_repeat_actions
@@ -375,7 +375,7 @@ async def read_candidate_profile(session: AsyncSession = Depends(get_session)) -
 @router.post("/candidate-profile/initialize")
 async def initialize_candidate_profile(session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
-    candidate = await ensure_candidate_profile(session, profile, force=True, source="initialize")
+    candidate = await ensure_candidate_profile(session, profile, force=True, source="initialize", llm_agent=agent)
     await session.commit()
     await session.refresh(candidate)
     return {"candidate_profile": serialize_candidate_profile(candidate)}
@@ -715,7 +715,11 @@ async def list_resume_versions(session: AsyncSession = Depends(get_session)) -> 
 
 
 @router.post("/profile/resumes/upload")
-async def upload_resume_version(file: UploadFile = File(...), session: AsyncSession = Depends(get_session)) -> dict:
+async def upload_resume_version(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
     profile = await get_or_create_profile(session)
     parsed = await parse_uploaded_file(file)
     was_resume_empty = not (profile.resume_text or "").strip()
@@ -730,10 +734,8 @@ async def upload_resume_version(file: UploadFile = File(...), session: AsyncSess
     )
     if was_resume_empty:
         profile.resume_text = parsed["content"]
-    candidate = await ensure_candidate_profile(session, profile, force=True, source="resume_upload")
+    candidate = await mark_candidate_profile_parsing(session, profile)
     await award_once(session, profile, "first_resume_uploaded", version.id if version else profile.id, {"filename": parsed["filename"]})
-    if (candidate.completeness or 0) >= 55:
-        await award_once(session, profile, "profile_completed", candidate.id, {"completeness": candidate.completeness})
     await refresh_recommendations_safely(
         session,
         profile,
@@ -744,11 +746,20 @@ async def upload_resume_version(file: UploadFile = File(...), session: AsyncSess
     )
     await session.commit()
     await session.refresh(profile)
+    await session.refresh(candidate)
+    background_tasks.add_task(
+        parse_candidate_profile_after_upload,
+        profile.id,
+        parsed["content"],
+        version.id if version else profile.id,
+    )
     return {
         "file": parsed,
         "resume_version": serialize_resume_version(version) if version else None,
         "resume_versions": await serialized_resume_versions(session, profile.id),
         "profile": serialize_profile(profile),
+        "candidate_profile": serialize_candidate_profile(candidate),
+        "candidate_profile_status": "parsing",
     }
 
 
@@ -795,6 +806,7 @@ async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get
         force=force_recommendations,
     )
     resume_version = None
+    candidate = None
     if (profile.resume_text or "").strip() and normalize_for_compare(previous_resume_text) != normalize_for_compare(profile.resume_text):
         resume_version = await create_resume_version(
             session,
@@ -804,7 +816,7 @@ async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get
             source="profile_save",
             optimized=1 if "优化" in profile.resume_text else 0,
         )
-        candidate = await ensure_candidate_profile(session, profile, force=True, source="profile_save")
+        candidate = await ensure_candidate_profile(session, profile, force=True, source="profile_save", llm_agent=agent)
         if (candidate.completeness or 0) >= 55:
             await award_once(session, profile, "profile_completed", candidate.id, {"completeness": candidate.completeness})
     await session.commit()
@@ -814,6 +826,7 @@ async def upsert_profile(payload: ProfileIn, session: AsyncSession = Depends(get
         "greeting": "个人档案已保存。",
         "resume_version": serialize_resume_version(resume_version) if resume_version else None,
         "resume_versions": await serialized_resume_versions(session, profile.id),
+        "candidate_profile": serialize_candidate_profile(candidate) if candidate else None,
     }
 
 
@@ -1299,7 +1312,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             source="agent_update",
             optimized=1,
         )
-        await ensure_candidate_profile(session, profile, force=True, source="agent_update")
+        candidate = await ensure_candidate_profile(session, profile, force=True, source="agent_update", llm_agent=agent)
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, "简历已更新。")
@@ -1315,6 +1328,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             "profile": serialize_profile(profile),
             "resume_version": serialize_resume_version(resume_version) if resume_version else None,
             "resume_versions": await serialized_resume_versions(session, profile.id),
+            "candidate_profile": serialize_candidate_profile(candidate),
         }
 
     if payload.tool == "append_profile_note":
@@ -1335,7 +1349,9 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
                 source="profile_note",
                 optimized=0,
             )
-            await ensure_candidate_profile(session, profile, force=True, source="profile_note")
+            candidate = await ensure_candidate_profile(session, profile, force=True, source="profile_note", llm_agent=agent)
+        else:
+            candidate = None
         await session.commit()
         await session.refresh(profile)
         await remember_approved_action(profile, payload.tool, data, f"已补充到{title}。")
@@ -1351,6 +1367,7 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
             "profile": serialize_profile(profile),
             "resume_version": serialize_resume_version(resume_version) if resume_version else None,
             "resume_versions": await serialized_resume_versions(session, profile.id),
+            "candidate_profile": serialize_candidate_profile(candidate) if candidate else None,
         }
 
     if payload.tool == "add_knowledge_item":
@@ -1935,6 +1952,74 @@ async def refresh_recommendations_after_commit(
             await recommendation_session.rollback()
 
 
+async def mark_candidate_profile_parsing(session: AsyncSession, profile: UserProfile) -> CandidateProfile:
+    candidate = (
+        await session.execute(select(CandidateProfile).where(CandidateProfile.user_id == profile.id).limit(1))
+    ).scalar_one_or_none()
+    if not candidate:
+        candidate = CandidateProfile(
+            user_id=profile.id,
+            basics={"name": profile.name or "同学"},
+            education=[],
+            experiences=[],
+            projects=[],
+            skills=[],
+            target_preferences={
+                "role": profile.target_role or "产品经理",
+                "company": profile.target_company or "",
+                "city": profile.target_city or "",
+                "stage": profile.stage or "投递期",
+            },
+            field_statuses={},
+            completeness=0,
+            source="resume_upload_parsing",
+        )
+        session.add(candidate)
+    statuses = dict(candidate.field_statuses or {})
+    statuses["_parser"] = "parsing"
+    candidate.field_statuses = statuses
+    candidate.source = "resume_upload_parsing"
+    await session.flush()
+    return candidate
+
+
+async def parse_candidate_profile_after_upload(user_id: str, resume_text: str, source_id: str = "") -> None:
+    async with SessionLocal() as session:
+        try:
+            profile = await session.get(UserProfile, user_id)
+            if not profile:
+                return
+            candidate = await ensure_candidate_profile(
+                session,
+                profile,
+                force=True,
+                source="resume_upload",
+                llm_agent=agent,
+                resume_text_override=resume_text,
+                agent_timeout_seconds=BACKGROUND_AGENT_PARSE_TIMEOUT_SECONDS,
+            )
+            if (candidate.field_statuses or {}).get("_parser") != "agent":
+                statuses = dict(candidate.field_statuses or {})
+                statuses["_parser"] = "failed"
+                candidate.field_statuses = statuses
+                candidate.source = "resume_upload_failed"
+            elif (candidate.completeness or 0) >= 55:
+                await award_once(session, profile, "profile_completed", candidate.id, {"completeness": candidate.completeness})
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            async with SessionLocal() as failure_session:
+                candidate = (
+                    await failure_session.execute(select(CandidateProfile).where(CandidateProfile.user_id == user_id).limit(1))
+                ).scalar_one_or_none()
+                if candidate:
+                    statuses = dict(candidate.field_statuses or {})
+                    statuses["_parser"] = "failed"
+                    candidate.field_statuses = statuses
+                    candidate.source = "resume_upload_failed"
+                    await failure_session.commit()
+
+
 async def cleanup_interview_related_data(session: AsyncSession, user_id: str, interview: InterviewSession) -> None:
     interview_id = interview.id
     title_bits = [interview.company or "", interview.role or ""]
@@ -2397,6 +2482,7 @@ async def parse_uploaded_file(file: UploadFile) -> dict:
         "title": parsed.filename or filename,
         "summary": parsed.summary,
         "content": parsed.content,
+        "content_html": parsed.content_html,
         "size": len(content),
         "warning": parsed.warning,
     }

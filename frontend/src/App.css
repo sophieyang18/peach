@@ -3443,6 +3443,186 @@ button:active,
     background 180ms ease;
 }
 
+.resume-rich-editor {
+  overflow: auto;
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 16px 18px;
+  outline: none;
+  font-family: "Songti SC", "Noto Serif CJK SC", Georgia, serif;
+  font-size: 15px;
+  line-height: 1.72;
+  white-space: normal;
+}
+
+.resume-rich-editor:empty::before {
+  content: attr(data-placeholder);
+  color: rgba(127, 89, 105, 0.58);
+  font-family: inherit;
+}
+
+.resume-rich-editor:focus {
+  border-color: #f6a6c5;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 0 0 4px rgba(230, 82, 124, 0.08);
+}
+
+.resume-rich-editor h3 {
+  margin: 16px 0 8px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 19px;
+  line-height: 1.35;
+}
+
+.resume-rich-editor h3:first-child {
+  margin-top: 0;
+}
+
+.resume-rich-bullet {
+  position: relative;
+  padding-left: 18px;
+}
+
+.resume-rich-bullet::before {
+  position: absolute;
+  left: 2px;
+  content: "•";
+  color: var(--accent-strong);
+}
+
+.internship-editor {
+  display: grid;
+  gap: 12px;
+}
+
+.internship-editor .profile-card-head button {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--accent-strong);
+  padding: 0 12px;
+  font-weight: 900;
+}
+
+.award-add-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-start;
+}
+
+.profile-inline-add-button {
+  justify-self: start;
+  min-height: 38px;
+  border: 1px dashed #f3a8c0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--accent-strong);
+  padding: 0 16px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.profile-inline-add-button:hover {
+  border-style: solid;
+  background: linear-gradient(135deg, var(--soft), var(--warm));
+}
+
+.internship-form-list {
+  display: grid;
+  gap: 12px;
+}
+
+.internship-form-card,
+.internship-extra-field {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 250, 246, 0.74);
+  padding: 14px;
+}
+
+.internship-form-card {
+  display: grid;
+  gap: 10px;
+}
+
+.internship-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.internship-form-grid label,
+.internship-extra-field {
+  display: grid;
+  gap: 7px;
+  color: #6b515e;
+  font-weight: 900;
+}
+
+.internship-form-grid span,
+.internship-extra-field span {
+  font-size: 13px;
+}
+
+.internship-form-grid input,
+.internship-form-grid select,
+.internship-form-grid textarea,
+.internship-extra-field textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #ead8d2;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--text);
+  padding: 10px 12px;
+  font: inherit;
+  font-weight: 650;
+  outline: none;
+}
+
+.internship-form-grid select {
+  appearance: auto;
+}
+
+.internship-form-grid textarea,
+.internship-extra-field textarea {
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.internship-date-field,
+.internship-description-field {
+  grid-column: 1 / -1;
+}
+
+.education-gpa-field {
+  max-width: 180px;
+}
+
+.internship-date-field > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.internship-date-field i {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.internship-delete-button {
+  justify-self: end;
+  min-height: 32px;
+  border: 0;
+  background: transparent;
+  color: #8a7280;
+  font-weight: 900;
+}
+
 .profile-action-result,
 .profile-empty-hint {
   min-height: 0;
@@ -4312,7 +4492,7 @@ button:active,
 
 .growth-hero {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 260px;
+  grid-template-columns: minmax(0, 1fr);
   align-items: end;
   gap: 18px;
   margin-bottom: 18px;
@@ -4335,29 +4515,6 @@ button:active,
   margin-top: 8px;
   color: var(--muted);
   font-size: 14px;
-}
-
-.readiness-card {
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  background: linear-gradient(135deg, rgba(255, 242, 248, 0.9), rgba(255, 250, 220, 0.9));
-  padding: 16px;
-}
-
-.readiness-card span,
-.readiness-card small {
-  display: block;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 850;
-}
-
-.readiness-card strong {
-  display: block;
-  margin: 5px 0;
-  color: var(--accent-strong);
-  font-size: 34px;
-  line-height: 1;
 }
 
 .growth-grid {
@@ -4433,12 +4590,126 @@ button:active,
   background: linear-gradient(135deg, var(--accent), #ef965f);
 }
 
-.next-training-card h2 {
+.ability-radar {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(220px, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.ability-radar svg {
+  width: 100%;
+  max-width: 320px;
+  justify-self: center;
+}
+
+.radar-ring {
+  fill: rgba(255, 242, 248, 0.38);
+  stroke: rgba(235, 160, 187, 0.62);
+  stroke-width: 1;
+}
+
+.radar-axis {
+  stroke: rgba(126, 94, 108, 0.24);
+  stroke-width: 1;
+}
+
+.radar-score {
+  fill: rgba(230, 82, 124, 0.2);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.radar-dot {
+  fill: #fff;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.ability-radar text {
+  fill: #6b515e;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.ability-radar-list {
+  display: grid;
+  gap: 8px;
+}
+
+.ability-radar-list article {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.8fr) auto;
+  align-items: center;
+  gap: 4px 10px;
+  border: 1px solid rgba(240, 215, 209, 0.8);
+  border-radius: 14px;
+  background: rgba(255, 250, 246, 0.68);
+  padding: 10px 12px;
+}
+
+.ability-radar-list span,
+.ability-radar-list strong {
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.ability-radar-list strong {
+  color: var(--accent-strong);
+}
+
+.ability-radar-list small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.ability-radar-empty {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.readiness-training-card {
+  align-self: start;
+}
+
+.readiness-summary {
+  border: 1px solid rgba(240, 215, 209, 0.88);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(255, 242, 248, 0.9), rgba(255, 250, 220, 0.9));
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+.readiness-summary strong {
+  display: block;
+  color: var(--accent-strong);
+  font-size: 34px;
+  line-height: 1;
+}
+
+.readiness-summary p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.6;
+}
+
+.growth-card-head.compact {
+  margin-top: 4px;
+}
+
+.next-training-card h2,
+.readiness-training-card h2 {
   margin: 8px 0;
   font-size: 24px;
 }
 
 .next-training-card p,
+.readiness-training-card > p,
 .trend-card p,
 .insight-card p,
 .issue-column p {
@@ -4446,7 +4717,8 @@ button:active,
   line-height: 1.65;
 }
 
-.next-training-card button {
+.next-training-card button,
+.readiness-training-card button {
   min-height: 40px;
   margin-top: 12px;
   border: 0;
@@ -5755,6 +6027,52 @@ button:active,
   gap: 12px;
 }
 
+.upload-parsing-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 248, 250, 0.42);
+  backdrop-filter: blur(2px);
+  pointer-events: auto;
+}
+
+.upload-parsing-dialog {
+  width: min(320px, calc(100vw - 48px));
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  border: 1px solid rgba(255, 184, 211, 0.72);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 22px 60px rgba(219, 82, 127, 0.18);
+  padding: 24px 22px;
+  color: var(--text);
+  text-align: center;
+}
+
+.upload-parsing-dialog strong {
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.upload-parsing-dialog p {
+  margin: 0;
+  color: #8b7480;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.upload-parsing-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 4px solid rgba(255, 196, 217, 0.68);
+  border-top-color: var(--accent);
+  animation: uploadSpin 0.82s linear infinite;
+}
+
 .skeleton-panel,
 .skeleton-line {
   overflow: hidden;
@@ -5785,6 +6103,12 @@ button:active,
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes uploadSpin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
@@ -6040,11 +6364,21 @@ button:active,
   }
 
   .applications-grid,
+  .growth-grid,
   .job-recommendation-grid {
     grid-template-columns: 1fr;
   }
 
+  .ability-radar {
+    grid-template-columns: 1fr;
+  }
+
   .application-form {
+    grid-template-columns: 1fr;
+  }
+
+  .internship-form-grid,
+  .internship-date-field > div {
     grid-template-columns: 1fr;
   }
 

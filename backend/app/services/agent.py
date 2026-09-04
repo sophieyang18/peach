@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+import re
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -6,6 +9,8 @@ from openai import AsyncOpenAI
 from backend.app.core.config import get_settings
 from backend.app.models import InterviewSession, UserProfile
 
+
+logger = logging.getLogger(__name__)
 
 PEACH_PERSONA = """
 你是「桃子」，一个刚上岸大厂的求职面试搭子。你温暖、靠谱、有点幽默，像朋友聊天。
@@ -95,7 +100,16 @@ class PeachAgent:
             self.client = None
         return self.client
 
-    async def complete(self, messages: list[dict[str, str]], fallback: str, allow_fallback: bool = True) -> str:
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        fallback: str,
+        allow_fallback: bool = True,
+        *,
+        system_prompt: str = PEACH_PERSONA,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> str:
         client = self.get_client()
         if not client:
             if not allow_fallback:
@@ -103,10 +117,15 @@ class PeachAgent:
             return fallback
 
         try:
+            request: dict[str, Any] = {
+                "model": self.settings.deepseek_model,
+                "messages": [{"role": "system", "content": system_prompt}, *messages] if system_prompt else messages,
+                "temperature": temperature,
+            }
+            if max_tokens is not None:
+                request["max_tokens"] = max_tokens
             response = await client.chat.completions.create(
-                model=self.settings.deepseek_model,
-                messages=[{"role": "system", "content": PEACH_PERSONA}, *messages],
-                temperature=0.7,
+                **request,
             )
             content = response.choices[0].message.content or ""
             if not content.strip() and not allow_fallback:
@@ -122,6 +141,10 @@ class PeachAgent:
         messages: list[dict[str, str]],
         fallback: dict[str, Any],
         allow_fallback: bool = True,
+        *,
+        system_prompt: str = PEACH_PERSONA,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         content = await self.complete(
             [
@@ -133,6 +156,9 @@ class PeachAgent:
             ],
             json.dumps(fallback, ensure_ascii=False),
             allow_fallback=allow_fallback,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         try:
             return sanitize_json_value(json.loads(content))
@@ -166,6 +192,88 @@ class PeachAgent:
 JSON 字段：strengths(list[str]), weak_points(list[str]), plan(list[{{day,title,focus}}]), greeting(str)
 """
         return await self.json_complete([{"role": "user", "content": prompt}], fallback)
+
+    async def extract_candidate_profile(
+        self,
+        profile: UserProfile,
+        resume_text: str,
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        sections = split_resume_for_agent(resume_text)
+        system_prompt = "你是简历结构化信息抽取引擎。只输出严格 JSON object，不输出解释。"
+
+        async def parse_section(key: str, prompt: str, section_fallback: dict[str, Any], max_tokens: int) -> dict[str, Any]:
+            source = sections.get(key) or resume_text[:5000]
+            if not source.strip():
+                return section_fallback
+            try:
+                return await asyncio.wait_for(
+                    self.json_complete(
+                        [{"role": "user", "content": prompt.format(source=source[:6000])}],
+                        section_fallback,
+                        allow_fallback=False,
+                        system_prompt=system_prompt,
+                        temperature=0,
+                        max_tokens=max_tokens,
+                    ),
+                    timeout=18,
+                )
+            except Exception as exc:
+                logger.warning("Candidate profile %s section agent parser failed: %s", key, exc)
+                return section_fallback
+
+        education_prompt = """
+把下面教育经历转成 JSON object。只输出这个格式：
+{{"education":[{{"title":"","school":"","degree":"","college":"","major":"","ranking":"","gpa":"","gpa_total":"","start_date":"","end_date":"","summary":"","status":"confirmed"}}]}}
+要求：一所学校一条；不要把“专业第二”填成专业；不确定字段填空字符串；不要编造。
+教育经历：
+{source}
+"""
+        experiences_prompt = """
+把下面实习经历转成 JSON object。只输出这个格式：
+{{"experiences":[{{"title":"","company":"","role":"","location":"","start_date":"","end_date":"","summary":"","status":"confirmed"}}]}}
+要求：一个公司一条；company 只填公司名；role 只填职位名；summary 保留该公司下事实，不要编造。
+实习经历：
+{source}
+"""
+        projects_prompt = """
+从下面简历片段抽取项目经历为 JSON object。
+要求：
+- projects 按项目名称拆分，一个项目一条，不要把项目正文 bullet 拆成多个项目。
+- project_name 只填项目名，role 只填角色。
+- summary 保留目标、行动、结果和数据，可压缩，不要新增事实。
+字段：
+projects: [{{title, project_name, role, start_date, end_date, link, summary, status}}]
+简历片段：
+{source}
+"""
+        profile_prompt = """
+把下面简历转成 JSON object。只输出这个格式：
+{{"basics":{{"name":"","gender":"","birth_date":"","hometown":"","current_residence":"","political_status":"","english_level":"","self_evaluation":""}},"skills":[]}}
+要求：不要输出手机号、邮箱、身份证；skills 只列技能词；不要编造。
+简历：
+{source}
+"""
+        education_data = await parse_section("education", education_prompt, {"education": fallback.get("education", [])}, 1400)
+        experiences_data = await parse_section("experiences", experiences_prompt, {"experiences": fallback.get("experiences", [])}, 2200)
+        projects_data = await parse_section("projects", projects_prompt, {"projects": fallback.get("projects", [])}, 1800)
+        profile_data = await parse_section("profile", profile_prompt, {"basics": fallback.get("basics", {}), "skills": fallback.get("skills", [])}, 900)
+        return {
+            "basics": profile_data.get("basics") or fallback.get("basics", {}),
+            "target_preferences": {
+                "role": profile.target_role,
+                "company": profile.target_company,
+                "city": profile.target_city,
+                "stage": profile.stage,
+                "career_objective": "",
+            },
+            "education": education_data.get("education") or fallback.get("education", []),
+            "experiences": experiences_data.get("experiences") or fallback.get("experiences", []),
+            "projects": projects_data.get("projects") or fallback.get("projects", []),
+            "skills": profile_data.get("skills") or fallback.get("skills", []),
+            "field_statuses": {},
+            "completeness": 0,
+        }
 
     async def daily_checkin(self, profile: UserProfile, recent_records: list[Any]) -> dict[str, Any]:
         fallback = {
@@ -685,6 +793,35 @@ def infer_role(text: str, fallback: str) -> str:
     return fallback
 
 
+RESUME_SECTION_HEADING_PATTERN = (
+    r"(?:教育背景|教育经历|实习经历|工作经历|实践经历|项目经历|项目经验|作品经历|"
+    r"个人技能|专业技能|技能|其他|竞赛经历|获奖经历|荣誉经历|校园经历|求职意向|自我评价)"
+)
+
+
+def split_resume_for_agent(resume_text: str) -> dict[str, str]:
+    return {
+        "education": resume_section_for_agent(resume_text, ["教育背景", "教育经历"], 5000),
+        "experiences": resume_section_for_agent(resume_text, ["实习经历", "工作经历", "实践经历"], 7000),
+        "projects": resume_section_for_agent(resume_text, ["项目经历", "项目经验", "作品经历"], 5000),
+        "profile": str(resume_text or "")[:6000],
+    }
+
+
+def resume_section_for_agent(resume_text: str, markers: list[str], limit: int) -> str:
+    text = str(resume_text or "").replace("\r\n", "\n")
+    if not text.strip():
+        return ""
+    for marker in markers:
+        match = re.search(rf"(?:^|\n)\s*{re.escape(marker)}[:：]?\s*([\s\S]{{0,{limit}}})", text, flags=re.I)
+        if not match:
+            continue
+        excerpt = match.group(1).strip()
+        next_section = re.search(rf"\n\s*{RESUME_SECTION_HEADING_PATTERN}\s*[:：]?\s*(?=\n|$)", excerpt, flags=re.I)
+        return excerpt[: next_section.start()].strip() if next_section and next_section.start() > 20 else excerpt
+    return ""
+
+
 def infer_profile_section(text: str) -> tuple[str, str]:
     if "复盘" in text:
         return "reviews", "面试复盘"
@@ -696,8 +833,8 @@ def infer_profile_section(text: str) -> tuple[str, str]:
         return "education", "教育背景"
     if "技能" in text:
         return "skills", "个人技能"
-    if "竞赛" in text or "比赛" in text:
-        return "competition", "竞赛经历"
+    if "获奖" in text or "奖项" in text or "荣誉" in text or "竞赛" in text or "比赛" in text:
+        return "competition", "获奖经历"
     return "full", "完整简历"
 
 

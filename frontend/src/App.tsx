@@ -347,6 +347,7 @@ type ParsedUpload = {
   title: string
   summary: string
   content: string
+  content_html?: string
   size?: number
   warning?: string
 }
@@ -354,6 +355,8 @@ type ParsedUpload = {
 type ProfileUploadResult = {
   file: ParsedUpload
   profile?: Profile
+  candidate_profile?: CandidateProfile
+  candidate_profile_status?: string
   resume_versions?: ResumeVersion[]
 }
 
@@ -454,9 +457,9 @@ const profileSectionMeta: Record<ProfileSectionId, { title: string; summary: str
     helper: '适合列出工具、方法论、数据能力、行业理解、表达协作能力和熟练程度。',
   },
   competition: {
-    title: '竞赛经历',
-    summary: '记录比赛角色、方案亮点、排名和复盘收获。',
-    helper: '建议写清比赛背景、你的角色、方案亮点、结果排名和能迁移到岗位的能力。',
+    title: '获奖经历',
+    summary: '记录竞赛奖项、荣誉称号、级别、时间和可迁移能力。',
+    helper: '建议写清奖项类型、级别、名称、获奖等级、时间和能迁移到岗位的能力。',
   },
 }
 
@@ -603,6 +606,8 @@ function App() {
   const [profileMessages, setProfileMessages] = useState<ChatMessage[]>([])
   const [resumeFiles, setResumeFiles] = useState<ParsedUpload[]>([])
   const [resumeVersions, setResumeVersions] = useState<ResumeVersion[]>([])
+  const [resumeRichHtml, setResumeRichHtml] = useState('')
+  const [resumeAgentParsingMessage, setResumeAgentParsingMessage] = useState('')
   const [knowledgeQuestion, setKnowledgeQuestion] = useState('')
   const [knowledgeMessages, setKnowledgeMessages] = useState<ChatMessage[]>([])
   const [personalKnowledge, setPersonalKnowledge] = useState<KnowledgeItem[]>([])
@@ -669,6 +674,7 @@ function App() {
   const anonymousIdRef = useRef(getOrCreateClientId('peach:anonymous-id'))
   const sessionIdRef = useRef(`session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
   const summarizingKnowledgeRef = useRef<Set<string>>(new Set())
+  const candidateProfilePollRef = useRef<number | undefined>(undefined)
 
   const profile = dashboard?.profile ?? defaultProfile
   const activeConversation = conversations.find((item) => item.id === activeConversationId) ?? conversations[0]
@@ -762,6 +768,56 @@ function App() {
       return next
     })
   }, [])
+
+  const applyAgentCandidateProfile = useCallback((candidate: CandidateProfile) => {
+    if (!isAgentParsedCandidateProfile(candidate)) return false
+    setDashboard((current) => (current ? { ...current, candidate_profile: candidate } : current))
+    setProfileSections((current) => {
+      const internships = serializeInternshipExperiences(normalizeCandidateExperiences(candidate.experiences))
+      const projects = serializeProjectExperiences(normalizeCandidateProjects(candidate.projects))
+      const education = serializeEducationExperiences(normalizeCandidateEducation(candidate.education))
+      return {
+        ...current,
+        ...(internships ? { internship: internships } : {}),
+        ...(projects ? { project: projects } : {}),
+        ...(education ? { education } : {}),
+      }
+    })
+    return true
+  }, [])
+
+  const pollCandidateProfileAfterUpload = useCallback(async () => {
+    if (candidateProfilePollRef.current) {
+      window.clearTimeout(candidateProfilePollRef.current)
+      candidateProfilePollRef.current = undefined
+    }
+    const startedAt = Date.now()
+    const poll = async () => {
+      try {
+        const data = await api<{ candidate_profile: CandidateProfile }>('/api/candidate-profile')
+        const parser = candidateProfileParserStatus(data.candidate_profile)
+        if (parser === 'agent' && applyAgentCandidateProfile(data.candidate_profile)) {
+          setResumeAgentParsingMessage('')
+          setNotice('简历深度解析完成，已更新结构化档案。')
+          return
+        }
+        if (parser === 'failed') {
+          setResumeAgentParsingMessage('')
+          setNotice('简历深度解析暂时失败，建议稍后重新上传或检查模型连接。')
+          return
+        }
+      } catch (err) {
+        console.error(err)
+      }
+      if (Date.now() - startedAt >= 120000) {
+        setResumeAgentParsingMessage('')
+        setNotice('简历深度解析仍在进行，可稍后刷新档案查看结果。')
+        return
+      }
+      candidateProfilePollRef.current = window.setTimeout(() => void poll(), 2500)
+    }
+    await poll()
+  }, [api, applyAgentCandidateProfile])
 
   const stopTts = useCallback(() => {
     if ('speechSynthesis' in window) window.speechSynthesis.cancel()
@@ -865,6 +921,7 @@ function App() {
     setProfileMessages([])
     setResumeFiles([])
     setResumeVersions([])
+    setResumeRichHtml('')
     setKnowledgeQuestion('')
     setKnowledgeMessages([])
     setPersonalKnowledge([])
@@ -1046,6 +1103,12 @@ function App() {
     if (!account) return
     void refreshDashboard()
   }, [account, refreshDashboard])
+
+  useEffect(() => {
+    return () => {
+      if (candidateProfilePollRef.current) window.clearTimeout(candidateProfilePollRef.current)
+    }
+  }, [])
 
   useEffect(() => {
     if (!account?.username) return
@@ -1336,6 +1399,7 @@ function App() {
       const data = await api<{ profile: Profile; resume_version: ResumeVersion }>(`/api/profile/resumes/${resume.id}/restore`, { method: 'POST' })
       setDashboard((current) => (current ? { ...current, profile: data.profile } : current))
       updateProfileSection('full', data.profile.resume_text || resume.content)
+      setResumeRichHtml('')
       setNotice(`已切换到第 ${resume.version_no} 版简历。`)
     } catch (err) {
       setError('简历版本切换失败。')
@@ -1437,6 +1501,7 @@ function App() {
         deleted_knowledge_id?: string
         resume_versions?: ResumeVersion[]
         resume_version?: ResumeVersion | null
+        candidate_profile?: CandidateProfile | null
         job_recommendations?: JobOpportunity[]
       }>('/api/agent/actions/execute', {
         method: 'POST',
@@ -1477,11 +1542,18 @@ function App() {
       deleted_knowledge_id?: string
       resume_versions?: ResumeVersion[]
       resume_version?: ResumeVersion | null
+      candidate_profile?: CandidateProfile | null
     },
   ) {
     if (data.profile) {
-      setDashboard((current) => (current ? { ...current, profile: data.profile as Profile } : current))
+      setDashboard((current) => (
+        current
+          ? { ...current, profile: data.profile as Profile, candidate_profile: data.candidate_profile || current.candidate_profile }
+          : current
+      ))
       setProfileSections((current) => syncProfileSectionsFromAction(current, action, data.profile as Profile))
+    } else if (data.candidate_profile) {
+      setDashboard((current) => (current ? { ...current, candidate_profile: data.candidate_profile || current.candidate_profile } : current))
     }
     if (data.knowledge) {
       setPersonalKnowledge((current) => [data.knowledge as KnowledgeItem, ...current.filter((item) => item.id !== data.knowledge?.id)])
@@ -1890,6 +1962,7 @@ function App() {
   }
 
   function updateProfileSection(id: ProfileSectionId, content: string) {
+    if (id === 'full') setResumeRichHtml('')
     setProfileSections((current) => ({ ...current, [id]: content }))
   }
 
@@ -1943,7 +2016,7 @@ function App() {
   async function saveProfileSections(nextSections = profileSections) {
     begin('profile', '正在保存个人档案')
     try {
-      const data = await api<{ profile: Profile; greeting?: string; resume_versions?: ResumeVersion[]; resume_version?: ResumeVersion | null }>('/api/profile', {
+      const data = await api<{ profile: Profile; greeting?: string; candidate_profile?: CandidateProfile | null; resume_versions?: ResumeVersion[]; resume_version?: ResumeVersion | null }>('/api/profile', {
         method: 'POST',
         body: JSON.stringify({
           name: profile.name,
@@ -1955,7 +2028,7 @@ function App() {
           resume_text: composeProfileResumeText(nextSections),
         }),
       })
-      setDashboard((current) => (current ? { ...current, profile: data.profile } : current))
+      setDashboard((current) => (current ? { ...current, profile: data.profile, candidate_profile: data.candidate_profile || current.candidate_profile } : current))
       if (data.resume_versions) setResumeVersions(data.resume_versions)
       setNotice('个人档案已保存。')
     } catch (err) {
@@ -2496,16 +2569,88 @@ function App() {
         ? await uploadApi<ProfileUploadResult>('/api/profile/resumes/upload', file)
         : await uploadApi<ProfileUploadResult>('/api/files/parse', file)
       const content = `【${data.file.title}】\n${data.file.content}`
-      updateProfileSection(
-        activeProfileSection,
-        [profileSections[activeProfileSection], content].filter(Boolean).join('\n\n'),
-      )
+      setProfileSections((current) => {
+        const next = {
+          ...current,
+          [activeProfileSection]: [current[activeProfileSection], content].filter(Boolean).join('\n\n'),
+        }
+        if (activeProfileSection === 'full') {
+          const useAgentProfile = isAgentParsedCandidateProfile(data.candidate_profile)
+          const useLegacyFallback = !data.candidate_profile
+          const candidateInternships = serializeInternshipExperiences(normalizeCandidateExperiences(data.candidate_profile?.experiences))
+          const extractedInternships = useAgentProfile ? candidateInternships : useLegacyFallback ? serializeInternshipExperiences(extractInternshipExperiences(data.file.content)) : ''
+          if (extractedInternships) {
+            next.internship = extractedInternships
+          }
+          const candidateProjects = serializeProjectExperiences(normalizeCandidateProjects(data.candidate_profile?.projects))
+          const extractedProjects = useAgentProfile ? candidateProjects : useLegacyFallback ? serializeProjectExperiences(extractProjectExperiences(data.file.content)) : ''
+          if (extractedProjects) {
+            next.project = extractedProjects
+          }
+          const candidateEducation = serializeEducationExperiences(normalizeCandidateEducation(data.candidate_profile?.education))
+          const extractedEducation = useAgentProfile ? candidateEducation : useLegacyFallback ? serializeEducationExperiences(extractEducationExperiences(data.file.content)) : ''
+          if (extractedEducation) {
+            next.education = extractedEducation
+          }
+          const extractedAwards = serializeAwardExperiences(extractAwardExperiences(data.file.content))
+          if (extractedAwards) {
+            next.competition = extractedAwards
+          }
+        }
+        if (activeProfileSection === 'internship') {
+          const normalizedInternships = serializeInternshipExperiences(extractInternshipExperiences(data.file.content || content))
+          if (normalizedInternships) {
+            next.internship = mergeProfileSectionContent(current.internship, normalizedInternships)
+          }
+        }
+        if (activeProfileSection === 'project') {
+          const normalizedProjects = serializeProjectExperiences(extractProjectExperiences(data.file.content || content))
+          if (normalizedProjects) {
+            next.project = mergeProfileSectionContent(current.project, normalizedProjects)
+          }
+        }
+        if (activeProfileSection === 'education') {
+          const normalizedEducation = serializeEducationExperiences(extractEducationExperiences(data.file.content || content))
+          if (normalizedEducation) {
+            next.education = mergeProfileSectionContent(current.education, normalizedEducation)
+          }
+        }
+        if (activeProfileSection === 'competition') {
+          const normalizedAwards = serializeAwardExperiences(extractAwardExperiences(data.file.content || content))
+          if (normalizedAwards) {
+            next.competition = mergeProfileSectionContent(current.competition, normalizedAwards)
+          }
+        }
+        return next
+      })
       if (activeProfileSection === 'full') {
+        setResumeRichHtml(data.file.content_html || '')
         setResumeFiles((current) => [data.file, ...current.filter((item) => item.filename !== data.file.filename)])
         if (data.resume_versions) setResumeVersions(data.resume_versions)
-        if (data.profile) setDashboard((current) => (current ? { ...current, profile: data.profile as Profile } : current))
+        if (data.profile || data.candidate_profile) {
+          setDashboard((current) => (
+            current
+              ? {
+                  ...current,
+                  profile: (data.profile as Profile) || current.profile,
+                  candidate_profile: data.candidate_profile || current.candidate_profile,
+                }
+              : current
+          ))
+        }
+        const parserStatus = candidateProfileParserStatus(data.candidate_profile)
+        if (parserStatus === 'parsing') {
+          setResumeAgentParsingMessage('桃子正在深度解析简历，完成后会自动更新结构化档案。')
+          void pollCandidateProfileAfterUpload()
+        } else if (parserStatus === 'agent' && data.candidate_profile) {
+          applyAgentCandidateProfile(data.candidate_profile)
+        }
       }
-      setNotice(data.file.warning || `已补充到${profileSectionMeta[activeProfileSection].title}。`)
+      if (activeProfileSection === 'full' && candidateProfileParserStatus(data.candidate_profile) === 'parsing') {
+        setNotice(data.file.warning || '简历已上传，桃子正在深度解析结构化档案。')
+      } else {
+        setNotice(data.file.warning || `已补充到${profileSectionMeta[activeProfileSection].title}。`)
+      }
     } catch (err) {
       setError(fileUploadErrorMessage(err))
       console.error(err)
@@ -2672,6 +2817,7 @@ function App() {
 
   return (
     <main className={appClass}>
+      {dashboard && (busy.upload || resumeAgentParsingMessage) ? <UploadParsingOverlay message={busy.upload || resumeAgentParsingMessage} /> : null}
       <aside className="main-nav" aria-label="主导航栏">
         <nav className="main-nav-list">
           <button
@@ -2883,6 +3029,7 @@ function App() {
             messages={profileMessages}
             resumeFiles={resumeFiles}
             resumeVersions={resumeVersions}
+            resumeRichHtml={resumeRichHtml}
             isSaving={Boolean(busy.profile)}
             value={profileInput}
             onSelectSection={selectProfileSection}
@@ -3698,6 +3845,7 @@ function ProfileWorkspace({
   messages,
   resumeFiles,
   resumeVersions,
+  resumeRichHtml,
   isSaving,
   value,
   onSelectSection,
@@ -3727,6 +3875,7 @@ function ProfileWorkspace({
   messages: ChatMessage[]
   resumeFiles: ParsedUpload[]
   resumeVersions: ResumeVersion[]
+  resumeRichHtml: string
   isSaving: boolean
   value: string
   onSelectSection: (id: ProfileSectionId) => void
@@ -3928,14 +4077,32 @@ function ProfileWorkspace({
           {activeSection === 'reviews' ? null : (
             <>
               {activeSection === 'full' ? <ResumeInsightCard profile={profile} sectionContent={sectionContent} resumeFiles={resumeFiles} /> : null}
-              {(activeSection === 'internship' || activeSection === 'project') ? <ExperienceNameList title={current.title} content={sectionContent} /> : null}
-              <textarea
-                className="profile-editor"
-                value={sectionContent}
-                onChange={(event) => onSectionContent(event.target.value)}
-                placeholder={`在这里整理${current.title}。桃子会基于这些内容帮你生成简历、优化表达和准备追问题。`}
-                rows={10}
-              />
+              {activeSection === 'full' ? (
+                <FullResumeEditor
+                  value={sectionContent}
+                  htmlValue={resumeRichHtml}
+                  onChange={onSectionContent}
+                  placeholder={`在这里整理${current.title}。桃子会基于这些内容帮你生成简历、优化表达和准备追问题。`}
+                />
+              ) : activeSection === 'internship' ? (
+                <InternshipExperienceEditor content={sectionContent} onChange={onSectionContent} />
+              ) : activeSection === 'project' ? (
+                <ProjectExperienceEditor content={sectionContent} onChange={onSectionContent} />
+              ) : activeSection === 'education' ? (
+                <EducationExperienceEditor content={sectionContent} onChange={onSectionContent} />
+              ) : activeSection === 'competition' ? (
+                <AwardExperienceEditor content={sectionContent} onChange={onSectionContent} />
+              ) : (
+                <>
+                  <textarea
+                    className="profile-editor"
+                    value={sectionContent}
+                    onChange={(event) => onSectionContent(event.target.value)}
+                    placeholder={`在这里整理${current.title}。桃子会基于这些内容帮你生成简历、优化表达和准备追问题。`}
+                    rows={10}
+                  />
+                </>
+              )}
             </>
           )}
 
@@ -3948,7 +4115,7 @@ function ProfileWorkspace({
               <p>{actionResult}</p>
             </section>
           ) : (
-            activeSection === 'reviews' || activeSection === 'full' ? null : (
+            activeSection === 'reviews' || activeSection === 'full' || activeSection === 'internship' || activeSection === 'project' || activeSection === 'education' || activeSection === 'competition' ? null : (
               <section className="profile-empty-hint" aria-label="当前分区状态">
                 <strong>{sectionContent.trim() ? '这部分内容已记录，后续可继续优化。' : '当前文件暂无内容。'}</strong>
               </section>
@@ -4417,7 +4584,8 @@ function GrowthWorkspace({
   onStartTraining: (prompt: string) => void
 }) {
   const data = growth ?? emptyGrowthCenter(profile)
-  const topAbility = [...data.abilities]
+  const visibleAbilities = data.abilities.filter((ability) => !['project_deep_dive', 'project_management'].includes(ability.dimension))
+  const topAbility = [...visibleAbilities]
     .filter((item) => item.current_score !== null)
     .sort((a, b) => (b.gap ?? 0) - (a.gap ?? 0))[0]
 
@@ -4426,13 +4594,7 @@ function GrowthWorkspace({
       <header className="growth-hero">
         <div>
           <p>成长中心</p>
-          <h1>你现在在哪里，下一步练什么</h1>
-          <span>{data.target.company ? `${data.target.company} · ` : ''}{data.target.role || profile.target_role}</span>
-        </div>
-        <div className="readiness-card">
-          <span>岗位准备度</span>
-          <strong>{data.readiness_score ? `${data.readiness_score}%` : '待评估'}</strong>
-          <small>{data.target.jd_status || '当前按照产品经理通用能力模型评估'}</small>
+          <h1>成长中心</h1>
         </div>
       </header>
 
@@ -4442,30 +4604,25 @@ function GrowthWorkspace({
             <strong>能力 Gap</strong>
             <span>{data.stats.ability_evidence_count ? `${data.stats.ability_evidence_count} 条证据` : '数据不足'}</span>
           </div>
-          <div className="ability-list">
-            {data.abilities.map((ability) => (
-              <article key={ability.dimension}>
-                <div>
-                  <strong>{ability.label}</strong>
-                  <span>{ability.evidence_count ? `${ability.current_score} / ${ability.target_score}` : '待进一步评估'}</span>
-                </div>
-                <div className="ability-bar">
-                  <i style={{ width: `${ability.current_score ?? 8}%` }} />
-                </div>
-                <small>{abilityStatusLabel(ability.status)} · {ability.confidence_level}</small>
-              </article>
-            ))}
-          </div>
+          <AbilityRadarChart abilities={visibleAbilities} />
         </section>
 
-        <section className="growth-card next-training-card">
+        <section className="growth-card readiness-training-card">
           <div className="growth-card-head">
-            <strong>下一步最值得练</strong>
-            <span>{topAbility?.label || '项目深挖'}</span>
+            <strong>岗位准备度</strong>
+            <span>{data.target.company ? data.target.company : data.target.role || profile.target_role || '目标岗位'}</span>
           </div>
-          <h2>{data.recommendation?.title || '项目深挖专项训练'}</h2>
-          <p>{data.recommendation?.description || '先围绕为什么做、如何决策、指标结果和业务价值连续追问。'}</p>
-          <button type="button" onClick={() => onStartTraining(data.recommendation?.title || '项目深挖专项训练')}>开始专项训练</button>
+          <div className="readiness-summary">
+            <strong>{data.readiness_score ? `${data.readiness_score}%` : '待评估'}</strong>
+            <p>{data.target.jd_status || '完成一次模拟面试后，桃子会基于真实证据评估岗位准备度。'}</p>
+          </div>
+          <div className="growth-card-head compact">
+            <strong>下一步最值得练</strong>
+            <span>{topAbility?.label || '结构化表达'}</span>
+          </div>
+          <h2>{data.recommendation?.title || '结构化表达专项训练'}</h2>
+          <p>{data.recommendation?.description || '先练习用背景、行动、结果和反思把回答讲清楚。'}</p>
+          <button type="button" onClick={() => onStartTraining(data.recommendation?.title || '结构化表达专项训练')}>开始专项训练</button>
         </section>
 
         <section className="growth-card trend-card">
@@ -4495,18 +4652,72 @@ function GrowthWorkspace({
           <IssueColumn title="正在提升" items={data.issues.improving} />
           <IssueColumn title="新发现" items={data.issues.new} />
         </section>
-
-        <section className="growth-card insight-card">
-          <div className="growth-card-head">
-            <strong>桃子最近发现</strong>
-            <span>基于真实证据</span>
-          </div>
-          {data.insights.length ? data.insights.slice(0, 3).map((item) => (
-            <p key={item.id || item.content}>{item.content}</p>
-          )) : <p>多聊几次、完成一次模拟面试后，桃子会沉淀更可靠的观察。</p>}
-        </section>
       </div>
     </section>
+  )
+}
+
+function AbilityRadarChart({ abilities }: { abilities: GrowthCenter['abilities'] }) {
+  const center = 120
+  const maxRadius = 86
+  const axes = abilities
+  if (!axes.length) {
+    return <p className="ability-radar-empty">完成一次模拟面试后，这里会出现能力雷达图。</p>
+  }
+  const rings = [0.25, 0.5, 0.75, 1]
+  const points = axes.map((ability, index) => {
+    const angle = (Math.PI * 2 * index) / axes.length - Math.PI / 2
+    const score = Math.max(0, Math.min(100, ability.current_score ?? 18))
+    const radius = (score / 100) * maxRadius
+    return {
+      ability,
+      angle,
+      x: center + Math.cos(angle) * radius,
+      y: center + Math.sin(angle) * radius,
+      axisX: center + Math.cos(angle) * maxRadius,
+      axisY: center + Math.sin(angle) * maxRadius,
+      labelX: center + Math.cos(angle) * (maxRadius + 30),
+      labelY: center + Math.sin(angle) * (maxRadius + 24),
+    }
+  })
+  const polygon = points.map((point) => `${point.x},${point.y}`).join(' ')
+
+  return (
+    <div className="ability-radar">
+      <svg viewBox="0 0 240 240" role="img" aria-label="能力 Gap 雷达图">
+        {rings.map((ring) => (
+          <polygon
+            key={ring}
+            className="radar-ring"
+            points={points.map((point) => {
+              const radius = maxRadius * ring
+              return `${center + Math.cos(point.angle) * radius},${center + Math.sin(point.angle) * radius}`
+            }).join(' ')}
+          />
+        ))}
+        {points.map((point) => (
+          <line key={point.ability.dimension} className="radar-axis" x1={center} y1={center} x2={point.axisX} y2={point.axisY} />
+        ))}
+        <polygon className="radar-score" points={polygon} />
+        {points.map((point) => (
+          <g key={point.ability.dimension}>
+            <circle className="radar-dot" cx={point.x} cy={point.y} r="3.5" />
+            <text x={point.labelX} y={point.labelY} textAnchor="middle">
+              {point.ability.label}
+            </text>
+          </g>
+        ))}
+      </svg>
+      <div className="ability-radar-list">
+        {axes.map((ability) => (
+          <article key={ability.dimension}>
+            <span>{ability.label}</span>
+            <strong>{ability.current_score !== null ? `${ability.current_score}/${ability.target_score}` : '待评估'}</strong>
+            <small>{abilityStatusLabel(ability.status)} · {ability.confidence_level}</small>
+          </article>
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -4550,15 +4761,416 @@ function ResumeInsightCard({
   )
 }
 
-function ExperienceNameList({ title, content }: { title: string; content: string }) {
-  const names = extractExperienceNames(content)
+type InternshipFormItem = {
+  company: string
+  role: string
+  start: string
+  end: string
+  description: string
+}
+
+type ProjectFormItem = {
+  name: string
+  role: string
+  start: string
+  end: string
+  link: string
+  description: string
+}
+
+type EducationFormItem = {
+  degree: string
+  school: string
+  college: string
+  major: string
+  ranking: string
+  gpaTotal: string
+  gpa: string
+  advisor: string
+  lab: string
+  research: string
+  start: string
+  end: string
+  recommended: string
+  scholarship: string
+}
+
+type AwardFormItem = {
+  kind: string
+  level: string
+  name: string
+  grade: string
+  date: string
+  description: string
+}
+
+function FullResumeEditor({
+  value,
+  htmlValue,
+  onChange,
+  placeholder,
+}: {
+  value: string
+  htmlValue?: string
+  onChange: (value: string) => void
+  placeholder: string
+}) {
+  const editorRef = useRef<HTMLDivElement | null>(null)
+  const lastValueRef = useRef('')
+
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor || lastValueRef.current === value) return
+    editor.innerHTML = htmlValue || formatResumeTextAsHtml(value)
+    lastValueRef.current = value
+  }, [htmlValue, value])
+
   return (
-    <section className="experience-name-list">
+    <div
+      ref={editorRef}
+      className="profile-editor resume-rich-editor"
+      contentEditable
+      data-placeholder={placeholder}
+      suppressContentEditableWarning
+      onInput={(event) => {
+        const text = event.currentTarget.innerText
+        lastValueRef.current = text
+        onChange(text)
+      }}
+    />
+  )
+}
+
+function InternshipExperienceEditor({ content, onChange }: { content: string; onChange: (value: string) => void }) {
+  const parsed = parseInternshipSectionContent(content)
+  const items = parsed.items.length ? parsed.items : [emptyInternshipFormItem()]
+
+  function updateItem(index: number, patch: Partial<InternshipFormItem>) {
+    const nextItems = items.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
+    onChange(serializeInternshipSection(nextItems, parsed.extra, true))
+  }
+
+  function addItem() {
+    onChange(serializeInternshipSection([...items, emptyInternshipFormItem()], parsed.extra, true))
+  }
+
+  function deleteItem(index: number) {
+    const nextItems = items.filter((_, itemIndex) => itemIndex !== index)
+    onChange(serializeInternshipSection(nextItems, parsed.extra, true))
+  }
+
+  function updateExtra(extra: string) {
+    onChange(serializeInternshipSection(items, extra, true))
+  }
+
+  return (
+    <section className="internship-editor">
       <div className="profile-card-head">
-        <strong>{title}列表</strong>
-        <span>按上传/录入时间排序</span>
+        <strong>实习经历列表</strong>
       </div>
-      {names.length ? names.map((name) => <span key={name}>{name}</span>) : <p>还没有可识别的经历名称。</p>}
+      <div className="internship-form-list">
+        {items.map((item, index) => (
+          <article className="internship-form-card" key={index}>
+            <div className="internship-form-grid">
+              <label>
+                <span>公司名称</span>
+                <input value={item.company} onChange={(event) => updateItem(index, { company: event.target.value })} placeholder="例如：百度" />
+              </label>
+              <label>
+                <span>职位名称</span>
+                <input value={item.role} onChange={(event) => updateItem(index, { role: event.target.value })} placeholder="例如：AIGC策略产品经理" />
+              </label>
+              <label className="internship-date-field">
+                <span>起止时间</span>
+                <div>
+                  <input value={item.start} onChange={(event) => updateItem(index, { start: event.target.value })} placeholder="2025-06" />
+                  <i>-</i>
+                  <input value={item.end} onChange={(event) => updateItem(index, { end: event.target.value })} placeholder="2025-09 / 至今" />
+                </div>
+              </label>
+              <label className="internship-description-field">
+                <span>描述</span>
+                <textarea value={item.description} onChange={(event) => updateItem(index, { description: event.target.value })} placeholder="工作概述、负责事项、产出结果和可量化数据" rows={5} />
+              </label>
+            </div>
+            <button className="internship-delete-button" type="button" onClick={() => deleteItem(index)} aria-label="删除这段实习经历">删除</button>
+          </article>
+        ))}
+      </div>
+      <button className="profile-inline-add-button" type="button" onClick={addItem}>+添加实习经历</button>
+      <label className="internship-extra-field">
+        <span>其他补充信息</span>
+        <textarea value={parsed.extra} onChange={(event) => updateExtra(event.target.value)} placeholder="填写表单字段没有覆盖的信息，例如证明人、团队背景、额外链接或备注" rows={3} />
+      </label>
+    </section>
+  )
+}
+
+function ProjectExperienceEditor({ content, onChange }: { content: string; onChange: (value: string) => void }) {
+  const parsed = parseProjectSectionContent(content)
+  const items = parsed.items.length ? parsed.items : [emptyProjectFormItem()]
+
+  function updateItem(index: number, patch: Partial<ProjectFormItem>) {
+    const nextItems = items.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
+    onChange(serializeProjectSection(nextItems, parsed.extra, true))
+  }
+
+  function addItem() {
+    onChange(serializeProjectSection([...items, emptyProjectFormItem()], parsed.extra, true))
+  }
+
+  function deleteItem(index: number) {
+    const nextItems = items.filter((_, itemIndex) => itemIndex !== index)
+    onChange(serializeProjectSection(nextItems, parsed.extra, true))
+  }
+
+  function updateExtra(extra: string) {
+    onChange(serializeProjectSection(items, extra, true))
+  }
+
+  return (
+    <section className="internship-editor project-editor">
+      <div className="profile-card-head">
+        <strong>项目经历列表</strong>
+      </div>
+      <div className="internship-form-list">
+        {items.map((item, index) => (
+          <article className="internship-form-card" key={index}>
+            <div className="internship-form-grid">
+              <label>
+                <span>项目名称</span>
+                <input value={item.name} onChange={(event) => updateItem(index, { name: event.target.value })} placeholder="例如：AIGC内容账号增长与商业化探索" />
+              </label>
+              <label>
+                <span>项目角色</span>
+                <input value={item.role} onChange={(event) => updateItem(index, { role: event.target.value })} placeholder="例如：独立产品负责人" />
+              </label>
+              <label className="internship-date-field">
+                <span>起止时间</span>
+                <div>
+                  <input value={item.start} onChange={(event) => updateItem(index, { start: event.target.value })} placeholder="2025-02" />
+                  <i>-</i>
+                  <input value={item.end} onChange={(event) => updateItem(index, { end: event.target.value })} placeholder="2025-06 / 至今" />
+                </div>
+              </label>
+              <label className="internship-description-field">
+                <span>项目链接</span>
+                <input value={item.link} onChange={(event) => updateItem(index, { link: event.target.value })} placeholder="https://..." />
+              </label>
+              <label className="internship-description-field">
+                <span>描述</span>
+                <textarea value={item.description} onChange={(event) => updateItem(index, { description: event.target.value })} placeholder="背景、目标、行动、结果和可量化指标" rows={5} />
+              </label>
+            </div>
+            <button className="internship-delete-button" type="button" onClick={() => deleteItem(index)} aria-label="删除这段项目经历">删除</button>
+          </article>
+        ))}
+      </div>
+      <button className="profile-inline-add-button" type="button" onClick={addItem}>+添加项目经历</button>
+      <label className="internship-extra-field">
+        <span>其他补充信息</span>
+        <textarea value={parsed.extra} onChange={(event) => updateExtra(event.target.value)} placeholder="填写表单字段没有覆盖的信息，例如项目证明、素材链接、团队背景或额外备注" rows={3} />
+      </label>
+    </section>
+  )
+}
+
+function EducationExperienceEditor({ content, onChange }: { content: string; onChange: (value: string) => void }) {
+  const parsed = parseEducationSectionContent(content)
+  const items = parsed.items.length ? parsed.items : [emptyEducationFormItem()]
+
+  function updateItem(index: number, patch: Partial<EducationFormItem>) {
+    const nextItems = items.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
+    onChange(serializeEducationSection(nextItems, parsed.extra, true))
+  }
+
+  function addItem() {
+    onChange(serializeEducationSection([...items, emptyEducationFormItem()], parsed.extra, true))
+  }
+
+  function deleteItem(index: number) {
+    const nextItems = items.filter((_, itemIndex) => itemIndex !== index)
+    onChange(serializeEducationSection(nextItems, parsed.extra, true))
+  }
+
+  function updateExtra(extra: string) {
+    onChange(serializeEducationSection(items, extra, true))
+  }
+
+  return (
+    <section className="internship-editor education-editor">
+      <div className="profile-card-head">
+        <strong>教育背景列表</strong>
+      </div>
+      <div className="internship-form-list">
+        {items.map((item, index) => (
+          <article className="internship-form-card" key={index}>
+            <div className="internship-form-grid education-form-grid">
+              <label>
+                <span>学历</span>
+                <select value={item.degree} onChange={(event) => updateItem(index, { degree: event.target.value })}>
+                  <option value="">请选择</option>
+                  <option value="本科">本科</option>
+                  <option value="硕士">硕士</option>
+                  <option value="博士">博士</option>
+                  <option value="大专">大专</option>
+                  <option value="高中">高中</option>
+                  <option value="其他">其他</option>
+                </select>
+              </label>
+              <label className="internship-date-field">
+                <span>时间</span>
+                <div>
+                  <input value={item.start} onChange={(event) => updateItem(index, { start: event.target.value })} placeholder="2020-09" />
+                  <i>-</i>
+                  <input value={item.end} onChange={(event) => updateItem(index, { end: event.target.value })} placeholder="2024-07 / 预计毕业" />
+                </div>
+              </label>
+              <label>
+                <span>学校全称</span>
+                <input value={item.school} onChange={(event) => updateItem(index, { school: event.target.value })} placeholder="例如：广东外语外贸大学" />
+              </label>
+              <label>
+                <span>所在院系</span>
+                <input value={item.college} onChange={(event) => updateItem(index, { college: event.target.value })} placeholder="例如：西方语言文化学院" />
+              </label>
+              <label>
+                <span>专业</span>
+                <input value={item.major} onChange={(event) => updateItem(index, { major: event.target.value })} placeholder="例如：法语" />
+              </label>
+              <label>
+                <span>专业排名</span>
+                <input value={item.ranking} onChange={(event) => updateItem(index, { ranking: event.target.value })} placeholder="例如：前5%" />
+              </label>
+              <label className="education-gpa-field">
+                <span>GPA总分</span>
+                <input value={item.gpaTotal} onChange={(event) => updateItem(index, { gpaTotal: event.target.value })} placeholder="4" />
+              </label>
+              <label className="education-gpa-field">
+                <span>个人GPA</span>
+                <input value={item.gpa} onChange={(event) => updateItem(index, { gpa: event.target.value })} placeholder="3.94" />
+              </label>
+              <label>
+                <span>导师</span>
+                <input value={item.advisor} onChange={(event) => updateItem(index, { advisor: event.target.value })} placeholder="请输入" />
+              </label>
+              <label>
+                <span>实验室</span>
+                <input value={item.lab} onChange={(event) => updateItem(index, { lab: event.target.value })} placeholder="请输入" />
+              </label>
+              <label>
+                <span>研究方向</span>
+                <input value={item.research} onChange={(event) => updateItem(index, { research: event.target.value })} placeholder="请输入" />
+              </label>
+              <label>
+                <span>该学历是否保送</span>
+                <select value={item.recommended} onChange={(event) => updateItem(index, { recommended: event.target.value })}>
+                  <option value="">请选择</option>
+                  <option value="是">是</option>
+                  <option value="否">否</option>
+                </select>
+              </label>
+              <label>
+                <span>是否获得国家奖学金</span>
+                <select value={item.scholarship} onChange={(event) => updateItem(index, { scholarship: event.target.value })}>
+                  <option value="">请选择</option>
+                  <option value="是">是</option>
+                  <option value="否">否</option>
+                </select>
+              </label>
+            </div>
+            <button className="internship-delete-button" type="button" onClick={() => deleteItem(index)} aria-label="删除这段教育经历">删除</button>
+          </article>
+        ))}
+      </div>
+      <button className="profile-inline-add-button" type="button" onClick={addItem}>+添加教育经历</button>
+      <label className="internship-extra-field">
+        <span>其他补充信息</span>
+        <textarea value={parsed.extra} onChange={(event) => updateExtra(event.target.value)} placeholder="填写表单字段没有覆盖的信息，例如核心课程、交换经历、证书、论文或校园经历" rows={3} />
+      </label>
+    </section>
+  )
+}
+
+function AwardExperienceEditor({ content, onChange }: { content: string; onChange: (value: string) => void }) {
+  const parsed = parseAwardSectionContent(content)
+  const items = parsed.items.length ? parsed.items : [emptyAwardFormItem('竞赛经历')]
+
+  function updateItem(index: number, patch: Partial<AwardFormItem>) {
+    const nextItems = items.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
+    onChange(serializeAwardSection(nextItems, parsed.extra, true))
+  }
+
+  function addItem(kind: string) {
+    onChange(serializeAwardSection([...items, emptyAwardFormItem(kind)], parsed.extra, true))
+  }
+
+  function deleteItem(index: number) {
+    const nextItems = items.filter((_, itemIndex) => itemIndex !== index)
+    onChange(serializeAwardSection(nextItems, parsed.extra, true))
+  }
+
+  function updateExtra(extra: string) {
+    onChange(serializeAwardSection(items, extra, true))
+  }
+
+  return (
+    <section className="internship-editor award-editor">
+      <div className="profile-card-head">
+        <strong>获奖经历列表</strong>
+      </div>
+      <div className="internship-form-list">
+        {items.map((item, index) => (
+          <article className="internship-form-card" key={index}>
+            <div className="internship-form-grid award-form-grid">
+              <label>
+                <span>类型</span>
+                <select value={item.kind} onChange={(event) => updateItem(index, { kind: event.target.value })}>
+                  <option value="竞赛经历">竞赛经历</option>
+                  <option value="荣誉经历">荣誉经历</option>
+                </select>
+              </label>
+              <label>
+                <span>奖项级别</span>
+                <select value={item.level} onChange={(event) => updateItem(index, { level: event.target.value })}>
+                  <option value="">请选择</option>
+                  <option value="国际级">国际级</option>
+                  <option value="国家级">国家级</option>
+                  <option value="省市级">省市级</option>
+                  <option value="校级">校级</option>
+                  <option value="院级">院级</option>
+                  <option value="其他">其他</option>
+                </select>
+              </label>
+              <label>
+                <span>{item.kind === '荣誉经历' ? '荣誉名称' : '竞赛名称'}</span>
+                <input value={item.name} onChange={(event) => updateItem(index, { name: event.target.value })} placeholder="例如：第27届21世纪杯英语演讲比赛" />
+              </label>
+              <label>
+                <span>{item.kind === '荣誉经历' ? '荣誉称号' : '奖项等级'}</span>
+                <input value={item.grade} onChange={(event) => updateItem(index, { grade: event.target.value })} placeholder="例如：广东省决赛三等奖" />
+              </label>
+              <label>
+                <span>获奖时间</span>
+                <input value={item.date} onChange={(event) => updateItem(index, { date: event.target.value })} placeholder="2022-12" />
+              </label>
+              <label className="internship-description-field">
+                <span>{item.kind === '荣誉经历' ? '荣誉说明' : '获奖项目概述'}</span>
+                <textarea value={item.description} onChange={(event) => updateItem(index, { description: event.target.value })} placeholder="赛事背景、你的角色、成果亮点、排名或能力证明" rows={5} />
+              </label>
+            </div>
+            <button className="internship-delete-button" type="button" onClick={() => deleteItem(index)} aria-label="删除这段获奖经历">删除</button>
+          </article>
+        ))}
+      </div>
+      <div className="award-add-actions">
+        <button className="profile-inline-add-button" type="button" onClick={() => addItem('竞赛经历')}>+添加竞赛经历</button>
+        <button className="profile-inline-add-button" type="button" onClick={() => addItem('荣誉经历')}>+添加荣誉经历</button>
+      </div>
+      <label className="internship-extra-field">
+        <span>其他补充信息</span>
+        <textarea value={parsed.extra} onChange={(event) => updateExtra(event.target.value)} placeholder="填写表单字段没有覆盖的信息，例如证书编号、主办方、作品链接或补充荣誉" rows={3} />
+      </label>
     </section>
   )
 }
@@ -5960,6 +6572,18 @@ function LoadingScreen() {
   )
 }
 
+function UploadParsingOverlay({ message }: { message: string }) {
+  return (
+    <div className="upload-parsing-overlay" role="status" aria-live="polite">
+      <section className="upload-parsing-dialog" aria-label="文件解析中">
+        <span className="upload-parsing-spinner" aria-hidden="true" />
+        <strong>解析中</strong>
+        <p>{message || '桃子正在解析文件并整理档案。'}</p>
+      </section>
+    </div>
+  )
+}
+
 function normalizeAgentActions(actions?: AgentToolProposal[]) {
   const allowed: AgentToolName[] = [
     'start_interview',
@@ -6677,7 +7301,47 @@ function buildInitialProfileSections(profile: Profile, dashboard: Dashboard | nu
     ...initialProfileSections,
     reviews: [reviewSummary, interviewSummary].filter(Boolean).join('\n\n'),
     full: profile.resume_text || '',
+    internship: buildInitialInternshipSection(profile.resume_text || '', dashboard?.candidate_profile),
+    project: buildInitialProjectSection(profile.resume_text || '', dashboard?.candidate_profile),
+    education: buildInitialEducationSection(profile.resume_text || '', dashboard?.candidate_profile),
+    competition: buildInitialAwardSection(profile.resume_text || ''),
   }
+}
+
+function buildInitialInternshipSection(resumeText: string, candidateProfile?: CandidateProfile) {
+  if (candidateProfile) {
+    const candidateItems = isAgentParsedCandidateProfile(candidateProfile) ? normalizeCandidateExperiences(candidateProfile.experiences) : []
+    return candidateItems.length ? serializeInternshipExperiences(candidateItems) : ''
+  }
+  return serializeInternshipExperiences(extractInternshipExperiences(resumeText))
+}
+
+function buildInitialProjectSection(resumeText: string, candidateProfile?: CandidateProfile) {
+  if (candidateProfile) {
+    const candidateItems = isAgentParsedCandidateProfile(candidateProfile) ? normalizeCandidateProjects(candidateProfile.projects) : []
+    return candidateItems.length ? serializeProjectExperiences(candidateItems) : ''
+  }
+  return serializeProjectExperiences(extractProjectExperiences(resumeText))
+}
+
+function buildInitialEducationSection(resumeText: string, candidateProfile?: CandidateProfile) {
+  if (candidateProfile) {
+    const candidateItems = isAgentParsedCandidateProfile(candidateProfile) ? normalizeCandidateEducation(candidateProfile.education) : []
+    return candidateItems.length ? serializeEducationExperiences(candidateItems) : ''
+  }
+  return serializeEducationExperiences(extractEducationExperiences(resumeText))
+}
+
+function candidateProfileParserStatus(candidateProfile?: CandidateProfile) {
+  return String(candidateProfile?.field_statuses?._parser ?? '')
+}
+
+function isAgentParsedCandidateProfile(candidateProfile?: CandidateProfile) {
+  return candidateProfileParserStatus(candidateProfile) === 'agent'
+}
+
+function buildInitialAwardSection(resumeText: string) {
+  return serializeAwardExperiences(extractAwardExperiences(resumeText))
 }
 
 function composeProfileResumeText(sections: Record<ProfileSectionId, string>) {
@@ -6692,10 +7356,800 @@ function composeProfileResumeText(sections: Record<ProfileSectionId, string>) {
     .join('\n\n')
 }
 
+function mergeProfileSectionContent(current: string, addition: string) {
+  const cleanCurrent = current.trim()
+  const cleanAddition = addition.trim()
+  if (!cleanAddition) return cleanCurrent
+  if (!cleanCurrent) return cleanAddition
+  if (normalizeForLooseCompare(cleanCurrent).includes(normalizeForLooseCompare(cleanAddition).slice(0, 120))) return cleanCurrent
+  return `${cleanCurrent}\n\n${cleanAddition}`
+}
+
+function normalizeCandidateExperiences(values?: unknown[]) {
+  return (values ?? [])
+    .map((value) => {
+      if (!value || typeof value !== 'object') return null
+      const item = value as Record<string, unknown>
+      const summary = String(item.summary ?? item.description ?? '').trim()
+      return {
+        company: String(item.company ?? '').trim(),
+        role: String(item.role ?? '').trim(),
+        start: String(item.start_date ?? item.start ?? '').trim(),
+        end: String(item.end_date ?? item.end ?? '').trim(),
+        description: summary,
+      }
+    })
+    .filter((item): item is InternshipFormItem => Boolean(item && Object.values(item).some((value) => value.trim())))
+}
+
+function normalizeCandidateProjects(values?: unknown[]) {
+  return (values ?? [])
+    .map((value) => {
+      if (!value || typeof value !== 'object') return null
+      const item = value as Record<string, unknown>
+      const summary = String(item.summary ?? item.description ?? '').trim()
+      return {
+        name: String(item.project_name ?? item.name ?? item.title ?? '').trim(),
+        role: String(item.role ?? '').trim(),
+        start: String(item.start_date ?? item.start ?? '').trim(),
+        end: String(item.end_date ?? item.end ?? '').trim(),
+        link: String(item.link ?? item.url ?? '').trim(),
+        description: summary,
+      }
+    })
+    .filter((item): item is ProjectFormItem => Boolean(item && Object.values(item).some((value) => value.trim())))
+}
+
+function normalizeCandidateEducation(values?: unknown[]) {
+  return (values ?? [])
+    .map((value) => {
+      if (!value || typeof value !== 'object') return null
+      const item = value as Record<string, unknown>
+      return {
+        degree: String(item.degree ?? item.education_level ?? '').trim(),
+        school: String(item.school ?? item.school_name ?? item.title ?? '').trim(),
+        college: String(item.college ?? item.department ?? '').trim(),
+        major: String(item.major ?? '').trim(),
+        ranking: String(item.ranking ?? item.rank ?? '').trim(),
+        gpaTotal: String(item.gpa_total ?? item.gpaTotal ?? '').trim(),
+        gpa: String(item.gpa ?? '').trim(),
+        advisor: String(item.advisor ?? '').trim(),
+        lab: String(item.lab ?? item.laboratory ?? '').trim(),
+        research: String(item.research ?? item.research_direction ?? '').trim(),
+        start: String(item.start_date ?? item.start ?? '').trim(),
+        end: String(item.end_date ?? item.end ?? '').trim(),
+        recommended: String(item.recommended ?? '').trim(),
+        scholarship: String(item.scholarship ?? '').trim(),
+      }
+    })
+    .filter((item): item is EducationFormItem => Boolean(item && Object.values(item).some((value) => value.trim())))
+}
+
+function emptyInternshipFormItem(): InternshipFormItem {
+  return { company: '', role: '', start: '', end: '', description: '' }
+}
+
+function emptyProjectFormItem(): ProjectFormItem {
+  return { name: '', role: '', start: '', end: '', link: '', description: '' }
+}
+
+function emptyEducationFormItem(): EducationFormItem {
+  return {
+    degree: '',
+    school: '',
+    college: '',
+    major: '',
+    ranking: '',
+    gpaTotal: '',
+    gpa: '',
+    advisor: '',
+    lab: '',
+    research: '',
+    start: '',
+    end: '',
+    recommended: '',
+    scholarship: '',
+  }
+}
+
+function emptyAwardFormItem(kind = '竞赛经历'): AwardFormItem {
+  return { kind, level: '', name: '', grade: '', date: '', description: '' }
+}
+
+function parseInternshipSectionContent(content: string): { items: InternshipFormItem[]; extra: string } {
+  const clean = String(content || '').trim()
+  if (!clean) return { items: [], extra: '' }
+  if (!/公司名称[:：]|职位名称[:：]|起止时间[:：]/.test(clean)) {
+    return { items: extractInternshipExperiences(clean), extra: '' }
+  }
+
+  const blocks = clean.split(/\n{2,}(?=公司名称[:：])/).map((block) => block.trim()).filter(Boolean)
+  const items: InternshipFormItem[] = []
+  const extraParts: string[] = []
+  for (const block of blocks) {
+    if (/^补充信息[:：]/.test(block)) {
+      extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
+      continue
+    }
+    const company = firstMatch(block, /公司名称[:：]\s*([^\n]*)/)
+    const role = firstMatch(block, /职位名称[:：]\s*([^\n]*)/)
+    const range = firstMatch(block, /起止时间[:：]\s*([^\n]*)/)
+    const [start, end] = parseFormDateRange(range)
+    const description = firstMatch(block, /描述[:：]\s*([\s\S]*?)(?:\n补充信息[:：]|$)/)
+    const item = { company, role, start, end, description: description.trim() }
+    if (Object.values(item).some(Boolean) || /公司名称[:：]|职位名称[:：]|起止时间[:：]/.test(block)) items.push(item)
+  }
+  const extra = extraParts.join('\n\n') || firstMatch(clean, /补充信息[:：]\s*([\s\S]*)/).trim()
+  return { items, extra }
+}
+
+function serializeInternshipSection(items: InternshipFormItem[], extra = '', keepEmpty = false) {
+  const blocks = items
+    .map((item) => ({
+      company: item.company.trim(),
+      role: item.role.trim(),
+      start: item.start.trim(),
+      end: item.end.trim(),
+      description: item.description.trim(),
+    }))
+    .filter((item) => keepEmpty || Object.values(item).some(Boolean))
+    .map((item) => [
+      `公司名称：${item.company}`,
+      `职位名称：${item.role}`,
+      `起止时间：${keepEmpty ? `${item.start} - ${item.end}` : [item.start, item.end].filter(Boolean).join(' - ')}`,
+      `描述：\n${item.description}`,
+    ].join('\n'))
+  if (extra.trim()) blocks.push(`补充信息：\n${extra.trim()}`)
+  return blocks.join('\n\n')
+}
+
+function serializeInternshipExperiences(items: InternshipFormItem[]) {
+  return serializeInternshipSection(items)
+}
+
+function parseProjectSectionContent(content: string): { items: ProjectFormItem[]; extra: string } {
+  const clean = String(content || '').trim()
+  if (!clean) return { items: [], extra: '' }
+  if (!/项目名称[:：]|项目角色[:：]|项目链接[:：]/.test(clean)) {
+    return { items: extractProjectExperiences(clean), extra: '' }
+  }
+
+  const blocks = clean.split(/\n{2,}(?=项目名称[:：])/).map((block) => block.trim()).filter(Boolean)
+  const items: ProjectFormItem[] = []
+  const extraParts: string[] = []
+  for (const block of blocks) {
+    if (/^补充信息[:：]/.test(block)) {
+      extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
+      continue
+    }
+    const name = firstMatch(block, /项目名称[:：]\s*([^\n]*)/)
+    const role = firstMatch(block, /项目角色[:：]\s*([^\n]*)/)
+    const range = firstMatch(block, /起止时间[:：]\s*([^\n]*)/)
+    const [start, end] = parseFormDateRange(range)
+    const link = firstMatch(block, /项目链接[:：]\s*([^\n]*)/)
+    const description = firstMatch(block, /描述[:：]\s*([\s\S]*?)(?:\n补充信息[:：]|$)/)
+    const item = { name, role, start, end, link, description: description.trim() }
+    if (Object.values(item).some(Boolean) || /项目名称[:：]|项目角色[:：]|项目链接[:：]|起止时间[:：]/.test(block)) items.push(item)
+  }
+  const extra = extraParts.join('\n\n') || firstMatch(clean, /补充信息[:：]\s*([\s\S]*)/).trim()
+  return { items, extra }
+}
+
+function serializeProjectSection(items: ProjectFormItem[], extra = '', keepEmpty = false) {
+  const blocks = items
+    .map((item) => ({
+      name: item.name.trim(),
+      role: item.role.trim(),
+      start: item.start.trim(),
+      end: item.end.trim(),
+      link: item.link.trim(),
+      description: item.description.trim(),
+    }))
+    .filter((item) => keepEmpty || Object.values(item).some(Boolean))
+    .map((item) => [
+      `项目名称：${item.name}`,
+      `项目角色：${item.role}`,
+      `起止时间：${keepEmpty ? `${item.start} - ${item.end}` : [item.start, item.end].filter(Boolean).join(' - ')}`,
+      `项目链接：${item.link}`,
+      `描述：\n${item.description}`,
+    ].join('\n'))
+  if (extra.trim()) blocks.push(`补充信息：\n${extra.trim()}`)
+  return blocks.join('\n\n')
+}
+
+function serializeProjectExperiences(items: ProjectFormItem[]) {
+  return serializeProjectSection(items)
+}
+
+function parseEducationSectionContent(content: string): { items: EducationFormItem[]; extra: string } {
+  const clean = String(content || '').trim()
+  if (!clean) return { items: [], extra: '' }
+  if (!/学校全称[:：]|学历[:：]|专业[:：]|GPA[:：]|个人GPA[:：]/.test(clean)) {
+    return { items: extractEducationExperiences(clean), extra: '' }
+  }
+
+  const blocks = clean.split(/\n{2,}(?=学历[:：]|学校全称[:：])/).map((block) => block.trim()).filter(Boolean)
+  const items: EducationFormItem[] = []
+  const extraParts: string[] = []
+  for (const block of blocks) {
+    if (/^补充信息[:：]/.test(block)) {
+      extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
+      continue
+    }
+    const range = firstMatch(block, /时间[:：]\s*([^\n]*)/)
+    const [start, end] = parseFormDateRange(range)
+    const item = {
+      degree: firstMatch(block, /学历[:：]\s*([^\n]*)/),
+      school: firstMatch(block, /学校全称[:：]\s*([^\n]*)/),
+      college: firstMatch(block, /所在院系[:：]\s*([^\n]*)/),
+      major: firstMatch(block, /专业[:：]\s*([^\n]*)/),
+      ranking: firstMatch(block, /专业排名[:：]\s*([^\n]*)/),
+      gpaTotal: firstMatch(block, /GPA总分[:：]\s*([^\n]*)/),
+      gpa: firstMatch(block, /个人GPA[:：]\s*([^\n]*)/),
+      advisor: firstMatch(block, /导师[:：]\s*([^\n]*)/),
+      lab: firstMatch(block, /实验室[:：]\s*([^\n]*)/),
+      research: firstMatch(block, /研究方向[:：]\s*([^\n]*)/),
+      start,
+      end,
+      recommended: firstMatch(block, /该学历是否保送[:：]\s*([^\n]*)/),
+      scholarship: firstMatch(block, /是否获得国家奖学金[:：]\s*([^\n]*)/),
+    }
+    if (Object.values(item).some(Boolean) || /学校全称[:：]|学历[:：]|专业[:：]|时间[:：]/.test(block)) items.push(item)
+  }
+  const extra = extraParts.join('\n\n') || firstMatch(clean, /补充信息[:：]\s*([\s\S]*)/).trim()
+  return { items, extra }
+}
+
+function serializeEducationSection(items: EducationFormItem[], extra = '', keepEmpty = false) {
+  const blocks = items
+    .map((item) => ({
+      degree: item.degree.trim(),
+      school: item.school.trim(),
+      college: item.college.trim(),
+      major: item.major.trim(),
+      ranking: item.ranking.trim(),
+      gpaTotal: item.gpaTotal.trim(),
+      gpa: item.gpa.trim(),
+      advisor: item.advisor.trim(),
+      lab: item.lab.trim(),
+      research: item.research.trim(),
+      start: item.start.trim(),
+      end: item.end.trim(),
+      recommended: item.recommended.trim(),
+      scholarship: item.scholarship.trim(),
+    }))
+    .filter((item) => keepEmpty || Object.values(item).some(Boolean))
+    .map((item) => [
+      `学历：${item.degree}`,
+      `时间：${keepEmpty ? `${item.start} - ${item.end}` : [item.start, item.end].filter(Boolean).join(' - ')}`,
+      `学校全称：${item.school}`,
+      `所在院系：${item.college}`,
+      `专业：${item.major}`,
+      `专业排名：${item.ranking}`,
+      `GPA总分：${item.gpaTotal}`,
+      `个人GPA：${item.gpa}`,
+      `导师：${item.advisor}`,
+      `实验室：${item.lab}`,
+      `研究方向：${item.research}`,
+      `该学历是否保送：${item.recommended}`,
+      `是否获得国家奖学金：${item.scholarship}`,
+    ].join('\n'))
+  if (extra.trim()) blocks.push(`补充信息：\n${extra.trim()}`)
+  return blocks.join('\n\n')
+}
+
+function serializeEducationExperiences(items: EducationFormItem[]) {
+  return serializeEducationSection(items)
+}
+
+function parseAwardSectionContent(content: string): { items: AwardFormItem[]; extra: string } {
+  const clean = String(content || '').trim()
+  if (!clean) return { items: [], extra: '' }
+  if (!/类型[:：]|奖项级别[:：]|竞赛名称[:：]|荣誉名称[:：]|获奖时间[:：]/.test(clean)) {
+    const items = extractAwardExperiences(clean)
+    return { items, extra: items.length ? '' : clean }
+  }
+
+  const blocks = clean.split(/\n{2,}(?=类型[:：]|奖项级别[:：]|竞赛名称[:：]|荣誉名称[:：])/).map((block) => block.trim()).filter(Boolean)
+  const items: AwardFormItem[] = []
+  const extraParts: string[] = []
+  for (const block of blocks) {
+    if (/^补充信息[:：]/.test(block)) {
+      extraParts.push(block.replace(/^补充信息[:：]\s*/, '').trim())
+      continue
+    }
+    const kind = firstMatch(block, /类型[:：]\s*([^\n]*)/) || (/荣誉名称[:：]/.test(block) ? '荣誉经历' : '竞赛经历')
+    const item = {
+      kind,
+      level: firstMatch(block, /奖项级别[:：]\s*([^\n]*)/),
+      name: firstMatch(block, /(?:竞赛名称|荣誉名称|名称)[:：]\s*([^\n]*)/),
+      grade: firstMatch(block, /(?:奖项等级|荣誉称号)[:：]\s*([^\n]*)/),
+      date: firstMatch(block, /获奖时间[:：]\s*([^\n]*)/),
+      description: firstMatch(block, /(?:获奖项目概述|荣誉说明|描述)[:：]\s*([\s\S]*?)(?:\n补充信息[:：]|$)/).trim(),
+    }
+    if (Object.values(item).some(Boolean)) items.push(item)
+  }
+  const extra = extraParts.join('\n\n') || firstMatch(clean, /补充信息[:：]\s*([\s\S]*)/).trim()
+  return { items, extra }
+}
+
+function serializeAwardSection(items: AwardFormItem[], extra = '', keepEmpty = false) {
+  const blocks = items
+    .map((item) => ({
+      kind: item.kind.trim() || '竞赛经历',
+      level: item.level.trim(),
+      name: item.name.trim(),
+      grade: item.grade.trim(),
+      date: item.date.trim(),
+      description: item.description.trim(),
+    }))
+    .filter((item) => keepEmpty || Object.values(item).some(Boolean))
+    .map((item) => [
+      `类型：${item.kind}`,
+      `奖项级别：${item.level}`,
+      `${item.kind === '荣誉经历' ? '荣誉名称' : '竞赛名称'}：${item.name}`,
+      `${item.kind === '荣誉经历' ? '荣誉称号' : '奖项等级'}：${item.grade}`,
+      `获奖时间：${item.date}`,
+      `${item.kind === '荣誉经历' ? '荣誉说明' : '获奖项目概述'}：\n${item.description}`,
+    ].join('\n'))
+  if (extra.trim()) blocks.push(`补充信息：\n${extra.trim()}`)
+  return blocks.join('\n\n')
+}
+
+function serializeAwardExperiences(items: AwardFormItem[]) {
+  return serializeAwardSection(items)
+}
+
+function extractInternshipExperiences(text: string): InternshipFormItem[] {
+  const section = extractResumeSection(text, ['实习经历', '工作经历', '实践经历']) || text
+  const chunks = splitExperienceChunks(section)
+  return chunks
+    .map(parseInternshipChunk)
+    .filter((item) => Object.values(item).some((value) => value.trim()))
+    .slice(0, 8)
+}
+
+function extractProjectExperiences(text: string): ProjectFormItem[] {
+  const section = extractResumeSection(text, ['项目经历', '项目经验', '作品经历']) || text
+  const chunks = splitProjectChunks(section)
+  return chunks
+    .map(parseProjectChunk)
+    .filter((item) => Object.values(item).some((value) => value.trim()))
+    .slice(0, 8)
+}
+
+function extractEducationExperiences(text: string): EducationFormItem[] {
+  const section = extractResumeSection(text, ['教育背景', '教育经历']) || text
+  const chunks = splitEducationChunks(section)
+  return chunks
+    .map(parseEducationChunk)
+    .filter((item) => Object.values(item).some((value) => value.trim()))
+    .slice(0, 4)
+}
+
+function extractAwardExperiences(text: string): AwardFormItem[] {
+  const section = extractResumeSection(text, ['获奖经历', '奖项荣誉', '荣誉奖项', '竞赛经历', '荣誉经历', '奖励情况'])
+  const source = section || String(text || '').split(/\n+/).filter(looksLikeAwardStart).join('\n')
+  if (!source.trim()) return []
+  const chunks = splitAwardChunks(source)
+  return chunks
+    .map(parseAwardChunk)
+    .filter((item) => Object.values(item).some((value) => value.trim()))
+    .slice(0, 10)
+}
+
+function extractResumeSection(text: string, markers: string[], limit = 5000) {
+  const clean = String(text || '').replace(/\r\n/g, '\n')
+  for (const marker of markers) {
+    const match = clean.match(new RegExp(`${escapeRegExp(marker)}[：:\\s]*([\\s\\S]{0,${limit}})`, 'i'))
+    if (!match?.[1]) continue
+    const excerpt = match[1].trim()
+    const next = excerpt.search(/\n\s*(教育背景|教育经历|项目经历|项目经验|个人技能|技能证书|竞赛经历|获奖经历|荣誉经历|奖项荣誉|校园经历|自我评价|求职意向)[^\n]{0,12}[：:]?/)
+    return next > 24 ? excerpt.slice(0, next).trim() : excerpt
+  }
+  return ''
+}
+
+function splitExperienceChunks(section: string) {
+  const lines = String(section || '').split(/\n+/).map((line) => line.trim()).filter(Boolean)
+  const chunks: string[][] = []
+  let current: string[] = []
+  for (const line of lines) {
+    if (looksLikeExperienceStart(line) && current.length) {
+      chunks.push(current)
+      current = [line]
+    } else {
+      current.push(line)
+    }
+  }
+  if (current.length) chunks.push(current)
+  if (chunks.length <= 1) {
+    return String(section || '')
+      .split(/\n\s*\n|(?=20\d{2}[./-]\d{1,2}[^。\n]{0,90}(?:实习|产品|运营|数据|策略))/)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean)
+  }
+  return chunks.map((chunk) => chunk.join('\n'))
+}
+
+function splitProjectChunks(section: string) {
+  const lines = String(section || '').split(/\n+/).map((line) => line.trim()).filter(Boolean)
+  const chunks: string[][] = []
+  let current: string[] = []
+  for (const line of lines) {
+    if (looksLikeProjectStart(line) && current.length) {
+      chunks.push(current)
+      current = [line]
+    } else {
+      current.push(line)
+    }
+  }
+  if (current.length) chunks.push(current)
+  if (chunks.length <= 1) {
+    return String(section || '')
+      .split(/\n\s*\n|(?=[\u4e00-\u9fa5A-Za-z0-9]{2,36}(?:项目|Agent|平台|系统|工具|增长|商业化|探索)[^。\n]{0,100}(?:20\d{2}|负责人|产品|运营|PM))/)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean)
+  }
+  return chunks.map((chunk) => chunk.join('\n'))
+}
+
+function splitEducationChunks(section: string) {
+  const lines = String(section || '').split(/\n+/).map((line) => line.trim()).filter(Boolean)
+  const chunks: string[][] = []
+  let current: string[] = []
+  for (const line of lines) {
+    if (looksLikeEducationStart(line) && current.length) {
+      chunks.push(current)
+      current = [line]
+    } else {
+      current.push(line)
+    }
+  }
+  if (current.length) chunks.push(current)
+  if (chunks.length <= 1) {
+    return String(section || '')
+      .split(/\n\s*\n|(?=[\u4e00-\u9fa5A-Za-z0-9]{2,28}(?:大学|学院|学校)[^。\n]{0,120}(?:20\d{2}|本科|硕士|博士|专业|GPA))/)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean)
+  }
+  return chunks.map((chunk) => chunk.join('\n'))
+}
+
+function splitAwardChunks(section: string) {
+  const lines = String(section || '').split(/\n+/).map((line) => line.trim()).filter(Boolean)
+  const chunks: string[][] = []
+  let current: string[] = []
+  for (const line of lines) {
+    if (looksLikeAwardStart(line) && current.length) {
+      chunks.push(current)
+      current = [line]
+    } else {
+      current.push(line)
+    }
+  }
+  if (current.length) chunks.push(current)
+  if (chunks.length <= 1) {
+    return String(section || '')
+      .split(/\n\s*\n|[;；]|(?=(?:20\d{2}|第\d+届|国家级|省市级|省级|市级|校级|院级)[^。\n]{0,120}(?:奖|荣誉|比赛|竞赛|大赛|挑战赛))/)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean)
+  }
+  return chunks.map((chunk) => chunk.join('\n'))
+}
+
+function looksLikeExperienceStart(line: string) {
+  const clean = line.trim()
+  if (!clean || /^[•·\-]/.test(clean)) return false
+  const hasDate = /20\d{2}(?:[./-]\d{1,2})?/.test(clean)
+  const hasRole = /(产品经理|产品实习生|策略产品|AI产品|AIGC|运营|用户研究|数据分析|项目助理|实习生|PM)/i.test(clean)
+  const hasCompanySignal = /(公司|集团|科技|字节|快手|百度|腾讯|阿里|美团|小红书|京东|网易|华为|平台)/.test(clean)
+  return clean.length <= 180 && (hasDate || hasCompanySignal) && hasRole
+}
+
+function looksLikeProjectStart(line: string) {
+  const clean = line.trim()
+  if (!clean || /^[•·\-]/.test(clean)) return false
+  if (/^(背景|目标|行动|结果|职责|项目内容|项目职责|项目成果|描述|亮点)[:：]/.test(clean)) return false
+  const hasProject = /(项目|Agent|平台|系统|工具|增长|商业化|探索|小红书|AIGC|AI)/i.test(clean)
+  const hasStartSignal = /20\d{2}(?:[./-]\d{1,2})?|负责人|产品|运营|PM|独立|主导|[|｜丨—–\-]/i.test(clean)
+  return clean.length <= 180 && hasProject && hasStartSignal
+}
+
+function looksLikeEducationStart(line: string) {
+  const clean = line.trim()
+  if (!clean || /^[•·\-]/.test(clean)) return false
+  if (/^(主修课程|核心课程|奖学金|荣誉|课程|描述|研究方向|实验室|导师)[:：]/.test(clean)) return false
+  const hasSchool = /(大学|学院|学校|University|College)/i.test(clean)
+  const hasDegree = /(本科|硕士|博士|大专|学士|研究生)/.test(clean)
+  const hasDate = /20\d{2}(?:[./-]\d{1,2})?/.test(clean)
+  return clean.length <= 180 && hasSchool && (hasDegree || hasDate)
+}
+
+function looksLikeAwardStart(line: string) {
+  const clean = line.replace(/^[•·\-]\s*/, '').trim()
+  if (!clean) return false
+  if (/^(描述|说明|项目概述|主办方|职责|背景|过程|成果)[:：]/.test(clean)) return false
+  const hasAwardSignal = /(奖|荣誉|优秀|三好学生|奖学金|比赛|竞赛|大赛|挑战赛|证书)/.test(clean)
+  const hasStartSignal = /20\d{2}(?:[./-]\d{1,2})?|第\d+届|国家级|省市级|省级|市级|校级|院级|一等奖|二等奖|三等奖|优秀奖|金奖|银奖|铜奖|冠军|亚军|季军|Top\s*\d+/i.test(clean)
+  return clean.length <= 220 && hasAwardSignal && hasStartSignal
+}
+
+function parseInternshipChunk(chunk: string): InternshipFormItem {
+  const clean = chunk.replace(/\r\n/g, '\n').trim()
+  const [start, end] = parseDateRange(clean)
+  const role = firstMatch(clean, /(AI\s*产品经理|AIGC\s*策略产品经理|AIGC\s*产品经理|策略产品经理|产品经理|产品实习生|产品运营|用户研究|数据分析|项目助理|[\u4e00-\u9fa5A-Za-z0-9]{0,12}实习生|PM)/i)
+  const firstLine = clean.split('\n').find(Boolean) || clean
+  const company = inferExperienceCompany(firstLine, role)
+  const description = clean
+    .split('\n')
+    .filter((line) => line.trim() && line.trim() !== firstLine.trim())
+    .join('\n')
+    .trim() || clean
+  return {
+    company,
+    role,
+    start,
+    end,
+    description,
+  }
+}
+
+function parseProjectChunk(chunk: string): ProjectFormItem {
+  const clean = chunk.replace(/\r\n/g, '\n').trim()
+  const [start, end] = parseDateRange(clean)
+  const role = firstMatch(clean, /(独立产品负责人|产品负责人|项目负责人|运营负责人|负责人|产品经理|PM|核心成员|组长|队长|研发|设计|策划)/i)
+  const link = firstMatch(clean, /(https?:\/\/[^\s，。；)）]+|www\.[^\s，。；)）]+)/i)
+  const firstLine = clean.split('\n').find(Boolean) || clean
+  const name = inferProjectName(firstLine, role)
+  const description = clean
+    .split('\n')
+    .filter((line) => line.trim() && line.trim() !== firstLine.trim())
+    .join('\n')
+    .trim() || clean
+  return {
+    name,
+    role,
+    start,
+    end,
+    link,
+    description,
+  }
+}
+
+function parseEducationChunk(chunk: string): EducationFormItem {
+  const clean = chunk.replace(/\r\n/g, '\n').trim()
+  const [start, end] = parseDateRange(clean)
+  const gpaPair = clean.match(/GPA[：:\s]*([0-9](?:\.\d+)?)(?:\s*[/／]\s*([0-9](?:\.\d+)?))?/i)
+  return {
+    degree: inferEducationDegree(clean),
+    school: inferSchoolName(clean),
+    college: firstMatch(clean, /([\u4e00-\u9fa5A-Za-z0-9]{2,30}(?:学院|学部|院系|系))/),
+    major: inferMajor(clean),
+    ranking: firstMatch(clean, /(前\s*\d+%|排名\s*[:：]?\s*[^\s，。；|｜]+)/),
+    gpaTotal: gpaPair?.[2]?.trim() || '',
+    gpa: gpaPair?.[1]?.trim() || '',
+    advisor: firstMatch(clean, /导师[:：\s]*([^\n，。；|｜]+)/),
+    lab: firstMatch(clean, /([\u4e00-\u9fa5A-Za-z0-9]{2,30}(?:实验室|研究中心))/),
+    research: firstMatch(clean, /研究方向[:：\s]*([^\n，。；|｜]+)/),
+    start,
+    end,
+    recommended: /保送|推免/.test(clean) ? '是' : '',
+    scholarship: /国家奖学金/.test(clean) ? '是' : '',
+  }
+}
+
+function parseAwardChunk(chunk: string): AwardFormItem {
+  const clean = chunk.replace(/\r\n/g, '\n').replace(/^[•·\-]\s*/gm, '').trim()
+  const firstLine = clean.split('\n').find(Boolean) || clean
+  const kind = inferAwardKind(clean)
+  const grade = inferAwardGrade(clean)
+  const level = inferAwardLevel(clean)
+  const date = firstMatch(clean, /(20\d{2}(?:[./-]\d{1,2})?(?:[./-]\d{1,2})?)/).replace(/[./]/g, '-')
+  const name = inferAwardName(firstLine, grade, level)
+  const description = clean
+    .split('\n')
+    .filter((line) => line.trim() && line.trim() !== firstLine.trim())
+    .join('\n')
+    .trim() || clean
+  return {
+    kind,
+    level,
+    name,
+    grade,
+    date,
+    description,
+  }
+}
+
+function inferAwardKind(value: string) {
+  return /(优秀学生|三好学生|奖学金|荣誉称号|先进个人|优秀干部|优秀团员|优秀毕业生)/.test(value) ? '荣誉经历' : '竞赛经历'
+}
+
+function inferAwardLevel(value: string) {
+  if (/国际/.test(value)) return '国际级'
+  if (/国家|全国/.test(value)) return '国家级'
+  if (/省市|省|市/.test(value)) return '省市级'
+  if (/校级|学校|校内/.test(value)) return '校级'
+  if (/院级|学院/.test(value)) return '院级'
+  return ''
+}
+
+function inferAwardGrade(value: string) {
+  return firstMatch(value, /(特等奖|一等奖|二等奖|三等奖|优秀奖|金奖|银奖|铜奖|冠军|亚军|季军|Top\s*\d+|前\s*\d+%|第\s*\d+\s*名|[\u4e00-\u9fa5]{0,12}奖学金|优秀学生干部|优秀学生|三好学生|优秀团员|优秀毕业生)/i)
+}
+
+function inferAwardName(line: string, grade: string, level: string) {
+  let cleaned = line
+    .replace(/20\d{2}(?:[./-]\d{1,2})?(?:[./-]\d{1,2})?/g, ' ')
+    .replace(/[|｜丨—–-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (grade) cleaned = cleaned.replace(new RegExp(escapeRegExp(grade), 'g'), ' ').replace(/\s+/g, ' ').trim()
+  if (level) cleaned = cleaned.replace(new RegExp(escapeRegExp(level), 'g'), ' ').replace(/\s+/g, ' ').trim()
+  const competition = firstMatch(cleaned, /([\u4e00-\u9fa5A-Za-z0-9“”"'《》·\s]{2,60}(?:比赛|竞赛|大赛|挑战赛|奖学金|荣誉称号|优秀学生干部|优秀学生|三好学生|优秀团员|优秀毕业生))/i)
+  return (competition || cleaned).replace(/^获?得/, '').trim()
+}
+
+function inferEducationDegree(value: string) {
+  if (/博士/.test(value)) return '博士'
+  if (/硕士|研究生/.test(value)) return '硕士'
+  if (/本科|学士/.test(value)) return '本科'
+  if (/大专|专科/.test(value)) return '大专'
+  if (/高中/.test(value)) return '高中'
+  return ''
+}
+
+function inferSchoolName(value: string) {
+  return firstMatch(value, /([\u4e00-\u9fa5A-Za-z0-9·.\-\s]{2,40}(?:大学|学院|学校|University|College))/i)
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function inferMajor(value: string) {
+  const explicit = firstMatch(value, /(?:专业|主修)[:：\s]*([^\n，。；|｜]+)/)
+  if (explicit) return explicit
+  const match = value.match(/([\u4e00-\u9fa5A-Za-z0-9]{2,24}(?:专业|学|工程|管理|语言|文学|经济|金融|计算机|法语|英语))/)
+  return match?.[1]?.replace(/专业$/, '').trim() || ''
+}
+
+function inferProjectName(line: string, role: string) {
+  const beforeRole = role ? line.split(role)[0] : line
+  const cleaned = beforeRole
+    .replace(/https?:\/\/\S+|www\.\S+/gi, ' ')
+    .replace(/20\d{2}(?:[./-]\d{1,2})?/g, ' ')
+    .replace(/[|｜丨—–\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return cleaned || firstMatch(line, /([\u4e00-\u9fa5A-Za-z0-9]{2,36}(?:项目|Agent|平台|系统|工具|增长|商业化|探索))/i)
+}
+
+function inferExperienceCompany(line: string, role: string) {
+  const beforeRole = role ? line.split(role)[0] : line
+  const cleaned = beforeRole
+    .replace(/20\d{2}(?:[./-]\d{1,2})?/g, ' ')
+    .replace(/[|｜丨—–\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const known = firstMatch(cleaned, /(字节跳动|快手|百度|腾讯|阿里巴巴|阿里|美团|小红书|京东|网易|华为|[\u4e00-\u9fa5A-Za-z0-9]{2,24}(?:公司|集团|科技|平台))/)
+  return known || cleaned.split(' ')[0] || ''
+}
+
+function parseDateRange(value: string): [string, string] {
+  const dates = Array.from(value.matchAll(/20\d{2}(?:[./-]\d{1,2})?|至今|现在/g)).map((match) => match[0].replace(/[./]/g, '-'))
+  return [dates[0] || '', dates[1] || '']
+}
+
+function parseFormDateRange(value: string): [string, string] {
+  const clean = String(value || '')
+  const parts = clean.split(/\s[-—–至到]\s|[—–]/)
+  if (parts.length >= 2) {
+    return [normalizeDateInput(parts[0]), normalizeDateInput(parts.slice(1).join('-'))]
+  }
+  return parseDateRange(clean)
+}
+
+function normalizeDateInput(value: string) {
+  return String(value || '').trim().replace(/[./]/g, '-')
+}
+
+function formatResumeTextAsHtml(value: string) {
+  const lines = String(value || '').split('\n')
+  if (!lines.some((line) => line.trim())) return ''
+  return lines.map((line) => {
+    const clean = line.trim()
+    if (!clean) return '<div><br /></div>'
+    const escaped = escapeHtml(clean)
+    if (/^【.+】$/.test(clean) || /^(教育背景|实习经历|工作经历|项目经历|个人技能|竞赛经历|获奖经历|求职意向|完整简历)$/.test(clean)) {
+      return `<h3>${escaped}</h3>`
+    }
+    if (/^[•·\-*]\s*/.test(clean)) {
+      return `<div class="resume-rich-bullet">${escaped.replace(/^[•·\-*]\s*/, '')}</div>`
+    }
+    return `<div>${escaped}</div>`
+  }).join('')
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function normalizeForLooseCompare(value: string) {
+  return value.replace(/\s+/g, '').trim()
+}
+
 function summarizeSection(id: ProfileSectionId, content: string) {
   const clean = content.replace(/\s+/g, ' ').trim()
   if (!clean) return profileSectionMeta[id].summary
+  if (id === 'internship') return summarizeInternshipProfileSection(content)
+  if (id === 'project') return summarizeProjectProfileSection(content)
+  if (id === 'education') return summarizeEducationProfileSection(content)
+  if (id === 'competition') return summarizeAwardProfileSection(content)
+  if (id === 'skills') return summarizeSkillsProfileSection(content)
   return clean.length > 82 ? `${clean.slice(0, 82)}...` : clean
+}
+
+function summarizeInternshipProfileSection(content: string) {
+  const items = parseInternshipSectionContent(content).items.filter(isMeaningfulRecord)
+  if (!items.length) return profileSectionMeta.internship.summary
+  const companies = uniqueStrings(items.map((item) => item.company).filter(Boolean)).slice(0, 3)
+  const roles = uniqueStrings(items.map((item) => item.role).filter(Boolean)).slice(0, 2)
+  const aiFocus = /AI|AIGC|Agent/i.test(content) ? '，深耕 AI Agent / AIGC 赛道' : ''
+  return `${formatChineseCount(items.length)}段${roles.join('、') || '产品'}实习经历${companies.length ? `（${companies.join('、')}）` : ''}${aiFocus}。`
+}
+
+function summarizeProjectProfileSection(content: string) {
+  const items = parseProjectSectionContent(content).items.filter(isMeaningfulRecord)
+  if (!items.length) return profileSectionMeta.project.summary
+  const names = uniqueStrings(items.map((item) => item.name).filter(Boolean)).slice(0, 2)
+  const roles = uniqueStrings(items.map((item) => item.role).filter(Boolean)).slice(0, 2)
+  const aiFocus = /AI|AIGC|Agent/i.test(content) ? '，突出 AI 产品与落地能力' : ''
+  return `${formatChineseCount(items.length)}段项目经历${names.length ? `（${names.join('、')}）` : ''}${roles.length ? `，角色为${roles.join('、')}` : ''}${aiFocus}。`
+}
+
+function summarizeEducationProfileSection(content: string) {
+  const items = parseEducationSectionContent(content).items.filter(isMeaningfulRecord)
+  if (!items.length) return profileSectionMeta.education.summary
+  const schools = uniqueStrings(items.map((item) => item.school).filter(Boolean)).slice(0, 2)
+  const majors = uniqueStrings(items.map((item) => item.major).filter(Boolean)).slice(0, 2)
+  const degrees = uniqueStrings(items.map((item) => item.degree).filter(Boolean)).slice(0, 2)
+  return `${schools.join('、') || formatChineseCount(items.length) + '段教育背景'}${degrees.length ? `，${degrees.join('、')}` : ''}${majors.length ? `，专业为${majors.join('、')}` : ''}。`
+}
+
+function summarizeAwardProfileSection(content: string) {
+  const items = parseAwardSectionContent(content).items.filter(isMeaningfulRecord)
+  if (!items.length) return profileSectionMeta.competition.summary
+  const competitionCount = items.filter((item) => item.kind === '竞赛经历').length
+  const honorCount = items.filter((item) => item.kind === '荣誉经历').length
+  const names = uniqueStrings(items.map((item) => item.name || item.grade).filter(Boolean)).slice(0, 2)
+  const parts = [
+    competitionCount ? `${formatChineseCount(competitionCount)}段竞赛经历` : '',
+    honorCount ? `${formatChineseCount(honorCount)}段荣誉经历` : '',
+  ].filter(Boolean)
+  return `${parts.join('、') || `${formatChineseCount(items.length)}段获奖经历`}${names.length ? `（${names.join('、')}）` : ''}。`
+}
+
+function summarizeSkillsProfileSection(content: string) {
+  const skills = uniqueStrings(content.split(/[\n,，、;；|｜]/).map((item) => item.replace(/^[-•·]\s*/, '').trim()).filter(Boolean)).slice(0, 6)
+  if (!skills.length) return profileSectionMeta.skills.summary
+  return `已记录 ${skills.length} 项核心技能：${skills.join('、')}。`
+}
+
+function isMeaningfulRecord(item: Record<string, string>) {
+  return Object.values(item).some((value) => String(value || '').trim())
+}
+
+function formatChineseCount(value: number) {
+  return ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十'][value] || `${value}`
 }
 
 function buildResumeNavSummary(profile: Profile, dashboard: Dashboard | null, sections: Record<ProfileSectionId, string>) {
@@ -6742,7 +8196,7 @@ function buildResumeFolders(profile: Profile, dashboard: Dashboard | null, secti
         { id: 'project', title: '项目经历', summary: summarizeSection('project', sections.project) },
         { id: 'education', title: '教育背景', summary: summarizeSection('education', sections.education) },
         { id: 'skills', title: '个人技能', summary: summarizeSection('skills', sections.skills) },
-        { id: 'competition', title: '竞赛经历', summary: summarizeSection('competition', sections.competition) },
+        { id: 'competition', title: '获奖经历', summary: summarizeSection('competition', sections.competition) },
       ],
     },
   ]
@@ -6828,15 +8282,6 @@ function formatResumeUpdatedLabel(value?: string) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '刚刚'
   return `更新于 ${date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })}`
-}
-
-function extractExperienceNames(content: string) {
-  return content
-    .split('\n')
-    .map((line) => line.replace(/^#+\s*/, '').replace(/^【|】$/g, '').trim())
-    .filter((line) => line && line.length <= 36)
-    .filter((line) => /(实习|项目|产品|平台|系统|增长|策略|运营|分析|大模型|AI|AIGC)/i.test(line))
-    .slice(0, 8)
 }
 
 function personalGreeting(profile: Profile) {
