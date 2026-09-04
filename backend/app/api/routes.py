@@ -77,7 +77,7 @@ from backend.app.services.interview_intelligence import (
     serialize_question,
     serialize_question_set,
 )
-from backend.app.services.job_market import recommend_jobs_for_profile, search_job_library
+from backend.app.services.job_market import recommend_jobs_for_profile, recommend_jobs_with_agent, search_job_library
 from backend.app.services.memory import PeachMemoryService, build_memory_context, remember_interaction, remember_interaction_isolated, retrieve_relevant_memories, upsert_memory
 from backend.app.services.recommendations import refresh_home_recommendations
 from backend.app.services.rewards import award_once, ensure_tree, refresh_tree_stage, serialize_tree
@@ -615,6 +615,11 @@ async def read_job_library(
 @router.get("/jobs/recommendations")
 async def read_job_recommendations(q: str = "", limit: int = 6, session: AsyncSession = Depends(get_session)) -> dict:
     profile = await get_or_create_profile(session)
+    if q.strip():
+        try:
+            return await recommend_jobs_with_agent(profile, agent, limit=limit, query=q)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="桃子暂时没能完成 Agent 岗位推荐，请稍后重试。") from exc
     return recommend_jobs_for_profile(profile, limit=limit, query=q)
 
 
@@ -1406,7 +1411,15 @@ async def execute_agent_action(payload: AgentToolExecuteIn, session: AsyncSessio
         return {"message": "面试已结束，报告已生成。", **result}
 
     if payload.tool == "recommend_jobs":
-        result = recommend_jobs_for_profile(profile, limit=int(data.get("limit") or 5), query=str(data.get("query") or ""))
+        query = str(data.get("query") or "").strip()
+        limit = int(data.get("limit") or 5)
+        if query:
+            try:
+                result = await recommend_jobs_with_agent(profile, agent, limit=limit, query=query)
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="桃子暂时没能完成 Agent 岗位推荐，请稍后重试。") from exc
+        else:
+            result = recommend_jobs_for_profile(profile, limit=limit)
         return {"message": "已根据当前档案生成岗位推荐。", "job_recommendations": result["items"], "job_source": result["source"]}
 
     if payload.tool == "update_profile_fields":

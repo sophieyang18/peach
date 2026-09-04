@@ -30,6 +30,12 @@ JOB_FIELDS = [
     "工作城市",
 ]
 DEFAULT_JOB_CSV = Path(__file__).resolve().parents[1] / "datasets" / "autumn_recruitment.csv"
+AGENT_RECOMMENDATION_POOL_LIMIT = 45
+BIG_COMPANY_PATTERN = re.compile(
+    r"(腾讯|阿里|字节|字节跳动|百度|美团|京东|网易|快手|小米|华为|蚂蚁|滴滴|拼多多|B站|哔哩|携程|知乎|贝壳|抖音)",
+    re.I,
+)
+NEGATIVE_BIG_COMPANY_PATTERN = re.compile(r"(不要|别|不想|不考虑|排除|避开|不推荐|非)(?:[^，。；,;]{0,10})(大厂|头部|一线|互联网大厂)")
 
 
 def search_job_library(
@@ -91,6 +97,163 @@ def recommend_jobs_for_profile(profile: UserProfile, *, limit: int = 6, query: s
         },
         "source": "autumn_recruitment_csv",
     }
+
+
+async def recommend_jobs_with_agent(profile: UserProfile, agent: Any, *, limit: int = 6, query: str = "") -> dict[str, Any]:
+    candidate_rows = build_agent_candidate_pool(profile, query=query, pool_limit=AGENT_RECOMMENDATION_POOL_LIMIT)
+    if not candidate_rows:
+        return {
+            "items": [],
+            "total": 0,
+            "profile_target": {
+                "role": profile.target_role or "产品经理",
+                "company": profile.target_company or "",
+                "city": profile.target_city or "",
+                "stage": profile.stage or "投递期",
+            },
+            "source": "agent_autumn_recruitment_csv",
+            "agent_used": False,
+            "agent_reason": "没有找到满足当前限制条件的候选岗位。",
+        }
+
+    limit = max(1, min(int(limit or 6), 12))
+    profile_snapshot = {
+        "target_role": profile.target_role or "产品经理",
+        "target_company": profile.target_company or "",
+        "target_city": profile.target_city or "",
+        "stage": profile.stage or "投递期",
+        "resume_excerpt": clean(profile.resume_text)[:3500],
+    }
+    compact_candidates = [
+        {
+            "id": row["id"],
+            "company": row.get("company", ""),
+            "position": row.get("position", ""),
+            "cities": row.get("cities", ""),
+            "industry": row.get("industry", ""),
+            "company_type": row.get("company_type", ""),
+            "batch": row.get("batch", ""),
+            "education": row.get("education", ""),
+            "target_graduates": row.get("target_graduates", ""),
+            "deadline": row.get("deadline", ""),
+            "written_test_free": bool(row.get("written_test_free")),
+            "major_friendly": bool(row.get("major_friendly")),
+            "notes": clean(row.get("notes"))[:260],
+            "recall_score": row.get("_recall_score", 0),
+            "recall_reasons": row.get("_recall_reasons", []),
+        }
+        for row in candidate_rows
+    ]
+    data = await agent.json_complete(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是桃子的岗位推荐 Agent。你的任务不是做关键词匹配，而是结合候选人档案、简历亮点、用户本次偏好，"
+                    "从给定岗位池中挑选最值得投递的岗位。必须严格遵守用户的否定偏好，例如“不要大厂”“别推荐算法岗”等。"
+                    "只能从候选岗位池中选择，不要编造公司、岗位、城市、链接。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"用户本次偏好：{query.strip() or '无额外偏好'}\n"
+                    f"需要推荐数量：{limit}\n"
+                    f"候选人档案：{profile_snapshot}\n"
+                    f"候选岗位池：{compact_candidates}\n\n"
+                    "请输出 JSON："
+                    "{"
+                    "\"overall_reason\":\"一句话说明推荐策略\","
+                    "\"selected\":[{\"id\":\"候选岗位id\",\"match_score\":1-99,\"match_reasons\":[\"原因1\",\"原因2\"]}]"
+                    "}"
+                ),
+            },
+        ],
+        {"overall_reason": "", "selected": []},
+        allow_fallback=False,
+        temperature=0.25,
+        max_tokens=1800,
+    )
+    selected = data.get("selected") if isinstance(data, dict) else []
+    if not isinstance(selected, list) or not selected:
+        raise RuntimeError("Agent did not return job recommendations")
+
+    rows_by_id = {str(row.get("id")): row for row in candidate_rows}
+    items: list[dict[str, Any]] = []
+    for selected_item in selected:
+        if not isinstance(selected_item, dict):
+            continue
+        row = rows_by_id.get(str(selected_item.get("id") or ""))
+        if not row:
+            continue
+        try:
+            match_score = int(selected_item.get("match_score") or row.get("_recall_score") or 70)
+        except (TypeError, ValueError):
+            match_score = int(row.get("_recall_score") or 70)
+        raw_reasons = selected_item.get("match_reasons")
+        agent_reasons = [clean(reason) for reason in raw_reasons if clean(reason)] if isinstance(raw_reasons, list) else []
+        if not agent_reasons:
+            agent_reasons = list(row.get("_recall_reasons") or [])
+        public_row = {key: value for key, value in row.items() if not key.startswith("_")}
+        public_row["match_score"] = max(1, min(99, match_score))
+        public_row["match_reasons"] = unique(agent_reasons)[:4]
+        items.append(public_row)
+        if len(items) >= limit:
+            break
+
+    if not items:
+        raise RuntimeError("Agent selected no valid jobs")
+
+    return {
+        "items": items,
+        "total": len(candidate_rows),
+        "profile_target": {
+            "role": profile.target_role or "产品经理",
+            "company": profile.target_company or "",
+            "city": profile.target_city or "",
+            "stage": profile.stage or "投递期",
+        },
+        "source": "agent_autumn_recruitment_csv",
+        "agent_used": True,
+        "agent_reason": clean(data.get("overall_reason")) if isinstance(data, dict) else "",
+    }
+
+
+def build_agent_candidate_pool(profile: UserProfile, *, query: str = "", pool_limit: int = AGENT_RECOMMENDATION_POOL_LIMIT) -> list[dict[str, Any]]:
+    rows = [row for row in load_job_rows() if not violates_negative_preferences(row, query)]
+    scored: list[tuple[dict[str, Any], int, int, int]] = []
+    for row in rows:
+        profile_score, profile_reasons = score_job(row, profile)
+        preference_score, preference_reasons = score_query_preferences(row, query)
+        total_score = profile_score + preference_score
+        if total_score <= 0:
+            continue
+        scored.append(
+            (
+                {
+                    **row,
+                    "_recall_score": max(1, min(99, total_score)),
+                    "_recall_reasons": unique([*preference_reasons, *profile_reasons])[:5],
+                },
+                total_score,
+                preference_score,
+                profile_score,
+            )
+        )
+
+    if not scored:
+        scored = [
+            (
+                {**row, "_recall_score": 1, "_recall_reasons": ["作为兜底候选进入 Agent 判断"]},
+                1,
+                0,
+                0,
+            )
+            for row in rows[:pool_limit]
+        ]
+
+    scored.sort(key=lambda item: (item[1], item[2], item[3], freshness_rank(item[0])), reverse=True)
+    return [row for row, *_ in scored[: max(1, min(pool_limit, 80))]]
 
 
 @lru_cache(maxsize=1)
@@ -242,6 +405,30 @@ def score_query_preferences(row: dict[str, Any], query: str) -> tuple[int, list[
             break
 
     return score, unique(reasons)[:3]
+
+
+def violates_negative_preferences(row: dict[str, Any], query: str) -> bool:
+    text = clean(query)
+    if not text:
+        return False
+    haystack = " ".join(
+        str(row.get(key) or "")
+        for key in ["company", "position", "industry", "company_type", "notes", "cities", "batch", "target_graduates"]
+    )
+    if NEGATIVE_BIG_COMPANY_PATTERN.search(text) and BIG_COMPANY_PATTERN.search(haystack):
+        return True
+    negative_terms = [
+        ("算法", r"(算法|机器学习|深度学习|计算机视觉|NLP|推荐|搜索)"),
+        ("技术", r"(开发|后端|前端|算法|工程师|测试|运维|硬件|嵌入式)"),
+        ("销售", r"(销售|客户经理|BD|商务拓展)"),
+        ("运营", r"(运营|社群|内容运营|用户运营|活动运营)"),
+    ]
+    for keyword, pattern in negative_terms:
+        if re.search(rf"(不要|别|不想|不考虑|排除|避开|不推荐)(?:[^，。；,;]{{0,10}}){keyword}", text) and re.search(
+            pattern, haystack, re.I
+        ):
+            return True
+    return False
 
 
 def matches_query(row: dict[str, Any], query: str) -> bool:
